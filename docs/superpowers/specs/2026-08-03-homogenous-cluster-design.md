@@ -2,266 +2,263 @@
 
 **Date:** 2026-08-03
 **Status:** Approved for planning
+**Supersedes:** GPU-sharded design (commits 1892703, 3d54141)
 
 ## Purpose
 
-Build a 7-node LLM inference cluster from surplus school hardware, running a
-genuinely capable model with no data leaving the building. The cluster is a
-working demonstrator for a blog post arguing that organisations with
-data-sovereignty constraints can repurpose idle compute for private inference
-instead of sending sensitive data to hosted APIs.
+Build a 7-node CPU-only LLM inference cluster from surplus school hardware,
+running a frontier-class open-weights MoE model with no data leaving the
+building, fronted by **Missing Link** — an asynchronous long-workload runner.
 
-This spec covers the **cluster build only**. Blog prose, benchmark tables, and
-publishable artifacts are explicitly out of scope.
+The cluster is a working demonstrator for a blog post arguing that
+organisations with data-sovereignty constraints can repurpose idle compute for
+private inference. See `CLAUDE.md` for the argument this build exists to make.
+
+This spec covers the **cluster build and Missing Link**. Blog prose and
+publishable artifacts are out of scope.
 
 ## Hardware
 
 | Component | Per node | × 7 nodes |
 |---|---|---|
-| CPU | 5th-gen Intel i5 (Broadwell) | 7 |
-| GPU | 1× NVIDIA Quadro P600, 2 GB GDDR5 | **14 GB VRAM** |
-| System RAM | 6–8 GB DDR3 | **42–56 GB** |
+| CPU | 5th-gen Intel i5 (Broadwell), AVX2, no AVX-512 | 7 |
+| System RAM | DDR3-1600 dual channel, ~25 GB/s | see ladder |
 | Storage | Mixed SSD + HDD, varying sizes | — |
 | Network | Gigabit ethernet, same switch | — |
+| GPU | 1× Quadro P600 2 GB — **unused** | — |
 
-**Pooled memory: ~56–70 GB.**
+### The GPUs are dropped
 
-### Bandwidth is the binding constraint
+The P600 (Pascal GP107) has 2 GB of VRAM, no FP8, no BF16 and crippled FP16.
+Fourteen gigabytes pooled is too little to hold meaningful layers of a
+100 GB-class model, and using them requires per-node hybrid CUDA/CPU RPC
+topology whose feasibility is unproven.
 
-The P600 (GP107, compute capability 6.1) has **64 GB/s** memory bandwidth on a
-128-bit bus. DDR3 system RAM is roughly 25 GB/s. Token generation speed is
-bounded almost entirely by how many bytes must be read per token, not by compute.
+Removing them eliminates: CUDA toolkit and driver management, architecture-flag
+build constraints, the hybrid-RPC gate test, and an entire fork in the
+architecture. The build gets materially simpler and the blog story gets cleaner.
 
-Two consequences drive every decision below:
+**Revisit condition:** GPUs help *prefill*, not generation — prompt processing
+is compute-bound where generation is bandwidth-bound. If measured
+time-to-first-token on realistic documents proves unbearable, reconsider them
+for prefill only. Decide on evidence, not in advance.
 
-1. **Pipeline sharding buys capacity, not speed.** For a single request, nodes
-   execute sequentially — time-per-token ≈ the time for one GPU to read the
-   entire model. Splitting a dense model across 7 nodes does not make it faster.
-2. **MoE decouples capability from bandwidth.** An MoE model must *store* all
-   parameters but only *reads* the routed experts per token. This is the entire
-   reason the cluster is viable, and the core of the blog's argument.
+## Why this works: the two facts
 
-### Quantisation note
+**1. Active parameters determine speed; total parameters determine capability.**
 
-Quantised GGUF does **not** double in size on Pascal. llama.cpp's CUDA backend
-keeps Q4/MXFP4 weights quantised in VRAM and dequantises per-tile during the
-matmul, using DP4A integer instructions (present on CC 6.1). The "fp16 only"
-constraint applies to FP8 tensor-core paths in vLLM/TensorRT, not llama.cpp.
+Bytes read per token ≈ active params × bits-per-weight. For an MoE, only routed
+experts are read. Everything else is storage. This is why a 1T-param model with
+32B active is tractable on DDR3 and a 70B dense model is not.
 
-## Model ladder
+**2. Pipeline sharding multiplies seats, not speed.**
 
-Three rungs, built in sequence. Each is independently demoable.
+For a single request, nodes execute sequentially — 7 nodes performs like one
+node with 7× the RAM. With *concurrent* requests, each node processes a
+different request's layers simultaneously, so aggregate throughput scales with
+node count while per-seat speed stays flat.
 
-### Rung 1 — Proof (single node)
+The design target is therefore **a small number of slow seats**, not one fast
+one. Missing Link exists to make that framing useful rather than apologetic.
 
-**Model:** Qwen3-4B Q4_K_M (~2.5 GB)
+## Memory budget
 
-Validates the full OS → driver → llama.cpp → clone → Tailscale pipeline on one
-machine before any distributed complexity. Fits in 2 GB VRAM with modest CPU
-offload. Success criterion: coherent multi-turn chat from a single node.
+**Usable model budget = (pooled RAM − 1 GB/node for OS) × 0.85.**
 
-### Rung 2 — The demo (VRAM-sharded)
+The 15% headroom is a hard convention, not a guideline — it covers KV cache
+growth, activation buffers, RPC transfer buffers, and page-cache pressure.
+Configurations that fit only marginally are not specced.
 
-**Model:** gpt-oss-20b, MXFP4 (~12.9 GB, 21B total / 3.6B active)
+| RAM/node | Pooled | Usable budget |
+|---|---|---|
+| 8 GB (current) | 56 GB | **~41 GB** |
+| 16 GB | 112 GB | **~89 GB** |
+| 32 GB (max for Broadwell) | 224 GB | **~184 GB** |
 
-Sharded across all 14 GB of pooled VRAM via llama.cpp RPC. Only 3.6B active
-parameters means genuinely usable generation speed. This is what gets demoed
-live so the audience is not watching a spinner.
+### RAM is the highest-leverage upgrade
 
-**The fit is tight and the fallback must not be CPU offload.** 14 GB nominal,
-minus ~250 MB CUDA context per GPU (~1.75 GB), leaves ~12.25 GB. A 12.9 GB model
-plus KV cache does not fit. KV cache is not free on 2 GB cards: gpt-oss-20b at
-8k context costs roughly 0.4 GB, and it lives on the node holding those layers,
-not spread evenly.
+Broadwell desktops take 32 GB (4 × 8 GB DDR3). Used DDR3 is near-worthless —
+roughly **$150–250 for the whole fleet** moves pooled RAM from 56 GB to 224 GB.
+Nothing else available comes close to that return, and it is a strong point for
+the blog: the bottleneck is the cheapest component in the machine.
 
-Fallback is therefore **a smaller quant, not CPU offload** — CPU offload depends
-on the same unproven RPC mechanism as rung 3 (see Risks). In order of preference:
+## Model ladder — scales with pooled RAM
 
-1. gpt-oss-20b at 8k context, reduced KV via `-ctk q8_0 -ctv q8_0`
-2. Qwen3-30B-A3B at IQ3_XXS (~12 GB)
-3. Qwen3-14B Q4_K_M (~9 GB) — dense, slower, but certain to fit
+Estimates below are arithmetic on datasheet bandwidth (~25 GB/s/node) and must
+be replaced by measurements. They establish expectations, not claims.
 
-### Rung 3 — The thesis (VRAM + system RAM)
+### Rung 1 — Proof (single node, any RAM config)
 
-**Model:** gpt-oss-120b, MXFP4 (~63 GB, 117B total / 5.1B active)
+**Qwen3-4B Q4_K_M (~2.5 GB).** Validates OS → llama.cpp → provisioning →
+Tailscale on one machine before distribution. Success: coherent multi-turn chat
+via `curl`.
 
-Attention, KV cache, routers and norms in the 14 GB of VRAM; routed expert FFN
-tensors in the ~49 GB of pooled system RAM. Expected to be slow (single-digit
-tok/s) but this is the point: frontier-class open-weights capability on hardware
-with zero acquisition cost. Extrapolates directly to the blog's Kimi K3 /
-550 GB argument.
+### Rung 2 — Baseline (~41 GB budget, current RAM)
 
-Success criterion is **capability, not speed** — the output should be visibly
-better than anything a single node can produce.
+**Qwen3-30B-A3B Q8_0 (~32 GB), 3B active.** Reads ~3 GB/token → roughly
+4–8 tok/s per seat. Genuinely conversational. Runs on the hardware as it stands
+today, with no RAM purchase. This is the guaranteed-deliverable rung.
 
-#### This rung has two possible architectures, and a test decides which
+### Rung 3 — The demo (~89 GB budget, 16 GB/node)
 
-`--n-cpu-moe` is applied by the process that loads the model, against *its own*
-CPU backend. Under RPC the master does not own the workers' system RAM — it sees
-a set of opaque remote backends. There is no path for the master's
-`--n-cpu-moe` to mean "put layer 40's experts in node 5's DDR3."
+**gpt-oss-120b MXFP4 (~63 GB), 5.1B active.** The sweet spot: 117B total
+parameters for capability, but only 5.1B active means ~3 GB/token and
+comparable speed to rung 2. A frontier-class model that is *not* glacial.
 
-**Architecture A (hybrid, preferred).** Run *two* `rpc-server` instances per
-node — one bound to CUDA, one to CPU — giving the master 14 backends. Then use
-`--override-tensor` regexes to force attention onto the CUDA backends and expert
-tensors onto the CPU backends. Viable only if `-ot` patterns can name an RPC
-device. **This is unproven and is the gate test below.**
+Alternative at this tier: GLM-4.5-Air Q4 (~70 GB, 12B active) — stronger on
+some tasks, roughly half the speed.
 
-**Architecture B (CPU-only RPC, fallback).** If `-ot` cannot target RPC devices,
-drop the GPUs from rung 3 entirely and run 7 CPU-backend `rpc-server`s over the
-~49 GB of pooled system RAM. Slower, but it still makes the argument and still
-extrapolates to Kimi K3. Model target shrinks to a ~40 GB-class MoE:
-GLM-4.5-Air Q4, or Qwen3-30B-A3B at Q8.
+### Rung 4 — The thesis (~184 GB budget, 32 GB/node)
 
-gpt-oss-120b (~63 GB) is only reachable under Architecture A. Do not commit to
-it as the rung 3 model until the gate test passes.
+**Qwen3-235B-A22B Q4 (~140 GB), 22B active.** Reads ~13 GB/token → roughly
+1–2 tok/s per seat. Genuinely glacial, and the point: this is a model class
+that no organisation could otherwise run without cloud access or serious
+capital. Extrapolates directly to the blog's Kimi K3 / 550 GB argument, which
+at ~32B active would land near 0.7–1.4 tok/s on the same architecture.
+
+**Rung 4 is where Missing Link stops being a nice framing and becomes
+mandatory.** At 1 tok/s, interactive chat is not a product. Async batch work is.
 
 ## Architecture
 
-### Why llama.cpp RPC, not Exo
-
-Exo's value proposition is heterogeneous device discovery and MLX/Apple support.
-This cluster is 7 identical Debian + CUDA boxes, so neither applies. Forking Exo
-would be work spent arriving where llama.cpp already is — and llama.cpp is the
-stack already proven to work on this hardware.
+```
+   Tailscale ────▶┌──────────────────────────────┐
+   (SSH + web)    │  MASTER (node 1)             │
+                  │  ├─ Missing Link (job queue) │
+                  │  ├─ Open WebUI               │
+                  │  ├─ llama-server (OpenAI API)│
+                  │  └─ rpc-server               │
+                  └──────────┬───────────────────┘
+                             │ raw LAN IPs, gigabit
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+        ┌──────────┐   ┌──────────┐   ┌──────────┐
+        │  node 2  │   │  node 3  │ … │  node 7  │
+        │rpc-server│   │rpc-server│   │rpc-server│
+        │ CPU + RAM│   │ CPU + RAM│   │ CPU + RAM│
+        └──────────┘   └──────────┘   └──────────┘
+```
 
 ### Components
 
-```
-                    ┌─────────────────────────────┐
-   Tailscale  ─────▶│  MASTER (node 1)            │
-   (SSH + GUI)      │  ├─ llama-server            │
-                    │  │   (OpenAI-compatible API)│
-                    │  ├─ Open WebUI              │
-                    │  └─ rpc-server (local GPU)  │
-                    └──────────┬──────────────────┘
-                               │ raw LAN IPs, gigabit
-                 ┌─────────────┼─────────────┐
-                 ▼             ▼             ▼
-            ┌─────────┐  ┌─────────┐   ┌─────────┐
-            │ node 2  │  │ node 3  │ … │ node 7  │
-            │rpc-server│ │rpc-server│  │rpc-server│
-            │ P600 2GB│  │ P600 2GB│   │ P600 2GB│
-            └─────────┘  └─────────┘   └─────────┘
-```
-
-**Unit boundaries:**
-
 | Unit | Does | Depends on |
 |---|---|---|
-| `rpc-server` (×7) | Holds a layer range, executes forward pass on its shard | CUDA driver, local GGUF cache |
+| `rpc-server` (×7) | Holds a layer range in system RAM, runs forward pass | Local GGUF cache |
 | `llama-server` (master) | Loads GGUF, assigns layers, serves OpenAI API | RPC endpoints |
-| Open WebUI (master) | Chat frontend | llama-server API |
-| `setup.sh` + preseed | Provisions a bare node to cluster-ready | Debian netinst media |
+| **Missing Link** (master) | Accepts long jobs, queues, executes, stores results | llama-server API |
+| Open WebUI (master) | Interactive chat frontend | llama-server API |
+| `setup.sh` + preseed | Bare node → cluster-ready | Debian netinst media |
 
-Each is independently testable: `rpc-server` via `llama-bench` against a single
-endpoint; `llama-server` via `curl` to `/v1/chat/completions`; provisioning via a
-clean VM run.
+Each is independently testable: `rpc-server` via `llama-bench` against one
+endpoint; `llama-server` via `curl` to `/v1/chat/completions`; Missing Link
+against a stub API; provisioning via a clean VM run.
+
+### Why llama.cpp RPC, not Exo
+
+Exo's value is heterogeneous device discovery and MLX/Apple support. Neither
+applies to 7 identical Debian boxes. llama.cpp is already proven on this
+hardware.
+
+**Benchmark `ik_llama.cpp` against mainline before committing.** It is a fork
+specifically optimised for CPU-side MoE inference and consistently outperforms
+mainline on exactly this workload. The decision should be measured, not assumed.
 
 ### Networking
 
-**RPC mesh uses raw LAN IPs on the local switch.** Tailscale carries SSH access
-and the Open WebUI endpoint only. Putting WireGuard encryption and reduced MTU on
-the per-token hot path is pure loss with no security benefit — the cluster is
-already on an isolated LAN.
+RPC mesh runs on **raw LAN IPs** over the local switch. Tailscale carries SSH
+and the web frontends only. WireGuard encryption and reduced MTU on the
+per-token hot path is pure loss with no security benefit on an isolated LAN.
 
-Activation payloads per hop are small (hidden_dim × 2 bytes, single-digit KB), so
-6 hops cost well under a millisecond. The network is **not** the bottleneck for
-batch-1 generation; memory bandwidth is.
+Per-hop activation payloads are single-digit KB, so 6 hops cost well under a
+millisecond. **The network is not the bottleneck** — memory bandwidth is.
 
-### OS and drivers
+### OS and provisioning
 
-**Debian 12 headless, NVIDIA 535 branch** (Debian's `nvidia-driver`).
+**Debian 12 headless.** No GUI, no display manager, no CUDA. Build llama.cpp
+once with AVX2 enabled; distribute binaries. Versions must match exactly across
+nodes or the RPC protocol mismatches — never build per-node.
 
-Pascal support is being wound down, but not yet: the **580** branch is the last
-to support Maxwell/Pascal/Volta, and support only drops at **590**. The 470
-legacy branch is for *Kepler* and is the wrong choice here. Debian 12's 535 is
-comfortably within Pascal's support window with headroom to spare — pin it and
-do not chase newer.
+Disks vary in size and type, which breaks block-level `dd` cloning. Use a Debian
+preseed for unattended base install plus one idempotent `setup.sh`.
 
-llama.cpp must be built with `CMAKE_CUDA_ARCHITECTURES=61` (GP107 is compute
-capability 6.1). Since binaries are built once and distributed fleet-wide,
-getting this wrong costs all seven nodes at once — verify the built binary sees
-the GPU before distributing.
+**Identity hygiene** — on first boot every node must regenerate `/etc/machine-id`,
+regenerate SSH host keys, and clear `/var/lib/tailscale` before joining. Cloned
+auth state collides.
 
-No GUI, no display manager: every megabyte of VRAM consumed by a desktop is a
-megabyte unavailable to the model.
+## Missing Link
 
-### Provisioning: scripted, not imaged
+An async job runner that makes glacial inference useful. Submit work, collect
+results later.
 
-Disks vary in size and type across the fleet, which breaks block-level `dd`
-cloning. Instead: a Debian preseed for unattended base install, then a single
-idempotent `setup.sh` that installs drivers, builds nothing (see below), and
-registers the node.
+**Primary workload: PII stripping as a gateway.** The cluster de-identifies
+sensitive documents so cloud models can safely handle the fast work afterwards.
+This reframes local inference from a worse alternative to cloud into the thing
+that *unlocks* cloud safely — and it is a task where slowness genuinely does not
+matter, because the document was going to sit in a queue anyway.
 
-**Identity hygiene** — any cloned or scripted node must, on first boot:
-- regenerate `/etc/machine-id`
-- regenerate SSH host keys
-- clear `/var/lib/tailscale` before joining (cloned auth state collides)
+Secondary workloads: overnight summarisation of sensitive records; report
+drafting.
 
-**Build once, distribute binaries.** llama.cpp version must match *exactly*
-across all nodes or the RPC protocol mismatches. Build on one machine, ship the
-binaries via the provisioning script. Never build per-node.
+### Scope
 
-### Frontend
+Deliberately minimal — Missing Link is a demonstrator, not a product.
 
-Open WebUI on the master, pointed at llama-server's OpenAI-compatible endpoint,
-lightly skinned. Zero build effort for a polished result. A cluster-status panel
-showing which node holds which layer range is the screenshot the blog needs.
+- Submit a job (document + task template), receive an ID
+- Persistent queue surviving restart (SQLite; jobs outlive any single run)
+- Sequential execution against llama-server, with progress visible
+- Retrieve results by ID; simple web view listing jobs and states
+- Per-job record of wall-clock time, tokens generated, and time-to-first-token
 
-## Risks to retire early
-
-Ordered by likelihood of derailing the build.
-
-### Gate test — run before provisioning anything else
-
-**Can `--override-tensor` patterns name an RPC device?**
-
-Two nodes, two `rpc-server` instances each (one CUDA, one CPU), a small MoE, and
-an `-ot` regex attempting to route expert tensors to a specific remote CPU
-backend. This single question decides whether rung 3 is Architecture A or B, and
-therefore which model the whole cluster is built around.
-
-Running it costs two machines and an afternoon. Skipping it risks imaging seven
-machines for the wrong architecture.
-
-### Remaining risks
-
-1. **RPC pushes weights over the wire on every start.** The master distributes
-   tensors to backends; 63 GB over gigabit is minutes per restart. `rpc-server -c`
-   enables a local file cache — verify it works on the built version before
-   accepting long iteration cycles as normal.
-2. **CUDA architecture flag.** llama.cpp built without
-   `CMAKE_CUDA_ARCHITECTURES=61` will not use the P600. Confirm on the build
-   machine before distributing binaries fleet-wide.
-3. **Pascal driver install.** Confirm Debian 12's `nvidia-driver` (535) installs
-   cleanly and `nvidia-smi` sees the P600 before anything else is attempted.
-   Pascal is supported through the 580 branch, so this should be uneventful — but
-   it is the cheapest possible thing to verify first.
-4. **Rung 2 VRAM fit.** ~12.25 GB usable against a 12.9 GB model. Fallbacks are
-   quant reductions, not CPU offload — see rung 2.
+**Out of scope:** authentication, multi-tenancy, job priorities, retries with
+backoff, distributed queue workers.
 
 ## Validation
 
-Measured on hardware, not estimated. The first node up produces:
+Measured on hardware, not estimated. Every performance claim in the blog must
+trace to one of these.
 
-- `nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv`
-- `lspci | grep -i vga` — confirm card count per node
-- `llama-bench` single-GPU with a small Q4 model — yields real tok/s and
-  effective GB/s, which calibrates every performance claim
+From the first node up:
+- `lscpu | grep -E 'avx2|Model name'` — confirm AVX2
+- `free -h` and `dmidecode -t memory` — actual RAM and free DIMM slots
+- `llama-bench` single-node with a small Q4 model → real tok/s and effective GB/s
 
 Per-rung success criteria:
 
 | Rung | Passes when |
 |---|---|
 | 1 | Single node holds a coherent multi-turn conversation via `curl` |
-| 2 | gpt-oss-20b serves from all 7 nodes at usable interactive speed through Open WebUI |
-| 3 | gpt-oss-120b generates coherent output; speed recorded, not constrained |
+| 2 | Qwen3-30B-A3B serves from all 7 nodes at conversational speed |
+| 3 | gpt-oss-120b serves from all 7 nodes; TTFT and tok/s recorded |
+| 4 | Qwen3-235B-A22B generates coherent output via Missing Link |
+
+**Both metrics always.** Time-to-first-token (prefill, compute-bound) and
+tokens/sec (generation, bandwidth-bound) are separate numbers with separate
+causes. TTFT on a realistic multi-thousand-token document is the number that
+decides whether the GPUs come back.
+
+Also measure **concurrent seats**: throughput at 1, 2, 4 and 7 simultaneous
+requests. This is the claim that pipeline sharding multiplies seats, and it
+needs evidence.
+
+## Risks
+
+1. **CPU prefill may be worse than expected.** Broadwell without AVX-512 on a
+   4,000-token document could exceed a minute before first token. Measure early;
+   it drives the GPU revisit decision and possibly the choice of workload.
+2. **RPC pushes weights over the wire on every start.** 140 GB over gigabit is a
+   long wait per restart. `rpc-server -c` enables a local file cache — verify on
+   the built version before accepting slow iteration as normal.
+3. **Rungs 3 and 4 depend on RAM purchases** that may not materialise. Rung 2 is
+   deliberately specced to need no new hardware, so there is always a
+   deliverable.
+4. **Swap death.** With models sized to pooled RAM, any overshoot pushes a node
+   into swap and collapses throughput. The 15% headroom exists for this; disable
+   swap on worker nodes so failures are loud rather than silent.
 
 ## Out of scope
 
-- Security hardening (cluster sits behind Tailscale on an isolated LAN)
-- High availability / node failure recovery
-- Multi-user concurrency and request queueing
-- Blog prose, benchmark tables, publishable artifacts
-- Fine-tuning or training of any kind
+- Security hardening (isolated LAN behind Tailscale)
+- High availability, node failure recovery
+- Fine-tuning or training
+- Blog prose and publishable artifacts
+- GPU acceleration (unless the TTFT revisit condition triggers)
