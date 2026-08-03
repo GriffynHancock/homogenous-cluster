@@ -1,4 +1,8 @@
-# Homogenous Cluster
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Homogenous Cluster
 
 A 7-node CPU-only LLM inference cluster built from surplus school hardware,
 serving as a working demonstrator for a blog post about **repurposing idle
@@ -48,8 +52,27 @@ Candidate workloads, in order of rhetorical strength:
 
 ## Current state
 
-Planning only. No hardware provisioned. See
+Planning only. No code, no build tooling, no tests, no hardware provisioned.
+The repository currently contains this file and the design spec at
 `docs/superpowers/specs/2026-08-03-homogenous-cluster-design.md`.
+
+Read the spec before proposing any implementation — it records not just what to
+build but which architectures were rejected and why (GPU sharding, Exo,
+`dd` cloning). Re-proposing them wastes a cycle.
+
+## Working on this repo
+
+Most work here is remote: the cluster nodes are reached over Tailscale SSH, and
+llama.cpp is built on one machine and its binaries distributed fleet-wide.
+Build/test commands will be added here once the provisioning scripts exist.
+
+Two standing constraints when writing anything that touches the cluster:
+
+- **llama.cpp versions must match exactly across all nodes** or the RPC protocol
+  mismatches. Never build per-node.
+- **Node provisioning must be idempotent.** Disks vary in size and type across
+  the fleet, so the setup path is a Debian preseed plus a re-runnable
+  `setup.sh`, not a disk image.
 
 ## Key decisions already made
 
