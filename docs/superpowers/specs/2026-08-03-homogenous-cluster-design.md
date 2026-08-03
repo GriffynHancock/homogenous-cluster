@@ -64,26 +64,57 @@ offload. Success criterion: coherent multi-turn chat from a single node.
 
 **Model:** gpt-oss-20b, MXFP4 (~12.9 GB, 21B total / 3.6B active)
 
-Sharded across all 14 GB of pooled VRAM via llama.cpp RPC, with the lowest 1–2
-layers' expert tensors offloaded to CPU to fit. Only 3.6B active parameters
-means genuinely usable generation speed. This is what gets demoed live so the
-audience is not watching a spinner.
+Sharded across all 14 GB of pooled VRAM via llama.cpp RPC. Only 3.6B active
+parameters means genuinely usable generation speed. This is what gets demoed
+live so the audience is not watching a spinner.
 
-Fallback if it will not fit: Qwen3-30B-A3B at IQ3_XXS, or gpt-oss-20b with a
-higher `--n-cpu-moe` value.
+**The fit is tight and the fallback must not be CPU offload.** 14 GB nominal,
+minus ~250 MB CUDA context per GPU (~1.75 GB), leaves ~12.25 GB. A 12.9 GB model
+plus KV cache does not fit. KV cache is not free on 2 GB cards: gpt-oss-20b at
+8k context costs roughly 0.4 GB, and it lives on the node holding those layers,
+not spread evenly.
+
+Fallback is therefore **a smaller quant, not CPU offload** — CPU offload depends
+on the same unproven RPC mechanism as rung 3 (see Risks). In order of preference:
+
+1. gpt-oss-20b at 8k context, reduced KV via `-ctk q8_0 -ctv q8_0`
+2. Qwen3-30B-A3B at IQ3_XXS (~12 GB)
+3. Qwen3-14B Q4_K_M (~9 GB) — dense, slower, but certain to fit
 
 ### Rung 3 — The thesis (VRAM + system RAM)
 
 **Model:** gpt-oss-120b, MXFP4 (~63 GB, 117B total / 5.1B active)
 
 Attention, KV cache, routers and norms in the 14 GB of VRAM; routed expert FFN
-tensors in the ~49 GB of pooled system RAM via `--n-cpu-moe`. Expected to be
-slow (single-digit tok/s) but this is the point: frontier-class open-weights
-capability on hardware with zero acquisition cost. Extrapolates directly to the
-blog's Kimi K3 / 550 GB argument.
+tensors in the ~49 GB of pooled system RAM. Expected to be slow (single-digit
+tok/s) but this is the point: frontier-class open-weights capability on hardware
+with zero acquisition cost. Extrapolates directly to the blog's Kimi K3 /
+550 GB argument.
 
 Success criterion is **capability, not speed** — the output should be visibly
 better than anything a single node can produce.
+
+#### This rung has two possible architectures, and a test decides which
+
+`--n-cpu-moe` is applied by the process that loads the model, against *its own*
+CPU backend. Under RPC the master does not own the workers' system RAM — it sees
+a set of opaque remote backends. There is no path for the master's
+`--n-cpu-moe` to mean "put layer 40's experts in node 5's DDR3."
+
+**Architecture A (hybrid, preferred).** Run *two* `rpc-server` instances per
+node — one bound to CUDA, one to CPU — giving the master 14 backends. Then use
+`--override-tensor` regexes to force attention onto the CUDA backends and expert
+tensors onto the CPU backends. Viable only if `-ot` patterns can name an RPC
+device. **This is unproven and is the gate test below.**
+
+**Architecture B (CPU-only RPC, fallback).** If `-ot` cannot target RPC devices,
+drop the GPUs from rung 3 entirely and run 7 CPU-backend `rpc-server`s over the
+~49 GB of pooled system RAM. Slower, but it still makes the argument and still
+extrapolates to Kimi K3. Model target shrinks to a ~40 GB-class MoE:
+GLM-4.5-Air Q4, or Qwen3-30B-A3B at Q8.
+
+gpt-oss-120b (~63 GB) is only reachable under Architecture A. Do not commit to
+it as the rung 3 model until the gate test passes.
 
 ## Architecture
 
@@ -140,10 +171,21 @@ batch-1 generation; memory bandwidth is.
 
 ### OS and drivers
 
-**Debian 12 headless, NVIDIA 535 branch.** Pascal support is being wound down in
-newer driver branches, so the version is pinned deliberately — do not take the
-newest. No GUI, no display manager: every megabyte of VRAM consumed by a desktop
-is a megabyte unavailable to the model.
+**Debian 12 headless, NVIDIA 535 branch** (Debian's `nvidia-driver`).
+
+Pascal support is being wound down, but not yet: the **580** branch is the last
+to support Maxwell/Pascal/Volta, and support only drops at **590**. The 470
+legacy branch is for *Kepler* and is the wrong choice here. Debian 12's 535 is
+comfortably within Pascal's support window with headroom to spare — pin it and
+do not chase newer.
+
+llama.cpp must be built with `CMAKE_CUDA_ARCHITECTURES=61` (GP107 is compute
+capability 6.1). Since binaries are built once and distributed fleet-wide,
+getting this wrong costs all seven nodes at once — verify the built binary sees
+the GPU before distributing.
+
+No GUI, no display manager: every megabyte of VRAM consumed by a desktop is a
+megabyte unavailable to the model.
 
 ### Provisioning: scripted, not imaged
 
@@ -169,22 +211,35 @@ showing which node holds which layer range is the screenshot the blog needs.
 
 ## Risks to retire early
 
-Ordered by likelihood of derailing the build. Each should be tested on **two
-nodes before imaging seven**.
+Ordered by likelihood of derailing the build.
 
-1. **RPC + `--n-cpu-moe` may not compose.** Each `rpc-server` process exposes one
-   backend. Getting per-node CPU expert offload to work *through* the RPC layer
-   is the single most likely thing to not behave as documented. Rung 3 depends
-   entirely on this. Mitigation to test: running two `rpc-server` instances per
-   node, one bound to CUDA and one to CPU.
-2. **RPC pushes weights over the wire on every start.** The master distributes
+### Gate test — run before provisioning anything else
+
+**Can `--override-tensor` patterns name an RPC device?**
+
+Two nodes, two `rpc-server` instances each (one CUDA, one CPU), a small MoE, and
+an `-ot` regex attempting to route expert tensors to a specific remote CPU
+backend. This single question decides whether rung 3 is Architecture A or B, and
+therefore which model the whole cluster is built around.
+
+Running it costs two machines and an afternoon. Skipping it risks imaging seven
+machines for the wrong architecture.
+
+### Remaining risks
+
+1. **RPC pushes weights over the wire on every start.** The master distributes
    tensors to backends; 63 GB over gigabit is minutes per restart. `rpc-server -c`
-   enables a local file cache — verify it works on the built version.
-3. **Pascal driver support.** Confirm the 535 branch installs cleanly on Debian 12
-   and that `nvidia-smi` sees the P600 before anything else is attempted.
-4. **Rung 2 VRAM fit is tight.** 14 GB nominal minus ~250 MB CUDA context per GPU
-   (~1.75 GB total) leaves ~12.25 GB for a 12.9 GB model plus KV cache. Expect to
-   need CPU offload even at rung 2; have IQ-quant fallbacks ready.
+   enables a local file cache — verify it works on the built version before
+   accepting long iteration cycles as normal.
+2. **CUDA architecture flag.** llama.cpp built without
+   `CMAKE_CUDA_ARCHITECTURES=61` will not use the P600. Confirm on the build
+   machine before distributing binaries fleet-wide.
+3. **Pascal driver install.** Confirm Debian 12's `nvidia-driver` (535) installs
+   cleanly and `nvidia-smi` sees the P600 before anything else is attempted.
+   Pascal is supported through the 580 branch, so this should be uneventful — but
+   it is the cheapest possible thing to verify first.
+4. **Rung 2 VRAM fit.** ~12.25 GB usable against a 12.9 GB model. Fallbacks are
+   quant reductions, not CPU offload — see rung 2.
 
 ## Validation
 
