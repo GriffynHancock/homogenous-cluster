@@ -1,6 +1,6 @@
 # Status
 
-**Updated:** 2026-08-10
+**Updated:** 2026-08-11
 **Phase:** Planning complete. Awaiting node 1 to begin execution.
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
 
@@ -45,6 +45,7 @@ is marked as such.
 | Frontend | Open WebUI, lightly skinned |
 | Demo | Missing Link — async job runner (summarisation, report drafting) |
 | Chunking | **Map-reduce**, ~4K chunks / 10% overlap. Not refine, not stuffing. |
+| Concurrency | **Sequential until measured.** MoE may make batching worthless. |
 | Quality eval | BillSum (CC0), factual consistency + SummEval, scored separately |
 
 ## Hardware (revised 2026-08-10 — much better than first assumed)
@@ -80,21 +81,31 @@ argument: run what no single machine could hold, at any speed.
 - [ ] Effective memory bandwidth, derived from measured tok/s in Task 3. This
       recalculates every estimate in the spec.
 
-**Batching — could change Missing Link's design (agent dispatched 2026-08-11):**
+**Batching — researched 2026-08-11, one item now the top measurement priority:**
 
-- [ ] **How does `--parallel` divide `-c`?** Believed `-c 32768 --parallel 4`
-      gives each slot 8192, not 32768. If so, concurrent chunks may be silently
-      truncated — a corruption mode producing plausible but incomplete output.
-- [ ] **Does batching help on CPU as the bandwidth argument predicts?** A
-      forward pass reads weights once regardless of batch size, so N sequences
-      should cost ≈ the wall-clock of 1.
-- [ ] **Does MoE break that?** If sequences in a batch route to *different*
-      experts, expert bytes read grows with batch size and the free-batching
-      argument weakens. **The most important throughput unknown.**
-- [ ] **Does `--parallel` work over RPC at all**, or is it single-node only?
-- [ ] **Cross-talk bug** (#14893) — confirm fixed on the pinned build before
-      enabling `--parallel`. Leaked output between summaries of sensitive
-      records is the worst failure mode this project has.
+- [x] **`-c` IS divided across slots** — `n_ctx_seq = n_ctx / n_seq_max`, padded
+      to 256 (confirmed in `src/llama-context.cpp`). Size `-c` as
+      `per_chunk_context × n_parallel`. Also: leaving `--parallel` unset means
+      **4 slots**, not one — auto resolves to `n_parallel=4, kv_unified=true`.
+- [x] **Overflow is not silent** *provided `--ctx-shift` stays off* (the
+      default). Prompt-too-long → hard HTTP error; mid-generation overflow →
+      slot marks `truncated`. **With ctx-shift ON, KV is silently evicted** —
+      never enable it for document work.
+- [x] **Batching works over RPC** (exercised in #14893), but see the build pin
+      warning below.
+- [ ] **⚠️ Does MoE destroy the batching win?** Batch B touches
+      ≈ `min(B × top_k, n_experts)` experts, so bytes read may grow in step with
+      tokens produced — flat throughput. Dense CPU scales ~5.75× from batch
+      1→32; sparse MoE may scale ~1×. **No public measurement exists.** Run
+      `llama-batched-bench -np 1,2,4,8` on the real model. This decides whether
+      the blog's "a few seats" claim survives.
+- [ ] **Cross-talk test before enabling `--parallel`.** Trigger for #14893 was
+      **FA off + multi-slot + RPC**; `-fa auto` may resolve to off on CPU, which
+      matches this architecture exactly. Fix has no build tag — test explicitly
+      with unique markers in two concurrent requests regardless.
+- [ ] **⚠️ Build pin: avoid `b8492` and later without checking.** PR #20908
+      broke RPC tensor-split across machines (#21006); `b8487` was last
+      known-good. Confirm #21030/#26500 are merged in whatever tag is pinned.
 
 **Decide on measurement:**
 
@@ -147,6 +158,33 @@ argument: run what no single machine could hold, at any speed.
   validates raw LAN IPs as a security requirement, not just latency.
 - **The public 0.06 tok/s CPU-cluster figure is a misuse case** — the model
   already fitted on one host. Never cite it without that context.
+
+### Batching and concurrency
+
+- **Free batching is a dense-model property.** Measured on CPU (Intel Ultra 9
+  285K, discussion #18030): generation scaled 25.7 → 147.7 t/s from batch 1 → 32
+  (~5.75×), prefill flat at ~230 t/s throughout.
+- **Sparse MoE probably breaks it.** Batch B touches ≈ `min(B × top_k,
+  n_experts)` distinct experts, so bytes read grow roughly in step with tokens
+  produced. Reality should sit between neutral and linear — attention weights
+  and shared experts are reused, and popular experts overlap — but **nobody has
+  published MoE batching numbers on CPU.** Measure it.
+- **`-c` is divided across slots**: `n_ctx_seq = n_ctx / n_seq_max`, padded to
+  256. Size `-c` as `per_chunk_context × n_parallel`.
+- **Unset `--parallel` gives 4 slots**, not 1 — auto resolves to
+  `n_parallel=4, kv_unified=true`. Always set it explicitly.
+- **Prefer `--no-kv-unified`.** Unified mode is a shared elastic pool, so one
+  slot can starve others; it also has a reported bug where populated-but-idle
+  slots drag down active throughput (#19523).
+- **Keep `--ctx-shift` off** (default). Off → hard error or a visible
+  `truncated` flag. On → silent KV eviction, quietly dropping the start of the
+  document. That is invisible corruption.
+- **`-ub` (default 512) is worth raising for CPU prefill** — a larger ubatch
+  amortises weight loading across more tokens, targeting TTFT directly.
+- **`-t` and `-tb` can differ** — generation is bandwidth-bound and saturates
+  early; prefill is compute-bound and wants every core.
+- **Our exact combination is under-tested publicly** — CPU-only, RPC-sharded,
+  multi-slot, MoE. Budget time for undocumented bugs.
 
 ### Rejected alternatives (do not re-propose)
 
@@ -244,9 +282,14 @@ API, end-to-end.
   earlier instinct to just enlarge the context window. Added Task 14, a quality
   evaluation harness.
 - **2026-08-10** — Repo bundled for deployment and published.
-- **2026-08-11** — Worked through the pipeline topology properly. Recorded that
-  only one node computes at a time per request (utilisation 1/7), that seats are
-  possible because weights are read-only while KV cache is per-sequence, and
-  that batching should be near-free on a bandwidth-bound system — which would
-  make map-reduce chunks worth submitting concurrently rather than sequentially.
-  Research dispatched to verify before changing the worker.
+- **2026-08-11** — Worked through the pipeline topology properly: only one node
+  computes at a time per request (utilisation 1/7); seats are possible because
+  weights are read-only while KV cache is per-sequence and lives on the node
+  holding those layers.
+- **2026-08-11** — **Batching research qualified a core claim.** Free batching
+  is a dense-model property; on a sparse MoE, batch B touches ≈ B × top_k
+  experts, so bytes read grow with tokens produced and throughput may stay flat.
+  The "sharding multiplies seats" line in CLAUDE.md is now marked unresolved
+  pending `llama-batched-bench`. Also confirmed `-c` divides across slots, that
+  unset `--parallel` silently means 4 slots, that `--ctx-shift` must stay off to
+  avoid silent KV eviction, and that builds from b8492 broke RPC tensor-split.

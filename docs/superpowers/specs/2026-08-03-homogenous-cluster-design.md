@@ -120,43 +120,107 @@ cost RAM, distributed the same way the layers are. At ~96 KB/token for
 GQA-4 models, a 32k-context seat costs ~3 GB spread across the fleet — small
 against 128 GB/node.
 
-### Batching is nearly free on a bandwidth-bound system
+### Batching is free for dense models — and largely is not for sparse MoE
 
-A forward pass must read the weights, and on this hardware that read *is* the
-cost. It reads the same weights whether computing 1 sequence or 16 — the
-matmuls simply get wider, and compute is the resource we have spare.
+The tempting argument: a forward pass reads the weights once, so N sequences
+cost the same wall-clock as 1. **For a dense model this holds**, and there is
+measurement behind it — on an Intel Ultra 9 285K, generation scaled 25.7 → 147.7
+t/s from batch 1 → 32 (~5.75×), while prompt processing stayed flat at ~230 t/s
+throughout (llama.cpp discussion #18030).
 
-**Serving 8 requests should cost roughly the same wall-clock as serving 1.**
-Per-seat speed stays flat; aggregate throughput scales close to linearly.
+**For a very sparse MoE it largely does not.** Each token routes to its own
+experts, so distinct experts touched per forward pass ≈
+`min(batch × top_k, n_experts)`. For a Kimi K2-class model (~384 experts, ~8
+active per token):
 
-Two caveats, both to be verified by measurement:
+| Batch | Experts touched | Bytes read | Tokens produced | Net throughput gain |
+|---|---|---|---|---|
+| 1 | 8 | 1× | 1× | — |
+| 4 | ~32 | ~4× | 4× | **≈ none** |
+| 8 | ~64 | ~8× | 8× | **≈ none** |
+| 48 | 384 (all) | full model | 48× | fully saturated |
 
-- This is *not* bubble-filling. Continuous batching sends sequences through the
-  pipeline together as one wider pass, so node 1 still idles while node 2 works.
-  Batching wins through weight reuse, not utilisation — and therefore does not
-  depend on node count at all.
-- **MoE may undermine it.** If different sequences in a batch route to different
-  experts, the expert weights read per forward pass grows with batch size, and
-  the free-batching argument weakens. This is the single most important
-  unknown for throughput and must be measured, not assumed.
+You read 8× the bytes to produce 8× the tokens. Throughput stays roughly flat.
+**The same sparsity that makes a 550 GB model tractable at batch 1 is what
+prevents batching from helping.**
+
+Reality should land between neutral and linear, because attention weights and
+any shared experts *are* reused across the batch, and popular experts overlap
+between tokens. Where exactly is unknown — **no public measurement exists for
+MoE batching on CPU**, and this is the single most important throughput unknown
+in the design.
+
+**This qualifies the "sharding multiplies seats" claim.** That claim assumed
+concurrent requests are cheap. For a sparse MoE, each additional seat may cost
+close to proportional slowdown. Measure before repeating the claim in the blog.
+
+**Measure it early:** `llama-batched-bench` at `-np 1,2,4,8` against the real
+model. If the curve flattens immediately rather than scaling like the dense
+case, seat count should stay in low single digits.
 
 ### Consequence for Missing Link
 
-Map-reduce chunks are **independent** — chunk 5 does not depend on chunk 4. That
-is embarrassingly parallel and maps directly onto batching. A 40-chunk document
-should submit its chunks concurrently rather than sequentially, letting
-continuous batching absorb them for close to the cost of one pass.
+Map-reduce chunks are independent, so they *could* be submitted concurrently.
+Whether that helps depends entirely on the measurement above. **Keep the worker
+sequential until the curve is known** — on a sparse MoE, concurrent chunks may
+buy nothing while adding cross-talk risk.
 
-Before implementing that, verify:
+### Serving configuration
 
-1. **How `--parallel` divides `-c`.** Believed to split total context across
-   slots, so `-c 32768 --parallel 4` gives each slot 8192. If so, concurrent
-   chunks could be silently truncated — a corruption failure mode that produces
-   plausible-looking but incomplete summaries.
-2. **The cross-talk bug** (#14893) — KV-cache corruption under `--parallel`
-   causing output to leak between conversations. Fixed upstream; confirm on the
-   pinned build. Cross-contaminated summaries of sensitive records would be the
-   worst possible failure for this project.
+Confirmed by source read (`src/llama-context.cpp`, `tools/server/server.cpp`):
+
+- **`-c` is divided across slots** unless KV is unified:
+  `n_ctx_seq = n_ctx / n_seq_max`, padded to 256. So `-c 32768 --parallel 4
+  --no-kv-unified` gives each slot **8192**. Size `-c` as
+  `per_chunk_context × n_parallel`.
+- **Leaving `--parallel` unset does not mean single-slot.** It defaults to `-1`
+  (auto), which silently resolves to `n_parallel = 4, kv_unified = true`. Always
+  set it explicitly.
+- **Prefer `--no-kv-unified`.** Unified mode is a shared elastic pool — one slot
+  filling 28k of a 32k pool starves the others, which is unpredictable for
+  fixed-size chunks. It also has a reported throughput bug where populated-but-
+  idle slots drag down active ones (#19523).
+- **Leave `--ctx-shift` off** (the default). Overflow behaviour matters here:
+  - Prompt longer than the slot → **hard HTTP error**
+    (`exceed_context_size_error`). Good — a failure we can see.
+  - Overflow mid-generation with ctx-shift off → slot stops, marks `truncated`.
+    Visible.
+  - **With ctx-shift on → silent KV eviction**, quietly dropping the start of
+    the document. That is exactly the invisible-corruption mode to avoid.
+- `--cont-batching` is already enabled by default; no need to pass it.
+- `-ub` (physical batch, default 512) is worth raising for CPU prefill — larger
+  ubatch amortises weight loading across more tokens, which targets TTFT
+  directly. `-b` (default 2048) is a scheduling ceiling.
+- `-t` sets generation threads, `-tb` sets prefill/batch threads and defaults to
+  `-t`. They can differ: generation is bandwidth-bound and saturates early,
+  prefill is compute-bound and wants every core.
+
+### Cross-talk risk is structurally live on this architecture
+
+Discussion #14893 reported output leaking between concurrent conversations on an
+RPC cluster. The maintainer reproduced it and identified the trigger precisely:
+**flash attention disabled, multi-slot, RPC-sharded.**
+
+`-fa` defaults to `auto`, and **CPU flash-attention support lags CUDA** — so
+this fleet may well resolve to FA-off, matching the trigger condition exactly.
+The fix is stated only as "fixed on latest master" with no build tag, so it
+cannot be pinned by version alone.
+
+Therefore, before enabling `--parallel`:
+
+1. Check what `-fa auto` resolves to in the build's startup log.
+2. Test cross-talk explicitly — two concurrent requests with unique markers,
+   verify no bleed — **regardless of what FA resolves to.**
+
+Cross-contaminated summaries of sensitive records is the worst failure mode this
+project has. It is also silent.
+
+### Build pin warning
+
+**Do not pin at or after build `b8492` without checking.** PR #20908 introduced
+a regression breaking `rpc-server` tensor-split across machines with malformed-
+response crashes (#21006). `b8487` was the last known-good; fixes #21030/#26500
+were proposed — confirm they are merged in whatever tag is pinned.
 
 ## Memory budget
 

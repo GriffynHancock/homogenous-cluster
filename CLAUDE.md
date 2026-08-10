@@ -22,13 +22,21 @@ Two technical facts carry the whole argument:
 1. **Active params, not total params, determine speed.** Bytes read per token
    ≈ active params × bits-per-weight. Everything else is storage. A 1T-param
    model with 32B active is tractable on system RAM; a 70B dense model is not.
-2. **Pipeline sharding multiplies seats, not speed.** For one request, nodes run
-   sequentially — 7 nodes ≈ 1 node with 7× the RAM. With concurrent requests,
-   each node works on a different request's layers simultaneously. Aggregate
-   throughput scales with node count; per-seat speed stays flat.
+2. **Pipeline sharding buys capacity, not speed.** For one request, nodes run
+   sequentially — 7 nodes ≈ 1 node with 7× the RAM. The cluster exists to hold
+   a model no single machine could, not to run it faster.
 
 The honest pitch is therefore not "slow chatbot" but **"a few seats, each slow,
 running something the organisation could not otherwise touch at all."**
+
+**Unresolved — do not assert this in the blog until measured.** The "a few
+seats" half of that pitch assumed concurrent requests are cheap, which is true
+for dense models (measured ~5.75× throughput from batch 1→32 on CPU) but
+**probably not for a very sparse MoE.** Each token routes to its own experts, so
+batch B touches ≈ `min(B × top_k, n_experts)` experts — meaning bytes read grow
+roughly in step with tokens produced, and throughput stays flat. The sparsity
+that makes a 550 GB model tractable at batch 1 is what stops batching helping.
+Run `llama-batched-bench` at `-np 1,2,4,8` before claiming multiple seats.
 
 ## Missing Link
 
