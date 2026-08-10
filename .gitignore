@@ -1,0 +1,10 @@
+.DS_Store
+**/.DS_Store
+.venv/
+__pycache__/
+*.pyc
+.remember/
+eval/dataset.json
+eval/results.json
+provisioning/*.key
+provisioning/tskey*
