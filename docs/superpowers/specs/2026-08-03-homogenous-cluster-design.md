@@ -195,9 +195,53 @@ against a stub API; provisioning via a clean VM run.
 
 ### Why llama.cpp RPC, not Exo
 
-Exo's value is heterogeneous device discovery and MLX/Apple support. Neither
-applies to 7 identical Debian boxes. llama.cpp is already proven on this
-hardware.
+Exo is actively maintained (v1 rewrite Dec 2025, 16 releases through Apr 2026)
+and could *structurally* do this job — it pools RAM across nodes, splits layers
+memory-proportionally, and has native Qwen3-MoE support including a model card
+for this exact model. It is not a capability gap. It is the wrong tool anyway:
+
+- **MLX is now the only inference engine.** tinygrad, the former non-Apple
+  fallback, was deleted entirely in the v1 rewrite. Linux CPU exists as an
+  `MlxCpu` backend, but the project's own `PLATFORMS.md` files it under
+  **"Planned"**, not Tier 1. Tier 1 is Apple Silicon only.
+- **No CPU optimisation work exists.** Searching 2,353 commits for AVX or NUMA
+  returns nothing, and the repo publishes no x86 or CPU-cluster benchmarks.
+- **It cannot consume GGUF.** It requires MLX-format safetensors, so the chosen
+  Q8_0 asset would need re-sourcing at a different quant with a different
+  accuracy and speed profile.
+- **Its strongest feature is Mac-only hardware.** RDMA tensor parallelism needs
+  Thunderbolt 5 on macOS 26.2+. On gigabit Ethernet it falls back to the same
+  untested socket-ring path.
+
+Revisit only if Linux CPU moves to a tested tier with published non-Apple
+benchmarks, or a documented CPU-optimised path ships. Neither is underway.
+
+#### What Exo teaches us about the synchrony problem
+
+**Exo has not solved decode-time synchrony either.** It queues sends and flushes
+them asynchronously during *prefill*, letting compute run ahead of transmission.
+But during generation it calls `mx.eval()` immediately around every send and
+receive, per layer, per token — fully synchronous, exactly llama.cpp's
+constraint.
+
+A well-resourced project with a full rewrite and custom RDMA transport still
+eats synchronous per-layer round trips during generation. This is a hard
+problem, not a llama.cpp deficiency — and it tempers expectations for PR #18626:
+prefill gains look likely, decode gains much less certain.
+
+#### Techniques worth borrowing
+
+- **Separate control plane from data plane.** Exo runs discovery and
+  orchestration over Zenoh while per-token tensors go over a raw TCP ring. If
+  Missing Link adds coordination traffic, keep it off the inference hot path.
+- **Prefill send-queueing.** Defer sends during prefill and flush them
+  asynchronously so compute overlaps transmission. Prior art for #18626.
+- **Memory-proportional layer allocation** (largest-remainder rounding, floor of
+  one layer per node) — a clean reference for computing `--tensor-split` should
+  the fleet ever become memory-heterogeneous.
+- **Bandwidth-aware placement is unsolved.** Exo's own code carries a
+  `TODO: Profile and get actual connection speeds`; splits are capacity-
+  proportional only. Do not expect quick wins there.
 
 **RPC is immature, and upstream says so.** Its README states the backend is "in
 a proof-of-concept development stage… fragile and insecure. Never run the RPC

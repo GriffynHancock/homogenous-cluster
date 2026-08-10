@@ -93,17 +93,20 @@ Verify empirically on node 1 (cheap, no source found):
 - **prima.cpp and distributed-llama rejected.** prima.cpp has no MoE support and
   its original repo is gone; distributed-llama needs an all-reduce per layer per
   token over gigabit and abandons the GGUF stack.
+- **Exo rejection confirmed on evidence.** MLX is now its only engine (tinygrad
+  deleted in the v1 rewrite); Linux CPU is "Planned" tier, not Tier 1; zero CPU
+  optimisation commits in 2,353; no GGUF support; its RDMA tensor parallelism is
+  Thunderbolt/macOS-only.
+- **Nobody has solved decode-time synchrony.** Exo overlaps sends with compute
+  during prefill but is fully synchronous per layer per token during generation
+  — the same constraint llama.cpp has. Temper expectations for PR #18626:
+  prefill gains likely, decode gains uncertain.
 - **Upstream calls RPC "fragile and insecure, never run on an open network."**
   Validates the raw-LAN-IP decision as a security requirement, not just latency.
 - **The public 0.06 tok/s CPU-cluster figure is a misuse case** — the model
   already fitted on one host. Must never be cited without that context.
 - **Pin the llama.cpp build.** `--tensor-split` over RPC has regressed before
   (#21006); a bad pin breaks all seven nodes at once.
-
-## In flight
-
-Exo deep-dive — confirm the rejection holds now that the design is CPU-only,
-and mine its history for CPU efficiency techniques worth borrowing regardless.
 
 ## Next
 
@@ -131,3 +134,7 @@ and mine its history for CPU efficiency techniques worth borrowing regardless.
   performance, provisioning). Target confirmed as Q8_0. Discovered the ~75%
   per-node RPC RAM ceiling, which now sits alongside the pooled-headroom rule as
   a second independent constraint.
+- **2026-08-10** — Retracted the 30–55% RPC overhead figure; its source does not
+  survive scrutiny. Exo rejection re-confirmed against the current codebase, and
+  its architecture mined for borrowable techniques. All blocking questions
+  closed; ready to write the implementation plan.
