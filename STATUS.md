@@ -1,7 +1,7 @@
 # Status
 
 **Updated:** 2026-08-10
-**Phase:** Research (design approved, no hardware provisioned)
+**Phase:** Research complete; implementation plan not yet written
 
 ## Where things stand
 
@@ -33,9 +33,14 @@ Blocking the implementation plan:
       — if not, the fork is disqualified outright. Evidence on its speed is split
       (1.7–1.9× faster on a Broadwell Xeon; ~1.5× *slower* on Zen3 with Qwen3
       MoE). Defaulting to mainline; revisit as post-launch optimisation.
-- [ ] What `rpc-server -c` actually caches, and whether it avoids re-transfer
-- [ ] How layer split across RPC backends is controlled with uneven node RAM
-- [ ] Known RPC failure modes and their fixes
+- [x] **What `rpc-server -c` caches** — tensors ≥10 MiB, content-hashed, to
+      `$LLAMA_CACHE` or `~/.cache/llama.cpp/rpc`. Skips retransfer on match.
+      Run with `-c` always; there is a report of `<defunct>` without it.
+- [x] **Layer split control** — `--tensor-split`, ordered as the `--rpc` list.
+      Set explicitly; auto-split trusts buggy self-reported free memory.
+      `--split-mode row` does nothing over RPC.
+- [x] **Known RPC failure modes** — see spec Risks. Biggest is the ~75% per-node
+      RAM ceiling (#15055) and ~30–55% protocol overhead (#22850, unfixed).
 
 Not blocking, decide on measurement:
 
@@ -69,18 +74,23 @@ Verify empirically on node 1 (cheap, no source found):
   `always` for llama.cpp. Assert the default rather than tuning it.
 - **Preseed must set `non-free-firmware`** or recycled hardware may install
   without working NIC firmware.
-
-## In flight
-
-Three Sonnet research agents dispatched 2026-08-10, covering llama.cpp RPC
-pitfalls, Qwen3-30B-A3B CPU performance, and Debian fleet provisioning.
-Findings will be folded into the spec before the implementation plan is written.
+- **Hard ~75% per-node RAM ceiling in RPC** (#15055, unfixed). Binds separately
+  from the pooled 15% headroom. Q8_0 sits at 58% per node, so it clears.
+- **RPC protocol overhead is 30–55%** versus local and is unfixed (#22850) —
+  caused by protocol design, not the network. Not recoverable by tuning.
+- **Upstream calls RPC "fragile and insecure, never run on an open network."**
+  Validates the raw-LAN-IP decision as a security requirement, not just latency.
+- **The public 0.06 tok/s CPU-cluster figure is a misuse case** — the model
+  already fitted on one host. Must never be cited without that context.
+- **Pin the llama.cpp build.** `--tensor-split` over RPC has regressed before
+  (#21006); a bad pin breaks all seven nodes at once.
 
 ## Next
 
-1. Fold research findings into the spec; close the blocking questions above
-2. Write the implementation plan
-3. Provision node 1, run `llama-bench`, replace estimates with measurements
+1. Write the implementation plan
+2. Provision node 1, run `llama-bench`, replace estimates with measurements
+3. Resolve the `ik_llama.cpp` RPC-support question (only blocking item left,
+   and only if we want the fork at all — mainline is the default)
 
 ## Log
 
@@ -92,3 +102,7 @@ Findings will be folded into the spec before the implementation plan is written.
 - **2026-08-10** — Model target fixed at ~32 GB Qwen3-30B-A3B; RAM-dependent
   larger rungs deferred. Cloud framing removed from Missing Link — workloads are
   summarisation and report drafting, done entirely on-premises.
+- **2026-08-10** — Research phase run across three streams (RPC internals, model
+  performance, provisioning). Target confirmed as Q8_0. Discovered the ~75%
+  per-node RPC RAM ceiling, which now sits alongside the pooled-headroom rule as
+  a second independent constraint.

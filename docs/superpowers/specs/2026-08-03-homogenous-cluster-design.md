@@ -63,11 +63,28 @@ one. Missing Link exists to make that framing useful rather than apologetic.
 
 ## Memory budget
 
-**Usable model budget = (pooled RAM − 1 GB/node for OS) × 0.85.**
+Two constraints bind independently. **Both must hold.**
 
-The 15% headroom is a hard convention, not a guideline — it covers KV cache
-growth, activation buffers, RPC transfer buffers, and page-cache pressure.
-Configurations that fit only marginally are not specced.
+**1. Pooled headroom: usable = (pooled RAM − 1 GB/node for OS) × 0.85.**
+
+The 15% headroom covers KV cache growth, activation buffers, RPC transfer
+buffers and page-cache pressure. Configurations that fit only marginally are not
+specced.
+
+**2. Per-node hard ceiling: no node may hold more than ~75% of its physical RAM.**
+
+Exceeding this aborts the client with `"Remote RPC server crashed or returned
+malformed response"`; the server logs `"Null buffer for tensor passed to
+init_tensor function"`. This is an unfixed llama.cpp RPC limitation
+(ggml-org/llama.cpp #15055) with no workaround other than staying under it.
+
+This is a *per-node* limit and does not compose with the pooled figure — it
+binds separately and more tightly. Check any candidate model against both.
+
+| Constraint | Limit | Q8_0 target |
+|---|---|---|
+| Pooled (56 GB → ×0.85) | ~41.6 GB | 32.5 GB ✓ |
+| Per node (8 GB → 75%) | ~6 GB | ~4.64 GB (58%) ✓ |
 
 | RAM/node | Pooled | Usable budget |
 |---|---|---|
@@ -181,6 +198,53 @@ against a stub API; provisioning via a clean VM run.
 Exo's value is heterogeneous device discovery and MLX/Apple support. Neither
 applies to 7 identical Debian boxes. llama.cpp is already proven on this
 hardware.
+
+**RPC is immature, and upstream says so.** Its README states the backend is "in
+a proof-of-concept development stage… fragile and insecure. Never run the RPC
+server on an open network or in a sensitive environment!" This independently
+validates keeping the mesh on raw LAN IPs — it is a security requirement, not
+only a latency optimisation.
+
+It remains the right choice: it is actively maintained, and it is the only
+option for homogeneous CPU-only llama.cpp clustering. But treat it as fragile.
+
+**Pin to a known-good build; do not track `master`.** `--tensor-split` over RPC
+has broken across releases before (#21006, fixed in #21030/#26500). Since
+binaries are built once and distributed fleet-wide, a bad pin costs all seven
+nodes at once.
+
+**RPC pools memory; it does not scale compute.** Maintainer-confirmed. Nodes
+wait strictly sequentially — thread count controls intra-node parallelism only
+and does nothing for the inter-node wait. This is the same point CLAUDE.md makes
+as "sharding multiplies seats, not speed," now corroborated upstream.
+
+#### Key operational details
+
+- **`--tensor-split`** works over RPC and is the supported mechanism for uneven
+  node RAM. Weights are relative, ordered as the `--rpc host:port,...` list plus
+  local devices. Default auto-split allocates by *self-reported* free memory,
+  which has known reporting bugs — **set `--tensor-split` explicitly** against
+  measured RAM rather than trusting auto-split.
+- **`--device` flags must come after `--rpc`** or the device list misresolves.
+- **`--split-mode row` has no effect over RPC.** Pipeline layer-splitting only;
+  true tensor parallelism is local-multi-GPU only.
+- **`rpc-server -t` defaults to half the logical cores**, not all of them. On
+  dedicated nodes this under-utilises the machine — set it explicitly.
+- **Version mismatch fails loudly**, not silently: `negotiate_hello()` rejects
+  the connection and logs `"RPC server version mismatch"`. Good — it means a
+  mismatched node cannot silently corrupt output.
+
+#### Cache behaviour
+
+`rpc-server -c` caches to `$LLAMA_CACHE` or `~/.cache/llama.cpp/rpc`. Tensors
+≥10 MiB are content-hashed and skipped on retransfer; anything smaller is always
+re-sent. Known rough edges: cache files are bare content hashes with no model
+association, so selective cleanup is impossible — wipe the whole directory.
+Loading is also not parallel across nodes even when every node has a full cache
+(#16434, open).
+
+There is a report of `rpc-server` going `<defunct>` when run as a background
+service *without* `-c` (#13185). Run with `-c` regardless.
 
 **`ik_llama.cpp` is a maybe, not a recommendation.** The fork is optimised for
 CPU-side MoE inference, but the evidence is genuinely split:
@@ -374,16 +438,44 @@ Also measure **concurrent seats**: throughput at 1, 2, 4 and 7 simultaneous
 requests. This is the claim that pipeline sharding multiplies seats, and it
 needs evidence.
 
+### Do not cite the 0.06 tok/s figure
+
+The only public CPU-cluster RPC throughput number — 20 nodes, 390 GB RAM,
+DeepSeek-R1 at **0.06 tok/s** (#12974) — measures RPC *misapplied*. The model
+already fitted in a single host's RAM, so RPC contributed pure coordination
+overhead for no benefit. The maintainer's own explanation is that adding RPC
+nodes to a model that already fits is expected to make things worse.
+
+Quoted without that context it would badly misrepresent the architecture. **No
+credible CPU-only RPC throughput figure exists in public sources** for any model
+in this class — which is precisely why measuring on this hardware is worth
+publishing.
+
 ## Risks
 
 1. **CPU prefill may be worse than expected.** Broadwell without AVX-512 on a
    4,000-token document could exceed a minute before first token. Measure early;
    it drives the GPU revisit decision and possibly the choice of workload.
 2. **RPC pushes weights over the wire on every start.** 32 GB over gigabit is
-   several minutes per restart, which makes iteration painful. `rpc-server -c`
-   enables a local file cache — verify on the built version before accepting
-   slow iteration as normal.
-3. **Swap death.** With models sized to pooled RAM, any overshoot pushes a node
+   several minutes per restart. `rpc-server -c` caches tensors ≥10 MiB, which
+   should make subsequent restarts fast — verify on the built version before
+   accepting slow iteration as normal.
+3. **RPC protocol overhead is significant and unfixed.** Measured 33% loss on
+   prompt processing and 28–55% on generation versus local, *even with more
+   bandwidth available than local PCIe* (#22850, open). The cause is protocol
+   design — graph topology reserialised every execution, synchronous blocking
+   calls, no pipelining — not the network. Budget for it; do not expect tuning
+   to recover it.
+4. **Concurrent requests had a KV-cache corruption bug.** With Flash Attention
+   disabled, concurrent arrivals could leak output between conversations
+   (#14893). Maintainer-confirmed fixed on master as of Aug 2025, but this is
+   directly relevant if Missing Link ever runs jobs concurrently — verify on the
+   pinned build before enabling `--parallel`.
+5. **Large-model loads can hang.** Models over ~100 GiB have hung indefinitely in
+   `load_tensors` where `llama-bench` succeeded on identical config; `-dio`
+   (direct I/O, bypassing mmap) resolves it (#19745). Not expected at 32 GB, but
+   worth knowing if the model grows.
+6. **Swap death.** With models sized to pooled RAM, any overshoot pushes a node
    into swap and collapses throughput. The 15% headroom exists for this; disable
    swap on worker nodes so failures are loud rather than silent.
 
