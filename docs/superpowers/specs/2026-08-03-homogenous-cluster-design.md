@@ -213,6 +213,10 @@ has broken across releases before (#21006, fixed in #21030/#26500). Since
 binaries are built once and distributed fleet-wide, a bad pin costs all seven
 nodes at once.
 
+**Watch PR #18626** (async/pipelined RPC). It is maintainer-authored and active.
+When it lands, re-benchmark and consider moving the pin — it is the one upstream
+change likely to materially improve this cluster's throughput.
+
 **RPC pools memory; it does not scale compute.** Maintainer-confirmed. Nodes
 wait strictly sequentially — thread count controls intra-node parallelism only
 and does nothing for the inter-node wait. This is the same point CLAUDE.md makes
@@ -234,6 +238,44 @@ as "sharding multiplies seats, not speed," now corroborated upstream.
   the connection and logs `"RPC server version mismatch"`. Good — it means a
   mismatched node cannot silently corrupt output.
 
+#### Protocol overhead
+
+A figure of "30–55% RPC overhead" circulates (issue #22850) and **should not be
+treated as measurement.** The issue was LLM-authored by the submitter's own
+admission, and a maintainer closed it in under two hours for violating the
+repository's AI-usage policy — with no technical review either way. Its
+benchmark also compared against a deliberately crippled local baseline (a GPU on
+a single PCIe v1 lane), which inflates the apparent RPC penalty.
+
+Critically, it was measured on build `b9033`, which **predates the fix for the
+main problem it identified by 32 minutes.**
+
+The three mechanisms it named, assessed against current source:
+
+| Mechanism | Real? | Status |
+|---|---|---|
+| Graph metadata reserialised each execution | Yes | **Fixed** — #22701 (May 2026) adds a `graph_uid` fast path; unchanged graph shapes send a tiny `GRAPH_RECOMPUTE` instead. Hardened by #23273. |
+| Synchronous blocking calls, no pipelining | Yes | **Unfixed in mainline, fix open and active** — PR #18626 by rgerganov (the RPC author), `mergeable`, last updated Aug 2026. A community PR (#24675) measured CPU-only pipelined prefill improving 37.96 → 59.84 t/s across two workers. |
+| `HASH_THRESHOLD` = 10 MiB | Yes | **Likely a misdiagnosis.** During generation, `SET_TENSOR` carries KV-cache writes and fresh activations — new bytes every token. Hashing would almost never dedup while adding a round-trip and a full hash pass. Lowering it would plausibly make generation *slower*. Do not patch it. |
+
+**The overhead is probably much smaller here than the GPU-derived numbers
+suggest.** Those came from a setup where per-token compute is microseconds, so a
+millisecond-scale round-trip dominates. On CPU-bound MoE inference, per-token
+compute is tens to hundreds of milliseconds against a sub-millisecond LAN
+round-trip — a far smaller ratio. This is reasoning, not measurement.
+
+**Measure it directly, before provisioning anything.** Run `llama-bench`
+locally, then again against `--rpc localhost:PORT` on the same machine with the
+same model. That isolates pure protocol cost with the network removed entirely,
+needs one machine, and converts this whole section from inference to fact.
+
+Prefill may fare worse than generation: varying prefill chunk sizes change the
+graph shape and so defeat the `graph_uid` fast path. Measure both.
+
+**Keep batch shapes constant across steps** where possible — that is what keeps
+`graph_uid` stable and the fast path active. This is usage discipline, not a
+flag.
+
 #### Cache behaviour
 
 `rpc-server -c` caches to `$LLAMA_CACHE` or `~/.cache/llama.cpp/rpc`. Tensors
@@ -246,8 +288,10 @@ Loading is also not parallel across nodes even when every node has a full cache
 There is a report of `rpc-server` going `<defunct>` when run as a background
 service *without* `-c` (#13185). Run with `-c` regardless.
 
-**`ik_llama.cpp` is a maybe, not a recommendation.** The fork is optimised for
-CPU-side MoE inference, but the evidence is genuinely split:
+**`ik_llama.cpp` is a maybe, not a recommendation.** It **does** support
+`rpc-server` (confirmed: `examples/rpc/rpc-server.cpp` present, same TCP
+architecture as upstream), and it is actively maintained. But the speed evidence
+is genuinely split:
 
 - On a Xeon E5-2683 v4 — **Broadwell, AVX2, no AVX-512, the closest available
   hardware analog** — it showed a 1.7–1.9× speedup on Mixtral-8x7B.
@@ -255,13 +299,21 @@ CPU-side MoE inference, but the evidence is genuinely split:
   generation and ~2× slower prefill than mainline (ik_llama.cpp issue #1699).
 - Its stated optimisations lean on AVX-512, which Broadwell lacks.
 
-**Blocking unknown: does `ik_llama.cpp` support `rpc-server`?** Unconfirmed by
-research. If it does not, the fork is disqualified regardless of speed, because
-the whole architecture depends on RPC. Check this against its source before
-spending any time benchmarking it.
+Its RPC code is at rough parity with mainline — it carries the same `graph_uid`
+fast path and the same synchronous blocking limitation, with no independent work
+on the protocol. Its investment is in CPU compute kernels, which is where any
+benefit would come from.
 
-Default to mainline. Treat the fork as an optimisation to test after the cluster
+Default to mainline. Treat the fork as an optimisation to A/B after the cluster
 works, not a choice to make up front.
+
+**Rejected: prima.cpp and distributed-llama.** prima.cpp's original repo is gone
+(404); the live continuation is `OpenCPIL/prima.cpp`, but it shows **no MoE
+support** — disqualifying — and its ring/prefetch design targets disk-bound
+consumer devices, solving a different problem. distributed-llama is maintained
+and CPU-focused but uses tensor parallelism with its own weight format, meaning
+an all-reduce per layer per token across 7 nodes on gigabit — plausibly *worse*
+than pipeline sharding here — plus abandoning the GGUF/Open WebUI stack.
 
 ### Networking
 
@@ -468,12 +520,9 @@ publishing.
    several minutes per restart. `rpc-server -c` caches tensors ≥10 MiB, which
    should make subsequent restarts fast — verify on the built version before
    accepting slow iteration as normal.
-3. **RPC protocol overhead is significant and unfixed.** Measured 33% loss on
-   prompt processing and 28–55% on generation versus local, *even with more
-   bandwidth available than local PCIe* (#22850, open). The cause is protocol
-   design — graph topology reserialised every execution, synchronous blocking
-   calls, no pipelining — not the network. Budget for it; do not expect tuning
-   to recover it.
+3. **RPC protocol overhead exists but its size is unknown.** See "Protocol
+   overhead" below — the widely-cited 30–55% figure does not survive scrutiny,
+   and the real magnitude for this configuration has never been measured.
 4. **Concurrent requests had a KV-cache corruption bug.** With Flash Attention
    disabled, concurrent arrivals could leak output between conversations
    (#14893). Maintainer-confirmed fixed on master as of Aug 2025, but this is

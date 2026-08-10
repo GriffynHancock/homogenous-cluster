@@ -29,10 +29,11 @@ Blocking the implementation plan:
 - [x] **Which Qwen3-30B-A3B variant and quant** — Instruct-2507, **Q8_0
       (32.5 GB)**. Fits the ~41.6 GB pooled budget with ~9 GB spare; ~4.6 GB per
       node. Fallbacks Q6_K (25.1 GB), Q5_K_M (21.7 GB).
-- [ ] **Does `ik_llama.cpp` support `rpc-server`?** Unconfirmed and load-bearing
-      — if not, the fork is disqualified outright. Evidence on its speed is split
-      (1.7–1.9× faster on a Broadwell Xeon; ~1.5× *slower* on Zen3 with Qwen3
-      MoE). Defaulting to mainline; revisit as post-launch optimisation.
+- [x] **Does `ik_llama.cpp` support `rpc-server`?** **Yes** — confirmed in
+      source. Its RPC code is at parity with mainline (same fast path, same
+      synchronous limitation). Speed evidence is split (1.7–1.9× faster on a
+      Broadwell Xeon; ~1.5× *slower* on Zen3 with Qwen3 MoE). Defaulting to
+      mainline; A/B it after the cluster works.
 - [x] **What `rpc-server -c` caches** — tensors ≥10 MiB, content-hashed, to
       `$LLAMA_CACHE` or `~/.cache/llama.cpp/rpc`. Skips retransfer on match.
       Run with `-c` always; there is a report of `<defunct>` without it.
@@ -78,8 +79,20 @@ Verify empirically on node 1 (cheap, no source found):
   without working NIC firmware.
 - **Hard ~75% per-node RAM ceiling in RPC** (#15055, unfixed). Binds separately
   from the pooled 15% headroom. Q8_0 sits at 58% per node, so it clears.
-- **RPC protocol overhead is 30–55%** versus local and is unfixed (#22850) —
-  caused by protocol design, not the network. Not recoverable by tuning.
+- **The "30–55% RPC overhead" figure is not credible** and has been removed from
+  the spec. Issue #22850 was LLM-authored and closed in under two hours for an
+  AI-policy violation with no technical review; it benchmarked against a
+  crippled baseline, on a build predating the fix for the main problem it
+  identified. The real overhead for CPU-only batch-1 is **unmeasured** and
+  likely far smaller. Measure it with the localhost `--rpc` test.
+- **Graph reserialisation is fixed** (#22701 `graph_uid` fast path). Keep batch
+  shapes constant across steps to keep that path active.
+- **Async/pipelined RPC is coming** — PR #18626, authored by the RPC maintainer,
+  open and active. A related CPU-only test showed prefill 37.96 → 59.84 t/s
+  across two workers. Watch it; re-benchmark and re-pin when it lands.
+- **prima.cpp and distributed-llama rejected.** prima.cpp has no MoE support and
+  its original repo is gone; distributed-llama needs an all-reduce per layer per
+  token over gigabit and abandons the GGUF stack.
 - **Upstream calls RPC "fragile and insecure, never run on an open network."**
   Validates the raw-LAN-IP decision as a security requirement, not just latency.
 - **The public 0.06 tok/s CPU-cluster figure is a misuse case** — the model
@@ -89,19 +102,17 @@ Verify empirically on node 1 (cheap, no source found):
 
 ## In flight
 
-Investigating whether the 30–55% RPC protocol overhead (#22850) is fixed,
-fixable, or fixed in a fork (prima.cpp, distributed-llama, ik_llama.cpp).
-This is potentially architecture-changing: a 30–55% tax on an already-slow
-cluster may not be acceptable, and an alternative transport may be warranted.
-
-Exo deep-dive queued behind it — confirm the rejection holds now that the
-design is CPU-only, and mine its history for CPU efficiency techniques worth
-borrowing regardless.
+Exo deep-dive — confirm the rejection holds now that the design is CPU-only,
+and mine its history for CPU efficiency techniques worth borrowing regardless.
 
 ## Next
 
-1. Resolve the RPC overhead question; decide whether the transport changes
-2. Write the implementation plan
+1. Write the implementation plan
+2. **Run the localhost RPC overhead test** — `llama-bench` local vs
+   `--rpc localhost:PORT`, same machine, same model. Needs one machine, no
+   cluster. Converts the overhead question from inference to fact and is the
+   cheapest high-value measurement available.
+3. Provision node 1, benchmark, replace estimates with measurements
 2. Provision node 1, run `llama-bench`, replace estimates with measurements
 3. Resolve the `ik_llama.cpp` RPC-support question (only blocking item left,
    and only if we want the fork at all — mainline is the default)
