@@ -19,13 +19,38 @@ publishable artifacts are out of scope.
 
 ## Hardware
 
+**Revised 2026-08-10 — the hardware is far better than originally assumed.**
+Machines are ECC-equipped (so likely Xeon, not i5) with **4 × 32 GB DDR4-2400
+per node**. Two nodes confirmed by inspection; the rest are unverified.
+
 | Component | Per node | × 7 nodes |
 |---|---|---|
-| CPU | 5th-gen Intel i5 (Broadwell), AVX2, no AVX-512 | 7 |
-| System RAM | DDR3-1600 dual channel, ~25 GB/s | see ladder |
+| CPU | Unconfirmed — ECC implies Xeon. Verify. | 7 |
+| System RAM | **128 GB DDR4-2400 ECC** | **~896 GB** |
 | Storage | Mixed SSD + HDD, varying sizes | — |
 | Network | Gigabit ethernet, same switch | — |
-| GPU | 1× Quadro P600 2 GB — **unused** | — |
+| GPU | 1× Quadro P — display only, unused for compute | — |
+
+**Unverified and load-bearing:**
+- CPU model, core count, and channel count. Bandwidth is the binding constraint
+  and quad-channel DDR4-2400 (~76.8 GB/s) is roughly **3× the original DDR3
+  estimate**. Hex-channel would be ~115 GB/s.
+- Whether all 7 nodes carry 128 GB, or only the two inspected.
+- Whether the CPU has AVX-512 (Xeon often does; it would materially help
+  prefill, which is compute-bound).
+
+Run on the first node and record before any model decision is final:
+
+```bash
+lscpu | grep -E 'Model name|^CPU\(s\)|Socket|Thread|Core|avx512'
+sudo dmidecode -t memory | grep -E 'Size|Speed|Locator|Rank' | head -60
+sudo dmidecode -t processor | grep -E 'Version|Core Count|Thread Count'
+```
+
+**Headless is still correct**, but for a different reason than originally
+written. The GPU is present for display, so VRAM is no longer the argument —
+running headless simply avoids spending RAM and CPU cycles on a desktop that
+nothing will ever look at.
 
 ### The GPUs are dropped
 
@@ -81,10 +106,15 @@ init_tensor function"`. This is an unfixed llama.cpp RPC limitation
 This is a *per-node* limit and does not compose with the pooled figure — it
 binds separately and more tightly. Check any candidate model against both.
 
-| Constraint | Limit | Q8_0 target |
-|---|---|---|
-| Pooled (56 GB → ×0.85) | ~41.6 GB | 32.5 GB ✓ |
-| Per node (8 GB → 75%) | ~6 GB | ~4.64 GB (58%) ✓ |
+At 128 GB/node × 7:
+
+| Constraint | Limit |
+|---|---|
+| Pooled: (896 − 7) × 0.85 | ~756 GB |
+| Per node: 128 × 0.75 × 7 | **~672 GB** ← binds |
+
+**~672 GB of usable model budget.** That is a different project from the one
+originally specced against 41 GB.
 
 | RAM/node | Pooled | Usable budget |
 |---|---|---|
@@ -101,49 +131,54 @@ the blog: the bottleneck is the cheapest component in the machine.
 
 ## Target model
 
-**Qwen3-30B-A3B-Instruct-2507, Q8_0 (32.5 GB)** — 30B total, ~3.3B active,
-48 layers, GQA with 32 query / 4 KV heads, 32k native context.
+### The cluster now has to earn its existence
 
-Fits the current ~41.6 GB pooled budget with ~9 GB spare, and requires no RAM
-purchase. Per node that is only ~4.6 GB of model weights against ~7 GB
-available — comfortable, not marginal.
+With 128 GB per node, **a single node holds 96 GB of model.** That is enough for
+gpt-oss-120b (63 GB) with room to spare. The seven-node cluster is not justified
+by anything under ~96 GB — one machine would do it, faster, with no RPC overhead
+at all.
 
-The pooling is what buys the quant tier. On any single node, Q8_0 would be
-impossible and Q4_K_M (18.6 GB) would be the ceiling. This is the design's
-central claim in miniature.
+This sharpens the argument rather than weakening it. The cluster's purpose is
+now unambiguous: **run models that no single machine in the building could hold,
+at any speed.** That is a much cleaner claim than "run a medium model slowly."
 
-Quant sizes for reference, should the budget move:
+### Candidate ladder
 
-| Quant | Size | Notes |
-|---|---|---|
-| Q4_K_M | 18.6 GB | Single-node ceiling if pooling failed |
-| Q5_K_M | 21.7 GB | Conservative fallback |
-| Q6_K | 25.1 GB | Fallback if Q8_0 proves tight in practice |
-| **Q8_0** | **32.5 GB** | **Target** |
+Estimates assume quad-channel DDR4-2400 (~76.8 GB/s) at 55% real efficiency.
+**All figures are arithmetic pending measurement.** Bytes/token ≈ active params
+× bytes-per-weight.
 
-**KV cache is not a constraint.** GQA at 4 KV heads gives ~96 KB/token: ~0.75 GB
-at 8k, ~3 GB at 32k (fp16). Long context is limited by prefill *time*, not
-memory — which is the opposite of the usual situation and worth stating in the
-blog.
+| Model | Size | Active | Nodes needed | Est. tok/s | Role |
+|---|---|---|---|---|---|
+| gpt-oss-120b MXFP4 | 63 GB | 5.1B | **1** | ~15–20 | Single-node baseline; the speed reference |
+| Qwen3-235B-A22B Q4 | ~140 GB | 22B | 2 | ~3–4 | First model needing the cluster |
+| DeepSeek-V3 Q4 | ~400 GB | 37B | 5 | ~2 | Frontier-class, genuinely slow |
+| **Kimi K2 Q4** | **~550 GB** | **32B** | **7** | **~2** | **The thesis** |
 
-### Expected speed
+Kimi K2 at ~550 GB fits the ~672 GB budget with real headroom. This is the model
+originally described as the aspiration, and it is now reachable rather than
+extrapolated.
 
-Bytes read per token ≈ 3.3B active × ~1 byte (Q8_0) ≈ **3.3 GB/token**. Against
-~25 GB/s DDR3 that is a ~7.5 tok/s theoretical ceiling; at the 50–70% bandwidth
-efficiency typical of old hardware, expect **4–5 tok/s per seat**.
+### The comparison that makes the blog
 
-This is arithmetic on datasheets and must be replaced by measurement. **No
-public benchmark exists for this model class on Broadwell/DDR3/AVX2** — the
-research turned up nothing closer than DDR4 Xeons. Prefill on AVX2-without-
-AVX-512 is entirely unmeasured, which matters because prefill dominates
-time-to-first-token on document workloads.
+Running **gpt-oss-120b on one node** and **Kimi K2 across seven** on the same
+hardware gives a direct, measured statement: *this is what one salvaged desktop
+does, and this is what seven do together — and the second is a model class the
+organisation could not otherwise touch at all.* Both numbers come from the same
+room, the same afternoon, and no cloud account.
 
-### Model lineage note
+### KV cache
 
-Qwen has since shipped Qwen3.5-35B-A3B and Qwen3.6-35B-A3B, which supersede
-30B-A3B as the small-MoE flagship. Different total parameter count, so not a
-drop-in, and quant sizes shift accordingly. Worth evaluating before the build
-starts, but 30B-A3B is the specced target because its sizes are known.
+GQA keeps this small. For Qwen3-class models, ~96 KB/token: ~3 GB at 32k. Even
+across the larger models KV cache is not the constraint — **prefill time is.**
+With 128 GB/node there is ample room to raise context substantially.
+
+### What must be measured before committing
+
+1. **Actual memory bandwidth** — `llama-bench` on one node yields effective
+   GB/s, which recalculates every row above.
+2. **Whether all 7 nodes have 128 GB.** Two are confirmed; five are not.
+3. **Prefill throughput**, especially if the CPU has AVX-512.
 
 ### Stepping stone
 

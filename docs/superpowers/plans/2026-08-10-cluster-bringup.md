@@ -13,15 +13,36 @@
 - **llama.cpp version must match byte-for-byte across all nodes.** Build once, distribute binaries. Never build per-node. Version mismatch is rejected at handshake with `"RPC server version mismatch"`.
 - **Pin the llama.cpp build to a specific tag.** Do not track `master`. `--tensor-split` over RPC has regressed before (#21006).
 - **Two independent memory constraints, both must hold:**
-  - Pooled: `(pooled RAM − 1 GB/node) × 0.85` — currently ~41.6 GB.
-  - **Per node: ≤75% of physical RAM** (llama.cpp #15055, unfixed; exceeding it aborts with `"Remote RPC server crashed or returned malformed response"`).
+  - Pooled: `(pooled RAM − 1 GB/node) × 0.85` — ~756 GB at 128 GB/node.
+  - **Per node: ≤75% of physical RAM** (llama.cpp #15055, unfixed; exceeding it aborts with `"Remote RPC server crashed or returned malformed response"`). At 128 GB/node this is 96 GB/node, **~672 GB pooled — the binding constraint.**
 - **Never pass `--advertise-routes`** on any node. It would pull RPC onto WireGuard.
-- **`rpc-server -t` defaults to half the cores.** Always set `-t 4` explicitly.
+- **`rpc-server -t` defaults to half the cores.** Always set `-t` explicitly to the real core count.
 - **Always run `rpc-server` with `-c`** (local tensor cache).
-- Target model: `Qwen3-30B-A3B-Instruct-2507` **Q8_0**, 32.5 GB.
+- **Model target is not yet fixed** — it depends on measurements from Task 1. See "Model selection" below.
 - Node 1 is the master. Nodes 2–7 are workers.
 - Record every measurement in `docs/measurements.md`. Never quote a performance number that is not in that file.
 - Do not patch `HASH_THRESHOLD`. See spec.
+- Default context: **32768**. With 128 GB/node, KV cache is not the constraint.
+
+## Model selection
+
+Hardware revised 2026-08-10: **128 GB DDR4-2400 ECC per node**, ~896 GB pooled.
+This changes what the cluster is for. A single node holds 96 GB — so anything
+smaller than that does not need a cluster at all.
+
+Two models are built, and the pair is the deliverable:
+
+| | Model | Size | Nodes | Purpose |
+|---|---|---|---|---|
+| **A** | gpt-oss-120b MXFP4 | 63 GB | **1** | Single-node baseline and speed reference |
+| **B** | Kimi K2 Q4 (Unsloth) | ~550 GB | **7** | The thesis: a model no single machine could hold |
+
+Model A is fetched in Task 3 and Model B in Task 7. Confirm exact Kimi K2 quant
+filenames and sizes at fetch time — pick the largest Unsloth quant that leaves
+every node at ≤75% of 128 GB (i.e. total ≤672 GB), keeping 15% pooled headroom.
+
+If Task 1 reveals that nodes do **not** all have 128 GB, recompute both
+constraints before fetching Model B and raise it with the user.
 
 ---
 
@@ -118,14 +139,26 @@ d-i finish-install/reboot_in_progress note
 Boot the installer with the preseed. Then on node 1 run and record the output:
 
 ```bash
-lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core'
-grep -o avx2 /proc/cpuinfo | head -1
+lscpu | grep -E 'Model name|^CPU\(s\)|Socket|Thread|Core|NUMA'
+grep -oE 'avx2|avx512[a-z]*' /proc/cpuinfo | sort -u
 free -h
-sudo dmidecode -t memory | grep -E 'Size|Speed|Locator' | head -40
+sudo dmidecode -t memory | grep -E 'Size|Speed|Locator|Rank' | head -60
+sudo dmidecode -t processor | grep -E 'Version|Core Count|Thread Count'
 lsblk -d -o NAME,SIZE,ROTA
 ```
 
-Expected: AVX2 present; 4 cores; RAM total and free DIMM slot count established.
+**Everything downstream depends on these numbers.** Specifically:
+- **Core count** sets `-t` on `rpc-server` (Task 6). The default is half the
+  cores, so this must be a real measured number, not an assumption.
+- **Memory channels** (infer from DIMM `Locator` labels, e.g. `CPU1_DIMM_A1`)
+  determine bandwidth, which determines tokens/sec more than anything else.
+  Quad-channel DDR4-2400 ≈ 76.8 GB/s; hex-channel ≈ 115 GB/s.
+- **AVX-512 presence** materially affects prefill, which is compute-bound.
+- **Total RAM** — confirm 128 GB. If any node differs, both memory constraints
+  need recomputing before a model is chosen.
+- **Socket count / NUMA nodes** — a dual-socket board needs NUMA-aware thread
+  pinning, which single-socket does not. If `NUMA node(s)` is greater than 1,
+  flag it: `--numa distribute` may be needed and is currently untested here.
 
 - [ ] **Step 3: Record the hardware facts**
 
@@ -146,10 +179,13 @@ this file.
 | Fact | Value |
 |---|---|
 | CPU model | <from lscpu> |
-| Cores / threads | <from lscpu> |
-| AVX2 | <yes/no> |
+| Sockets / cores / threads | <from lscpu> |
+| NUMA nodes | <from lscpu> |
+| AVX2 / AVX-512 | <from /proc/cpuinfo> |
 | RAM total | <from free -h> |
-| RAM per DIMM / free slots | <from dmidecode> |
+| DIMM size / speed / count | <from dmidecode> |
+| Inferred memory channels | <from DIMM locator labels> |
+| Theoretical bandwidth (GB/s) | <channels × 2400 MT/s × 8 bytes> |
 | Disk (size, rotational) | <from lsblk> |
 ```
 
@@ -259,7 +295,7 @@ set -euo pipefail
 
 BIN=/opt/llama.cpp/bin
 MODEL="${MODEL:-/opt/models/qwen3-4b-q4km.gguf}"
-THREADS="${THREADS:-4}"
+THREADS="${THREADS:-$(nproc)}"
 PORT=50052
 
 echo "=== Baseline: local, no RPC ==="
@@ -354,7 +390,7 @@ set -euo pipefail
 
 BIN=/opt/llama.cpp/bin
 MODEL="${MODEL:-/opt/models/qwen3-4b-q4km.gguf}"
-THREADS="${THREADS:-4}"
+THREADS="${THREADS:-$(nproc)}"
 PORT=8080
 
 echo "=== Throughput: prefill and generation ==="
@@ -409,15 +445,77 @@ Append to `docs/measurements.md`:
 | TTFT @ ~2000 tok prompt (s) | |
 ```
 
-- [ ] **Step 4: Sanity-check prefill against the GPU revisit condition**
+- [ ] **Step 4: Fetch and benchmark Model A — gpt-oss-120b on ONE node**
 
-The spec says GPUs come back only if TTFT is unbearable. Compare pp2048 against the ~2000-token TTFT. If TTFT exceeds **90 seconds**, note it prominently in `docs/measurements.md` and raise it with the user — that is the evidence that would reopen the GPU decision.
+With 128 GB per node, a single machine holds 96 GB of model. gpt-oss-120b
+(63 GB) fits comfortably. **This is half the blog's headline comparison** — what
+one salvaged desktop does on its own, with no cluster and no RPC overhead.
 
-- [ ] **Step 5: Commit**
+```bash
+pip install -q huggingface_hub
+huggingface-cli download unsloth/gpt-oss-120b-GGUF \
+  --include "*Q4_K_M*" --local-dir /opt/models/gpt-oss-120b
+du -sh /opt/models/gpt-oss-120b
+```
+
+If that repo or quant 404s, list what exists:
+`curl -s "https://huggingface.co/api/models?search=gpt-oss-120b-GGUF" | jq -r '.[].id'`
+
+Then benchmark it, single node, no RPC:
+
+```bash
+MODEL=$(ls /opt/models/gpt-oss-120b/*00001*.gguf 2>/dev/null \
+        || ls /opt/models/gpt-oss-120b/*.gguf | head -1)
+/opt/llama.cpp/bin/llama-bench -m "$MODEL" -t "$(nproc)" -p 512,2048 -n 128 -r 3
+MODEL="$MODEL" ./bench/node-bench.sh
+```
+
+- [ ] **Step 5: Record and derive effective bandwidth**
+
+Effective bandwidth is the single number that recalculates every model estimate
+in the spec. Derive it from the measured generation rate:
+
+```bash
+python3 -c "
+tg  = float(input('measured tg128 tok/s: '))
+act = 5.1e9      # gpt-oss-120b active params
+bpw = 4.25/8     # MXFP4 bytes per weight
+gb  = act*bpw/1e9
+print(f'~{gb:.2f} GB read per token')
+print(f'effective bandwidth ~= {tg*gb:.1f} GB/s')"
+```
+
+Append to `docs/measurements.md`:
+
+```markdown
+## Model A: gpt-oss-120b, single node
+
+**Date:** <YYYY-MM-DD> | **Node:** node1 | **Threads:** <nproc>
+
+| Metric | Value |
+|---|---|
+| pp512 / pp2048 (t/s) | |
+| tg128 (t/s) | |
+| TTFT @ ~2000 tok (s) | |
+| **Derived effective bandwidth (GB/s)** | |
+| Theoretical bandwidth (GB/s) | |
+| Efficiency (% of theoretical) | |
+```
+
+**Recompute the spec's model ladder using the measured bandwidth** and update
+the estimates there. If efficiency is far below ~50%, investigate thread count
+and NUMA before proceeding.
+
+- [ ] **Step 6: Sanity-check prefill against the GPU revisit condition**
+
+The spec says GPUs come back only if TTFT is unbearable. If TTFT at ~2000 tokens
+exceeds **90 seconds**, note it prominently and raise it with the user.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add bench/node-bench.sh docs/measurements.md
-git commit -m "test: single-node throughput and TTFT baseline"
+git commit -m "test: single-node baseline and gpt-oss-120b measurements"
 ```
 
 ---
@@ -705,13 +803,15 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=cluster
+# RPC_THREADS is written per-node by install-services.sh from that node's
+# actual nproc. systemd does not expand shell variables, hence EnvironmentFile.
+EnvironmentFile=/etc/default/rpc-server
 # -c enables the local tensor cache: without it every restart re-pushes the
 #    full model over the wire, and there is a report of the process going
 #    <defunct> when run headless without it.
-# -t 4 is required: the default is HALF the logical cores, which would silently
-#    use 2 threads on a 4-core node.
+# -t is required: the default is HALF the logical cores.
 # -H 0.0.0.0 binds the LAN interface. RPC stays on raw LAN IPs, never Tailscale.
-ExecStart=/opt/llama.cpp/bin/rpc-server -H 0.0.0.0 -p %i -t 4 -c
+ExecStart=/opt/llama.cpp/bin/rpc-server -H 0.0.0.0 -p %i -t $RPC_THREADS -c
 Restart=always
 RestartSec=5
 LimitMEMLOCK=infinity
@@ -734,10 +834,13 @@ for entry in "${NODES[@]}"; do
   set -- $entry
   NAME=$1; IP=$2
   scp -q cluster/rpc-server@.service "$IP:/tmp/"
+  # Thread count comes from each node's real core count, never a hardcoded
+  # guess -- rpc-server's own default is half the cores.
   ssh "$IP" "sudo mv /tmp/rpc-server@.service /etc/systemd/system/ && \
+             echo RPC_THREADS=\$(nproc) | sudo tee /etc/default/rpc-server >/dev/null && \
              sudo systemctl daemon-reload && \
              sudo systemctl enable --now rpc-server@${RPC_PORT}"
-  echo "  $NAME started"
+  echo "  $NAME started with \$(ssh $IP nproc) threads"
 done
 
 echo
@@ -783,38 +886,62 @@ git commit -m "feat: rpc-server systemd unit and fleet installer"
 - Consumes: `nodes.env`, running `rpc-server` fleet.
 - Produces: `llama-server` on the master serving an OpenAI-compatible API on port 8080.
 
-- [ ] **Step 1: Fetch the model on the master**
+- [ ] **Step 1: Choose and fetch the cluster model (Model B)**
+
+List available Unsloth Kimi K2 quants with sizes:
 
 ```bash
-curl -L -o /opt/models/qwen3-30b-a3b-q8_0.gguf \
-  "https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf"
-ls -lh /opt/models/qwen3-30b-a3b-q8_0.gguf
+curl -s "https://huggingface.co/api/models/unsloth/Kimi-K2-Instruct-GGUF?blobs=true" \
+  | jq -r '.siblings[] | select(.rfilename|test("gguf$")) | "\(.size/1e9|floor)GB \(.rfilename)"' \
+  | sort -n
 ```
 
-Expected: ~32.5 GB. If the exact filename 404s, list the repo and pick the `Q8_0` file:
-`curl -s https://huggingface.co/api/models/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF | jq -r '.siblings[].rfilename' | grep -i q8`
+**Pick the largest quant whose total is ≤672 GB** (the per-node 75% ceiling
+across 7 × 128 GB), leaving pooled headroom. If the repo name 404s, search:
+`curl -s "https://huggingface.co/api/models?search=Kimi-K2-Instruct-GGUF" | jq -r '.[].id'`
+
+Large quants are split into multiple files. Fetch all parts:
+
+```bash
+sudo mkdir -p /opt/models/kimi-k2 && sudo chown "$USER" /opt/models/kimi-k2
+# Repeat per part, or use huggingface-cli:
+pip install -q huggingface_hub
+huggingface-cli download unsloth/Kimi-K2-Instruct-GGUF \
+  --include "<chosen-quant-pattern>*" \
+  --local-dir /opt/models/kimi-k2
+du -sh /opt/models/kimi-k2
+```
+
+llama.cpp loads split GGUFs by pointing at the **first** part; it finds the rest.
 
 - [ ] **Step 2: Verify both memory constraints before launching**
 
 ```bash
 source provisioning/nodes.env
-MODEL_GB=32.5
+MODEL_GB=$(du -sb /opt/models/kimi-k2 | awk '{printf "%.1f", $1/1e9}')
 N=${#NODES[@]}
-PER_NODE_GB=$(python3 -c "print(f'{$MODEL_GB/$N:.2f}')")
-echo "Model:            ${MODEL_GB} GB across ${N} nodes"
-echo "Per node:         ${PER_NODE_GB} GB"
-for entry in "${NODES[@]}"; do
-  set -- $entry
-  python3 -c "
-ram_gb = $3/1024
-share  = $PER_NODE_GB
-pct    = 100*share/ram_gb
-status = 'OK' if pct <= 75 else 'FAIL (>75%, will abort at runtime)'
-print(f'  $1: {share:.2f}/{ram_gb:.1f} GB = {pct:.0f}%  {status}')"
-done
+echo "Model: ${MODEL_GB} GB across ${N} nodes"
+
+python3 - <<PY
+nodes = [l.split() for l in """$(printf '%s\n' "${NODES[@]}")""".strip().split("\n")]
+model_gb = $MODEL_GB
+total_ram = sum(int(n[2]) for n in nodes) / 1024
+pooled_limit = (total_ram - len(nodes)) * 0.85
+print(f"Pooled limit: {pooled_limit:.0f} GB -- "
+      f"{'OK' if model_gb <= pooled_limit else 'FAIL'}")
+# Layers are split proportionally to RAM, so each node's share tracks its size.
+for name, ip, ram_mb in nodes:
+    ram_gb = int(ram_mb) / 1024
+    share = model_gb * (ram_gb / total_ram)
+    pct = 100 * share / ram_gb
+    ok = "OK" if pct <= 75 else "FAIL (>75%, aborts at runtime)"
+    print(f"  {name}: {share:.0f}/{ram_gb:.0f} GB = {pct:.0f}%  {ok}")
+PY
 ```
 
-Expected: every node ≤75%. **Any node over 75% means the model will abort with `"Remote RPC server crashed or returned malformed response"` — drop to Q6_K rather than trying to push through it.**
+Expected: every node ≤75% and pooled OK. **Any FAIL means the model will abort
+with `"Remote RPC server crashed or returned malformed response"` — step down a
+quant rather than trying to push through it.**
 
 - [ ] **Step 3: Write the cluster launcher**
 
@@ -831,9 +958,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source provisioning/nodes.env
 
-MODEL="${MODEL:-/opt/models/qwen3-30b-a3b-q8_0.gguf}"
-CTX="${CTX:-8192}"
+MODEL="${MODEL:?set MODEL to the first part of the GGUF, e.g. /opt/models/kimi-k2/....-00001-of-000NN.gguf}"
+CTX="${CTX:-32768}"
 PORT="${PORT:-8080}"
+THREADS="${THREADS:-$(nproc)}"
 
 RPC_LIST=""
 SPLIT=""
@@ -852,7 +980,7 @@ exec /opt/llama.cpp/bin/llama-server \
   --tensor-split "$SPLIT" \
   -m "$MODEL" \
   -c "$CTX" \
-  -t 4 \
+  -t "$THREADS" \
   --host 0.0.0.0 \
   --port "$PORT"
 ```
@@ -955,10 +1083,10 @@ Note: `llama-server` needs `--parallel N` to actually serve N concurrently. Re-r
 Append to `docs/measurements.md`:
 
 ```markdown
-## Cluster: Qwen3-30B-A3B Q8_0 across 7 nodes
+## Model B: Kimi K2 across 7 nodes
 
 **Date:** <YYYY-MM-DD>
-**Model:** Qwen3-30B-A3B-Instruct-2507 Q8_0 (32.5 GB) | **Context:** 8192
+**Model:** Kimi K2 <quant> (<size> GB) | **Context:** 32768
 **llama.cpp:** <tag> | **Split:** <tensor-split values>
 
 | Metric | Value |
