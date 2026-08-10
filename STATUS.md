@@ -62,8 +62,10 @@ Verify empirically on node 1 (cheap, no source found):
   argument for benchmarking node 1 before anything else.
 - **KV cache is not a constraint.** GQA at 4 KV heads → ~96 KB/token, so 32k
   context costs ~3 GB. Long context is limited by prefill time, not memory.
-- **Thread count needs separate tuning for prefill vs generation.** Generation
-  peaks well below core count due to memory-controller contention.
+- **Use all 4 cores; do not reduce thread count.** The "24 threads beat 96"
+  finding is a many-core contention effect that does not apply below ~24
+  threads. The real risk here is the opposite: `rpc-server -t` defaults to
+  *half* the cores, so set `-t 4` explicitly.
 - **Duplicate `machine-id` breaks DHCP, not just logging.** systemd-networkd
   derives its DHCP client-ID from it, so identical IDs make nodes collide on one
   lease — presents as intermittent fleet-wide network flapping.
@@ -85,9 +87,21 @@ Verify empirically on node 1 (cheap, no source found):
 - **Pin the llama.cpp build.** `--tensor-split` over RPC has regressed before
   (#21006); a bad pin breaks all seven nodes at once.
 
+## In flight
+
+Investigating whether the 30–55% RPC protocol overhead (#22850) is fixed,
+fixable, or fixed in a fork (prima.cpp, distributed-llama, ik_llama.cpp).
+This is potentially architecture-changing: a 30–55% tax on an already-slow
+cluster may not be acceptable, and an alternative transport may be warranted.
+
+Exo deep-dive queued behind it — confirm the rejection holds now that the
+design is CPU-only, and mine its history for CPU efficiency techniques worth
+borrowing regardless.
+
 ## Next
 
-1. Write the implementation plan
+1. Resolve the RPC overhead question; decide whether the transport changes
+2. Write the implementation plan
 2. Provision node 1, run `llama-bench`, replace estimates with measurements
 3. Resolve the `ik_llama.cpp` RPC-support question (only blocking item left,
    and only if we want the fork at all — mainline is the default)

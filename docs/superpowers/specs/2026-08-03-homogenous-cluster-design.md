@@ -228,8 +228,8 @@ as "sharding multiplies seats, not speed," now corroborated upstream.
 - **`--device` flags must come after `--rpc`** or the device list misresolves.
 - **`--split-mode row` has no effect over RPC.** Pipeline layer-splitting only;
   true tensor parallelism is local-multi-GPU only.
-- **`rpc-server -t` defaults to half the logical cores**, not all of them. On
-  dedicated nodes this under-utilises the machine — set it explicitly.
+- **`rpc-server -t` defaults to half the logical cores**, not all of them. On a
+  4-core node that means 2 threads unless set explicitly. Set `-t 4`.
 - **Version mismatch fails loudly**, not silently: `negotiate_hello()` rejects
   the connection and logs `"RPC server version mismatch"`. Good — it means a
   mismatched node cannot silently corrupt output.
@@ -414,12 +414,20 @@ From the first node up:
 - `free -h` and `dmidecode -t memory` — actual RAM and free DIMM slots
 - `llama-bench` single-node with a small Q4 model → real tok/s and effective GB/s
 
-**Thread count must be tuned separately for prefill and generation.** They are
-bounded by different things: prefill is compute-bound and wants every core;
-generation is bandwidth-bound and typically peaks *well below* core count,
-because past a point extra threads add memory-controller contention rather than
-bandwidth. One report found generation optimal at 24 threads on a 96-thread
-machine. Sweep both independently rather than setting one thread count.
+**Use all cores on this hardware. Do not reduce thread count.**
+
+There is a documented case of generation peaking at 24 threads on a 96-thread
+machine — but that is a many-core memory-controller contention effect, and it
+does not apply here. A 5th-gen desktop i5 has 4 cores and no hyperthreading.
+With so few threads there is nothing to contend: the memory controller is not
+saturated by 4 cores. Set threads to core count for both prefill and generation.
+
+**`rpc-server -t` defaults to half the logical cores**, so on a 4-core node it
+will use 2 unless told otherwise. Set it explicitly to 4 — this is the more
+likely mistake on this fleet by far.
+
+Revisit thread reduction only if a node with **24+ threads** ever joins the
+fleet. Below that the contention effect should not appear.
 
 Success criteria:
 
