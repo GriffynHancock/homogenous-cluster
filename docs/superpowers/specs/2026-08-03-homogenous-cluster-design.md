@@ -74,7 +74,7 @@ for prefill only. Decide on evidence, not in advance.
 
 Bytes read per token ≈ active params × bits-per-weight. For an MoE, only routed
 experts are read. Everything else is storage. This is why a 1T-param model with
-32B active is tractable on DDR3 and a 70B dense model is not.
+32B active is tractable on system RAM and a 70B dense model is not.
 
 **2. Pipeline sharding multiplies seats, not speed.**
 
@@ -116,18 +116,12 @@ At 128 GB/node × 7:
 **~672 GB of usable model budget.** That is a different project from the one
 originally specced against 41 GB.
 
-| RAM/node | Pooled | Usable budget |
-|---|---|---|
-| 8 GB (current) | 56 GB | **~41 GB** |
-| 16 GB | 112 GB | **~89 GB** |
-| 32 GB (max for Broadwell) | 224 GB | **~184 GB** |
+### RAM is already the win
 
-### RAM is the highest-leverage upgrade
-
-Broadwell desktops take 32 GB (4 × 8 GB DDR3). Used DDR3 is near-worthless —
-roughly **$150–250 for the whole fleet** moves pooled RAM from 56 GB to 224 GB.
-Nothing else available comes close to that return, and it is a strong point for
-the blog: the bottleneck is the cheapest component in the machine.
+The fleet arrived with 4 × 32 GB DDR4-2400 ECC per node. No upgrade is needed —
+these machines were decommissioned with server-grade memory still installed,
+which is the blog's point in miniature: the expensive component was already
+bought, and it is sitting idle.
 
 ## Target model
 
@@ -186,13 +180,12 @@ With 128 GB/node there is ample room to raise context substantially.
 provisioning → Tailscale before any distribution. Success: coherent multi-turn
 chat via `curl`.
 
-### Larger models are deferred, not designed for
+### Changing the model later costs nothing structural
 
-If RAM is added later (Broadwell takes 32 GB/node → 224 GB pooled → ~184 GB
-usable), gpt-oss-120b and Qwen3-235B-A22B come into range and the blog's
-extrapolation to Kimi K3-class models becomes demonstrable rather than argued.
-**Do not build for this now.** The architecture does not change — only the GGUF
-path and the layer split do — so there is nothing to design in advance.
+The architecture does not depend on which model runs. Swapping targets changes
+only the GGUF path and the `--tensor-split` values, so there is nothing to
+design in advance for a different choice — pick on measured evidence once the
+hardware facts are in.
 
 ## Architecture
 
@@ -312,7 +305,7 @@ as "sharding multiplies seats, not speed," now corroborated upstream.
 - **`--split-mode row` has no effect over RPC.** Pipeline layer-splitting only;
   true tensor parallelism is local-multi-GPU only.
 - **`rpc-server -t` defaults to half the logical cores**, not all of them. On a
-  4-core node that means 2 threads unless set explicitly. Set `-t 4`.
+  node this silently halves throughput. Set it from `nproc`.
 - **Version mismatch fails loudly**, not silently: `negotiate_hello()` rejects
   the connection and logs `"RPC server version mismatch"`. Good — it means a
   mismatched node cannot silently corrupt output.
@@ -609,27 +602,30 @@ From the first node up:
 - `free -h` and `dmidecode -t memory` — actual RAM and free DIMM slots
 - `llama-bench` single-node with a small Q4 model → real tok/s and effective GB/s
 
-**Use all cores on this hardware. Do not reduce thread count.**
+**Set thread count from `nproc`, then sweep if the CPU turns out many-core.**
 
-There is a documented case of generation peaking at 24 threads on a 96-thread
-machine — but that is a many-core memory-controller contention effect, and it
-does not apply here. A 5th-gen desktop i5 has 4 cores and no hyperthreading.
-With so few threads there is nothing to contend: the memory controller is not
-saturated by 4 cores. Set threads to core count for both prefill and generation.
+`rpc-server -t` defaults to *half* the logical cores, so leaving it unset
+silently halves the fleet's compute. Always set it explicitly. This is the most
+likely thread-related mistake here by far.
 
-**`rpc-server -t` defaults to half the logical cores**, so on a 4-core node it
-will use 2 unless told otherwise. Set it explicitly to 4 — this is the more
-likely mistake on this fleet by far.
+Whether *all* cores is optimal depends on the CPU, which is still unconfirmed.
+There is a documented case of generation peaking at **24 threads on a 96-thread
+machine** — past some point, extra threads contend for bandwidth the memory
+controller cannot deliver, adding coordination cost without throughput. That
+effect requires enough cores to saturate the controller in the first place.
 
-Revisit thread reduction only if a node with **24+ threads** ever joins the
-fleet. Below that the contention effect should not appear.
+So:
+- **Under ~24 threads** — use all of them and move on.
+- **Over ~24 threads** (plausible on a Xeon) — sweep thread count for
+  *generation* specifically. Prefill is compute-bound and will still want every
+  core, so the two may want different values.
 
 Success criteria:
 
 | Stage | Passes when |
 |---|---|
-| Single node | Qwen3-4B holds a coherent multi-turn conversation via `curl` |
-| Sharded | Qwen3-30B-A3B serves from all 7 nodes; TTFT and tok/s recorded |
+| Single node | Model A (gpt-oss-120b) holds a coherent conversation via `curl` |
+| Sharded | Model B serves from all 7 nodes; TTFT and tok/s recorded |
 | Missing Link | A real document is summarised end-to-end through the queue |
 
 **Both metrics always.** Time-to-first-token (prefill, compute-bound) and
@@ -656,12 +652,13 @@ publishing.
 
 ## Risks
 
-1. **CPU prefill may be worse than expected.** Broadwell without AVX-512 on a
-   4,000-token document could exceed a minute before first token. Measure early;
-   it drives the GPU revisit decision and possibly the choice of workload.
-2. **RPC pushes weights over the wire on every start.** 32 GB over gigabit is
-   several minutes per restart. `rpc-server -c` caches tensors ≥10 MiB, which
-   should make subsequent restarts fast — verify on the built version before
+1. **CPU prefill may be worse than expected.** A 4,000-token document could
+   exceed a minute before first token, and worse if the CPU lacks AVX-512.
+   Measure early; it drives the GPU revisit decision and possibly the choice of
+   workload. This is also why documents are chunked rather than stuffed.
+2. **RPC pushes weights over the wire on every start.** ~550 GB over gigabit is
+   a very long first load — plan for it. `rpc-server -c` caches tensors ≥10 MiB,
+   which should make subsequent restarts fast — verify on the built version before
    accepting slow iteration as normal.
 3. **RPC protocol overhead exists but its size is unknown.** See "Protocol
    overhead" below — the widely-cited 30–55% figure does not survive scrutiny,

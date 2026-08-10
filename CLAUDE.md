@@ -21,7 +21,7 @@ Two technical facts carry the whole argument:
 
 1. **Active params, not total params, determine speed.** Bytes read per token
    ≈ active params × bits-per-weight. Everything else is storage. A 1T-param
-   model with 32B active is tractable on DDR3; a 70B dense model is not.
+   model with 32B active is tractable on system RAM; a 70B dense model is not.
 2. **Pipeline sharding multiplies seats, not speed.** For one request, nodes run
    sequentially — 7 nodes ≈ 1 node with 7× the RAM. With concurrent requests,
    each node works on a different request's layers simultaneously. Aggregate
@@ -98,16 +98,34 @@ Missing Link does have tests: `cd missing-link && python -m pytest tests/ -v`
 
 ## Key decisions already made
 
-- **CPU + system RAM only.** The Quadro P600s (2 GB, Pascal, no FP8/BF16) are
-  dropped. They are too small to hold meaningful layers and reintroduce
-  significant CUDA/RPC complexity. Revisit only if measured time-to-first-token
-  proves unbearable.
-- **llama.cpp RPC, not Exo.** Exo's value is heterogeneous discovery and MLX;
-  neither applies to 7 identical Debian boxes.
+**Hardware: 128 GB DDR4-2400 ECC per node, ~896 GB pooled.** Usable budget is
+**~672 GB**, bound by the per-node 75% rule rather than pooled headroom.
+
+**A single node holds 96 GB**, so the cluster is only justified above that. Two
+models, and their comparison is the deliverable:
+
+- **Model A — gpt-oss-120b (~63 GB, 5.1B active) on ONE node.** The speed
+  reference: what one salvaged desktop does alone.
+- **Model B — Kimi K2 Q4 (~550 GB, 32B active) across SEVEN.** The thesis: a
+  model class the organisation could not otherwise touch.
+
+Other settled decisions:
+
+- **CPU + system RAM only.** GPUs are present for display and unused for
+  compute. Revisit only if measured time-to-first-token proves unbearable, and
+  then for prefill only — prefill is compute-bound, generation is not.
+- **llama.cpp RPC.** Exo rejected on evidence: MLX is now its only engine,
+  Linux CPU is "Planned" tier, zero CPU optimisation commits in 2,353, and no
+  GGUF support. prima.cpp (no MoE) and distributed-llama (all-reduce per layer
+  per token over gigabit) also rejected. See the spec for full reasoning.
 - **Debian 12 headless**, scripted provisioning (not `dd` cloning — disks vary).
 - **Tailscale for SSH and the web GUI only.** RPC mesh runs on raw LAN IPs;
-  encryption on the per-token hot path is pure loss.
+  encryption on the per-token hot path is pure loss, and upstream explicitly
+  warns against exposing RPC to any network.
 - **Open WebUI** as the chat frontend, lightly skinned.
+- **Map-reduce for long documents**, ~4K chunks with 10% overlap — decided on
+  evidence, not preference. A larger context window does not fix "lost in the
+  middle", and CPU prefill degrades ~58% from 512 to 32K context.
 
 ## Conventions
 
@@ -117,8 +135,13 @@ Missing Link does have tests: `cd missing-link && python -m pytest tests/ -v`
   goal is to find the *specific* fixes and known failure modes, not general
   background. Much of this work is re-treading paths others have already walked
   painfully; the point is to not repeat their debugging.
-- **Delegate research to Sonnet subagents**, in parallel, rather than running
-  searches inline. Ask for conclusions plus source URLs.
+- **Delegate research to Sonnet subagents** rather than running searches inline.
+  Ask for conclusions plus source URLs, with CONFIRMED / REPORTED / INFERRED
+  distinguished. Point them at specific repos, issues and files — vague briefs
+  come back with general background instead of the actual fix.
+- **Run at most ONE Sonnet agent at a time** (up to two Haiku agents are fine).
+  Do not fan out unless explicitly asked. Do your own work — spec edits, doc
+  updates — while an agent runs, rather than launching another.
 - Leave **15% memory headroom** in all model-fit calculations. Do not spec
   configurations that fit only marginally.
 - Performance claims must come from measurement on the hardware, not

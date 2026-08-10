@@ -370,7 +370,7 @@ git commit -m "test: measure RPC protocol overhead on localhost"
 - [ ] **Step 1: Verify coherent output from one node**
 
 ```bash
-/opt/llama.cpp/bin/llama-cli -m /opt/models/qwen3-4b-q4km.gguf -t 4 \
+/opt/llama.cpp/bin/llama-cli -m /opt/models/qwen3-4b-q4km.gguf -t "$(nproc)" \
   -p "Explain in three sentences why a school might not want to send student records to a cloud AI service." \
   -n 200 --no-warmup
 ```
@@ -864,7 +864,7 @@ Expected: every node reports `open`. Then confirm the thread count actually appl
 
 ```bash
 source provisioning/nodes.env
-ssh 192.168.1.102 "systemctl show rpc-server@$RPC_PORT -p ExecStart | grep -o '\-t 4'"
+ssh 192.168.1.102 "cat /etc/default/rpc-server; echo actual cores: \$(nproc)"
 ```
 
 - [ ] **Step 4: Commit**
