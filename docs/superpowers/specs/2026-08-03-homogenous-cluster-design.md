@@ -84,15 +84,49 @@ the blog: the bottleneck is the cheapest component in the machine.
 
 ## Target model
 
-**Qwen3-30B-A3B at ~32 GB** — 30B total parameters, 3B active.
+**Qwen3-30B-A3B-Instruct-2507, Q8_0 (32.5 GB)** — 30B total, ~3.3B active,
+48 layers, GQA with 32 query / 4 KV heads, 32k native context.
 
-Exact quant to be confirmed by research (Q8_0 is approximately this size; if it
-overshoots, Q6_K). This fits the **current** ~41 GB budget with headroom intact
-and requires no RAM purchase, so the build has a guaranteed deliverable.
+Fits the current ~41.6 GB pooled budget with ~9 GB spare, and requires no RAM
+purchase. Per node that is only ~4.6 GB of model weights against ~7 GB
+available — comfortable, not marginal.
 
-Reads roughly 3 GB per token against ~25 GB/s, so expect single-digit tokens per
-second per seat — usable for async work, marginal for interactive chat. This is
-arithmetic on datasheet bandwidth and must be replaced by measurement.
+The pooling is what buys the quant tier. On any single node, Q8_0 would be
+impossible and Q4_K_M (18.6 GB) would be the ceiling. This is the design's
+central claim in miniature.
+
+Quant sizes for reference, should the budget move:
+
+| Quant | Size | Notes |
+|---|---|---|
+| Q4_K_M | 18.6 GB | Single-node ceiling if pooling failed |
+| Q5_K_M | 21.7 GB | Conservative fallback |
+| Q6_K | 25.1 GB | Fallback if Q8_0 proves tight in practice |
+| **Q8_0** | **32.5 GB** | **Target** |
+
+**KV cache is not a constraint.** GQA at 4 KV heads gives ~96 KB/token: ~0.75 GB
+at 8k, ~3 GB at 32k (fp16). Long context is limited by prefill *time*, not
+memory — which is the opposite of the usual situation and worth stating in the
+blog.
+
+### Expected speed
+
+Bytes read per token ≈ 3.3B active × ~1 byte (Q8_0) ≈ **3.3 GB/token**. Against
+~25 GB/s DDR3 that is a ~7.5 tok/s theoretical ceiling; at the 50–70% bandwidth
+efficiency typical of old hardware, expect **4–5 tok/s per seat**.
+
+This is arithmetic on datasheets and must be replaced by measurement. **No
+public benchmark exists for this model class on Broadwell/DDR3/AVX2** — the
+research turned up nothing closer than DDR4 Xeons. Prefill on AVX2-without-
+AVX-512 is entirely unmeasured, which matters because prefill dominates
+time-to-first-token on document workloads.
+
+### Model lineage note
+
+Qwen has since shipped Qwen3.5-35B-A3B and Qwen3.6-35B-A3B, which supersede
+30B-A3B as the small-MoE flagship. Different total parameter count, so not a
+drop-in, and quant sizes shift accordingly. Worth evaluating before the build
+starts, but 30B-A3B is the specced target because its sizes are known.
 
 ### Stepping stone
 
@@ -148,9 +182,22 @@ Exo's value is heterogeneous device discovery and MLX/Apple support. Neither
 applies to 7 identical Debian boxes. llama.cpp is already proven on this
 hardware.
 
-**Benchmark `ik_llama.cpp` against mainline before committing.** It is a fork
-specifically optimised for CPU-side MoE inference and consistently outperforms
-mainline on exactly this workload. The decision should be measured, not assumed.
+**`ik_llama.cpp` is a maybe, not a recommendation.** The fork is optimised for
+CPU-side MoE inference, but the evidence is genuinely split:
+
+- On a Xeon E5-2683 v4 — **Broadwell, AVX2, no AVX-512, the closest available
+  hardware analog** — it showed a 1.7–1.9× speedup on Mixtral-8x7B.
+- On a Ryzen 7 5800X with Qwen3 MoE it *regressed*, running ~1.5× slower
+  generation and ~2× slower prefill than mainline (ik_llama.cpp issue #1699).
+- Its stated optimisations lean on AVX-512, which Broadwell lacks.
+
+**Blocking unknown: does `ik_llama.cpp` support `rpc-server`?** Unconfirmed by
+research. If it does not, the fork is disqualified regardless of speed, because
+the whole architecture depends on RPC. Check this against its source before
+spending any time benchmarking it.
+
+Default to mainline. Treat the fork as an optimisation to test after the cluster
+works, not a choice to make up front.
 
 ### Networking
 
@@ -210,6 +257,13 @@ From the first node up:
 - `lscpu | grep -E 'avx2|Model name'` — confirm AVX2
 - `free -h` and `dmidecode -t memory` — actual RAM and free DIMM slots
 - `llama-bench` single-node with a small Q4 model → real tok/s and effective GB/s
+
+**Thread count must be tuned separately for prefill and generation.** They are
+bounded by different things: prefill is compute-bound and wants every core;
+generation is bandwidth-bound and typically peaks *well below* core count,
+because past a point extra threads add memory-controller contention rather than
+bandwidth. One report found generation optimal at 24 threads on a 96-thread
+machine. Sweep both independently rather than setting one thread count.
 
 Success criteria:
 

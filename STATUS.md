@@ -26,8 +26,13 @@ in the spec is arithmetic on datasheets and is explicitly marked as such.
 
 Blocking the implementation plan:
 
-- [ ] Which Qwen3-30B-A3B variant and quant lands nearest 32 GB
-- [ ] Whether `ik_llama.cpp` beats mainline for CPU MoE, and whether it supports RPC
+- [x] **Which Qwen3-30B-A3B variant and quant** — Instruct-2507, **Q8_0
+      (32.5 GB)**. Fits the ~41.6 GB pooled budget with ~9 GB spare; ~4.6 GB per
+      node. Fallbacks Q6_K (25.1 GB), Q5_K_M (21.7 GB).
+- [ ] **Does `ik_llama.cpp` support `rpc-server`?** Unconfirmed and load-bearing
+      — if not, the fork is disqualified outright. Evidence on its speed is split
+      (1.7–1.9× faster on a Broadwell Xeon; ~1.5× *slower* on Zen3 with Qwen3
+      MoE). Defaulting to mainline; revisit as post-launch optimisation.
 - [ ] What `rpc-server -c` actually caches, and whether it avoids re-transfer
 - [ ] How layer split across RPC backends is controlled with uneven node RAM
 - [ ] Known RPC failure modes and their fixes
@@ -36,6 +41,18 @@ Not blocking, decide on measurement:
 
 - [ ] Actual RAM per node and free DIMM slots (needs `dmidecode` on real hardware)
 - [ ] Whether time-to-first-token is bad enough to reconsider GPUs for prefill
+- [ ] Whether Qwen3.5/3.6-35B-A3B supersede the target (newer, not a drop-in)
+
+## Research findings so far
+
+- **No public benchmark exists** for this model class on Broadwell/DDR3/AVX2.
+  Nothing closer than DDR4 Xeons. Estimated 4–5 tok/s per seat; **prefill on
+  AVX2-without-AVX-512 is entirely unmeasured.** This gap is the strongest
+  argument for benchmarking node 1 before anything else.
+- **KV cache is not a constraint.** GQA at 4 KV heads → ~96 KB/token, so 32k
+  context costs ~3 GB. Long context is limited by prefill time, not memory.
+- **Thread count needs separate tuning for prefill vs generation.** Generation
+  peaks well below core count due to memory-controller contention.
 
 ## In flight
 
