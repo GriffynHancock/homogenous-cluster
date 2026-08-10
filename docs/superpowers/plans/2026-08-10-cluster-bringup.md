@@ -1627,9 +1627,20 @@ Create `missing-link/missing_link/worker.py`:
 ```python
 """Sequential job executor.
 
-Deliberately one-at-a-time: the cluster serves a small number of slow seats,
-and queueing work behind a single worker is the honest model. Concurrency
-would contend for the same pipeline.
+One job at a time, and within a job the map-reduce chunks are also sequential.
+
+NOTE: chunk-level sequencing is likely leaving throughput on the floor. Chunks
+are independent, and on a bandwidth-bound system a forward pass reads the
+weights once regardless of batch size -- so submitting chunks concurrently
+against `llama-server --parallel N` should cost close to the same wall-clock as
+one chunk. See the spec's "Batching is nearly free" section.
+
+Deliberately NOT doing that yet. Two things must be verified on the pinned
+build first, because both fail silently:
+  1. Whether `--parallel N` divides `-c` across slots (truncating chunks).
+  2. Whether the KV-cache cross-talk bug (#14893) is really fixed -- leaked
+     output between concurrent summaries would be the worst failure here.
+Get it correct first, then make it fast.
 """
 import time
 import httpx

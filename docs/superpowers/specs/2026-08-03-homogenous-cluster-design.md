@@ -79,12 +79,84 @@ experts are read. Everything else is storage. This is why a 1T-param model with
 **2. Pipeline sharding multiplies seats, not speed.**
 
 For a single request, nodes execute sequentially — 7 nodes performs like one
-node with 7× the RAM. With *concurrent* requests, each node processes a
-different request's layers simultaneously, so aggregate throughput scales with
-node count while per-seat speed stays flat.
+node with 7× the RAM. The design target is therefore **a small number of slow
+seats**, not one fast one. Missing Link exists to make that framing useful
+rather than apologetic.
 
-The design target is therefore **a small number of slow seats**, not one fast
-one. Missing Link exists to make that framing useful rather than apologetic.
+### What the topology actually does
+
+Layers are split across nodes in order, and generation is autoregressive, so
+each token traverses node 1 → 7 and then loops back to node 1 for the next
+token. During a single request, **only one node computes at a time:**
+
+```
+t₁  [N1 ████] N2 ···· N3 ···· ... N7 ····
+t₂   N1 ····[N2 ████] N3 ···· ... N7 ····
+t₃   N1 ···· N2 ····[N3 ████] ... N7 ····
+                  ⋮
+     └────── loops back to N1 for the next token ──────┘
+
+Compute utilisation: 1/7. Six nodes idle at every instant.
+```
+
+Those gaps are **pipeline bubbles**. Filling them properly requires
+microbatching — node 1 starting batch B while node 2 finishes batch A — which
+llama.cpp does not do today. PR #18626 moves toward it.
+
+### What makes multiple seats possible
+
+Not stochasticity. **Weights are read-only**, so any number of sequences can
+traverse them at once. Three things occupy memory, and they behave differently:
+
+| | Shared or private | Cost |
+|---|---|---|
+| Weights | Shared, read-only, one copy | Fixed, dominates |
+| **KV cache** | **Private per sequence** | Grows linearly with seats |
+| Activations | Transient, per request | Negligible |
+
+**The KV cache for a sequence lives on the node holding those layers.** So
+per-node memory is `weights_shard + (layers_shard × context × seats)`. Seats
+cost RAM, distributed the same way the layers are. At ~96 KB/token for
+GQA-4 models, a 32k-context seat costs ~3 GB spread across the fleet — small
+against 128 GB/node.
+
+### Batching is nearly free on a bandwidth-bound system
+
+A forward pass must read the weights, and on this hardware that read *is* the
+cost. It reads the same weights whether computing 1 sequence or 16 — the
+matmuls simply get wider, and compute is the resource we have spare.
+
+**Serving 8 requests should cost roughly the same wall-clock as serving 1.**
+Per-seat speed stays flat; aggregate throughput scales close to linearly.
+
+Two caveats, both to be verified by measurement:
+
+- This is *not* bubble-filling. Continuous batching sends sequences through the
+  pipeline together as one wider pass, so node 1 still idles while node 2 works.
+  Batching wins through weight reuse, not utilisation — and therefore does not
+  depend on node count at all.
+- **MoE may undermine it.** If different sequences in a batch route to different
+  experts, the expert weights read per forward pass grows with batch size, and
+  the free-batching argument weakens. This is the single most important
+  unknown for throughput and must be measured, not assumed.
+
+### Consequence for Missing Link
+
+Map-reduce chunks are **independent** — chunk 5 does not depend on chunk 4. That
+is embarrassingly parallel and maps directly onto batching. A 40-chunk document
+should submit its chunks concurrently rather than sequentially, letting
+continuous batching absorb them for close to the cost of one pass.
+
+Before implementing that, verify:
+
+1. **How `--parallel` divides `-c`.** Believed to split total context across
+   slots, so `-c 32768 --parallel 4` gives each slot 8192. If so, concurrent
+   chunks could be silently truncated — a corruption failure mode that produces
+   plausible-looking but incomplete summaries.
+2. **The cross-talk bug** (#14893) — KV-cache corruption under `--parallel`
+   causing output to leak between conversations. Fixed upstream; confirm on the
+   pinned build. Cross-contaminated summaries of sensitive records would be the
+   worst possible failure for this project.
 
 ## Memory budget
 

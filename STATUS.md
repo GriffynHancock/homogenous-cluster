@@ -80,6 +80,22 @@ argument: run what no single machine could hold, at any speed.
 - [ ] Effective memory bandwidth, derived from measured tok/s in Task 3. This
       recalculates every estimate in the spec.
 
+**Batching — could change Missing Link's design (agent dispatched 2026-08-11):**
+
+- [ ] **How does `--parallel` divide `-c`?** Believed `-c 32768 --parallel 4`
+      gives each slot 8192, not 32768. If so, concurrent chunks may be silently
+      truncated — a corruption mode producing plausible but incomplete output.
+- [ ] **Does batching help on CPU as the bandwidth argument predicts?** A
+      forward pass reads weights once regardless of batch size, so N sequences
+      should cost ≈ the wall-clock of 1.
+- [ ] **Does MoE break that?** If sequences in a batch route to *different*
+      experts, expert bytes read grows with batch size and the free-batching
+      argument weakens. **The most important throughput unknown.**
+- [ ] **Does `--parallel` work over RPC at all**, or is it single-node only?
+- [ ] **Cross-talk bug** (#14893) — confirm fixed on the pinned build before
+      enabling `--parallel`. Leaked output between summaries of sensitive
+      records is the worst failure mode this project has.
+
 **Decide on measurement:**
 
 - [ ] Whether TTFT is bad enough to reconsider GPUs for prefill (threshold: 90 s
@@ -228,3 +244,9 @@ API, end-to-end.
   earlier instinct to just enlarge the context window. Added Task 14, a quality
   evaluation harness.
 - **2026-08-10** — Repo bundled for deployment and published.
+- **2026-08-11** — Worked through the pipeline topology properly. Recorded that
+  only one node computes at a time per request (utilisation 1/7), that seats are
+  possible because weights are read-only while KV cache is per-sequence, and
+  that batching should be near-free on a bandwidth-bound system — which would
+  make map-reduce chunks worth submitting concurrently rather than sequentially.
+  Research dispatched to verify before changing the worker.
