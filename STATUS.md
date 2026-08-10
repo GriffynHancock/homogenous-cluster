@@ -1,9 +1,20 @@
 # Status
 
 **Updated:** 2026-08-10
-**Phase:** Plan written; awaiting hardware to begin execution
+**Phase:** Planning complete. Awaiting node 1 to begin execution.
 
 Implementation plan: `docs/superpowers/plans/2026-08-10-cluster-bringup.md`
+
+## If you are a fresh session on node 1
+
+1. `./bootstrap.sh` — installs deps, prints hardware facts. Idempotent.
+2. Work through the plan from **Task 1, Step 2** (bootstrap covers Step 1's
+   package needs; the preseed still needs writing for nodes 2–7).
+3. **Task 1's hardware facts gate everything downstream.** Core count sets
+   `-t`; memory channels set bandwidth, which sets tokens/sec; total RAM sets
+   which model is possible. Record them in `docs/measurements.md` before
+   choosing a model.
+4. Update this file as you go. The next session may be a cold start.
 
 ## Where things stand
 

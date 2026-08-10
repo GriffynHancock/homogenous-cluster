@@ -51,33 +51,50 @@ preprocessing step that makes cloud safe, and do not propose hybrid
 local/cloud architectures. The argument is that the work happens entirely
 on hardware the organisation already owns, and the data never leaves.
 
-## Current state
+## Where you are running
+
+**You are most likely running on node 1, the cluster master**, with real
+hardware under you and root via sudo. You are the operator, not an advisor —
+run the commands, read the output, record the numbers.
 
 **Read `STATUS.md` first.** It records the current phase, decisions made, open
 questions, and what is in flight. Keep it updated as work proceeds — it is the
-handoff document between sessions.
+handoff document between sessions, and the next session may be a cold start.
 
-Planning only so far. No code, no build tooling, no tests, no hardware
-provisioned. The design spec is at
-`docs/superpowers/specs/2026-08-03-homogenous-cluster-design.md`.
+Then follow `docs/superpowers/plans/2026-08-10-cluster-bringup.md` task by task.
 
 Read the spec before proposing any implementation — it records not just what to
 build but which architectures were rejected and why (GPU sharding, Exo,
-`dd` cloning). Re-proposing them wastes a cycle.
+prima.cpp, distributed-llama, `dd` cloning). Re-proposing them wastes a cycle.
 
 ## Working on this repo
 
-Most work here is remote: the cluster nodes are reached over Tailscale SSH, and
-llama.cpp is built on one machine and its binaries distributed fleet-wide.
-Build/test commands will be added here once the provisioning scripts exist.
+Work happens **on the master node**. Workers are reached over plain SSH on LAN
+IPs. llama.cpp is built once on the master and its binaries distributed
+fleet-wide.
 
-Two standing constraints when writing anything that touches the cluster:
+Standing constraints when writing anything that touches the cluster:
 
 - **llama.cpp versions must match exactly across all nodes** or the RPC protocol
-  mismatches. Never build per-node.
+  mismatches. Never build per-node. Pin to a release tag; do not track `master`.
 - **Node provisioning must be idempotent.** Disks vary in size and type across
   the fleet, so the setup path is a Debian preseed plus a re-runnable
   `setup.sh`, not a disk image.
+- **Two memory constraints, both must hold.** Pooled `(RAM − 1 GB/node) × 0.85`,
+  and a hard **per-node ≤75% of physical RAM** (llama.cpp #15055, unfixed —
+  exceeding it aborts at runtime). At 128 GB/node the per-node rule binds first.
+- **`rpc-server -t` defaults to half the cores.** Always set it from `nproc`.
+- **Never pass `--advertise-routes`** to Tailscale — it would pull the RPC hot
+  path onto WireGuard. RPC runs on raw LAN IPs.
+
+## Verification
+
+There is no test suite for the cluster itself — verification is running the
+command and reading the output. Do not report a step as done without having
+seen its output.
+
+Missing Link does have tests: `cd missing-link && python -m pytest tests/ -v`
+(28 tests once Task 12 is complete).
 
 ## Key decisions already made
 
