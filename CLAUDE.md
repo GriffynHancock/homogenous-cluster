@@ -40,20 +40,25 @@ results later.
 Missing Link is the centrepiece of the argument, not a nice-to-have. It is what
 converts "too slow to be useful" into "fast enough for this class of work."
 
-Candidate workloads, in order of rhetorical strength:
+The workloads are:
 
-- **PII stripping as a gateway** (primary). The local model de-identifies
-  sensitive documents so that cloud models *can* safely be used for the fast
-  work afterwards. This reframes local inference from a worse alternative to
-  cloud into the thing that unlocks cloud safely — and it is where the name
-  comes from: the missing link between air-gapped data and capable AI.
-- **Overnight document summarisation** of sensitive records.
+- **Document summarisation** of sensitive records — submit overnight, read in
+  the morning.
 - **Report writing / drafting** where a multi-minute turnaround is fine.
+
+**Cloud is not part of the story.** Do not frame local inference as a
+preprocessing step that makes cloud safe, and do not propose hybrid
+local/cloud architectures. The argument is that the work happens entirely
+on hardware the organisation already owns, and the data never leaves.
 
 ## Current state
 
-Planning only. No code, no build tooling, no tests, no hardware provisioned.
-The repository currently contains this file and the design spec at
+**Read `STATUS.md` first.** It records the current phase, decisions made, open
+questions, and what is in flight. Keep it updated as work proceeds — it is the
+handoff document between sessions.
+
+Planning only so far. No code, no build tooling, no tests, no hardware
+provisioned. The design spec is at
 `docs/superpowers/specs/2026-08-03-homogenous-cluster-design.md`.
 
 Read the spec before proposing any implementation — it records not just what to
@@ -89,6 +94,14 @@ Two standing constraints when writing anything that touches the cluster:
 
 ## Conventions
 
+- **Research before specifying or building.** Before committing to a tool,
+  flag, or configuration, search for how others solved the same problem — GitHub
+  issues, forum threads, writeups from people who built the same thing. The
+  goal is to find the *specific* fixes and known failure modes, not general
+  background. Much of this work is re-treading paths others have already walked
+  painfully; the point is to not repeat their debugging.
+- **Delegate research to Sonnet subagents**, in parallel, rather than running
+  searches inline. Ask for conclusions plus source URLs.
 - Leave **15% memory headroom** in all model-fit calculations. Do not spec
   configurations that fit only marginally.
 - Performance claims must come from measurement on the hardware, not

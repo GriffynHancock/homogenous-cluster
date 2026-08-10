@@ -82,42 +82,31 @@ roughly **$150–250 for the whole fleet** moves pooled RAM from 56 GB to 224 GB
 Nothing else available comes close to that return, and it is a strong point for
 the blog: the bottleneck is the cheapest component in the machine.
 
-## Model ladder — scales with pooled RAM
+## Target model
 
-Estimates below are arithmetic on datasheet bandwidth (~25 GB/s/node) and must
-be replaced by measurements. They establish expectations, not claims.
+**Qwen3-30B-A3B at ~32 GB** — 30B total parameters, 3B active.
 
-### Rung 1 — Proof (single node, any RAM config)
+Exact quant to be confirmed by research (Q8_0 is approximately this size; if it
+overshoots, Q6_K). This fits the **current** ~41 GB budget with headroom intact
+and requires no RAM purchase, so the build has a guaranteed deliverable.
 
-**Qwen3-4B Q4_K_M (~2.5 GB).** Validates OS → llama.cpp → provisioning →
-Tailscale on one machine before distribution. Success: coherent multi-turn chat
-via `curl`.
+Reads roughly 3 GB per token against ~25 GB/s, so expect single-digit tokens per
+second per seat — usable for async work, marginal for interactive chat. This is
+arithmetic on datasheet bandwidth and must be replaced by measurement.
 
-### Rung 2 — Baseline (~41 GB budget, current RAM)
+### Stepping stone
 
-**Qwen3-30B-A3B Q8_0 (~32 GB), 3B active.** Reads ~3 GB/token → roughly
-4–8 tok/s per seat. Genuinely conversational. Runs on the hardware as it stands
-today, with no RAM purchase. This is the guaranteed-deliverable rung.
+**Qwen3-4B Q4_K_M (~2.5 GB), single node.** Validates OS → llama.cpp →
+provisioning → Tailscale before any distribution. Success: coherent multi-turn
+chat via `curl`.
 
-### Rung 3 — The demo (~89 GB budget, 16 GB/node)
+### Larger models are deferred, not designed for
 
-**gpt-oss-120b MXFP4 (~63 GB), 5.1B active.** The sweet spot: 117B total
-parameters for capability, but only 5.1B active means ~3 GB/token and
-comparable speed to rung 2. A frontier-class model that is *not* glacial.
-
-Alternative at this tier: GLM-4.5-Air Q4 (~70 GB, 12B active) — stronger on
-some tasks, roughly half the speed.
-
-### Rung 4 — The thesis (~184 GB budget, 32 GB/node)
-
-**Qwen3-235B-A22B Q4 (~140 GB), 22B active.** Reads ~13 GB/token → roughly
-1–2 tok/s per seat. Genuinely glacial, and the point: this is a model class
-that no organisation could otherwise run without cloud access or serious
-capital. Extrapolates directly to the blog's Kimi K3 / 550 GB argument, which
-at ~32B active would land near 0.7–1.4 tok/s on the same architecture.
-
-**Rung 4 is where Missing Link stops being a nice framing and becomes
-mandatory.** At 1 tok/s, interactive chat is not a product. Async batch work is.
+If RAM is added later (Broadwell takes 32 GB/node → 224 GB pooled → ~184 GB
+usable), gpt-oss-120b and Qwen3-235B-A22B come into range and the blog's
+extrapolation to Kimi K3-class models becomes demonstrable rather than argued.
+**Do not build for this now.** The architecture does not change — only the GGUF
+path and the layer split do — so there is nothing to design in advance.
 
 ## Architecture
 
@@ -187,17 +176,17 @@ auth state collides.
 
 ## Missing Link
 
-An async job runner that makes glacial inference useful. Submit work, collect
+An async job runner that makes slow inference useful. Submit work, collect
 results later.
 
-**Primary workload: PII stripping as a gateway.** The cluster de-identifies
-sensitive documents so cloud models can safely handle the fast work afterwards.
-This reframes local inference from a worse alternative to cloud into the thing
-that *unlocks* cloud safely — and it is a task where slowness genuinely does not
-matter, because the document was going to sit in a queue anyway.
+**Workloads: document summarisation and report drafting.** Both are tasks where
+the document was going to sit in a queue anyway, so a multi-minute or overnight
+turnaround costs nothing. Summarising a folder of sensitive records overnight is
+worth real staff hours, and no data leaves the building to do it.
 
-Secondary workloads: overnight summarisation of sensitive records; report
-drafting.
+The work happens entirely on hardware the organisation already owns. Cloud is
+not part of this design — no hybrid architectures, no framing local inference as
+a preprocessing step for something else.
 
 ### Scope
 
@@ -222,14 +211,13 @@ From the first node up:
 - `free -h` and `dmidecode -t memory` — actual RAM and free DIMM slots
 - `llama-bench` single-node with a small Q4 model → real tok/s and effective GB/s
 
-Per-rung success criteria:
+Success criteria:
 
-| Rung | Passes when |
+| Stage | Passes when |
 |---|---|
-| 1 | Single node holds a coherent multi-turn conversation via `curl` |
-| 2 | Qwen3-30B-A3B serves from all 7 nodes at conversational speed |
-| 3 | gpt-oss-120b serves from all 7 nodes; TTFT and tok/s recorded |
-| 4 | Qwen3-235B-A22B generates coherent output via Missing Link |
+| Single node | Qwen3-4B holds a coherent multi-turn conversation via `curl` |
+| Sharded | Qwen3-30B-A3B serves from all 7 nodes; TTFT and tok/s recorded |
+| Missing Link | A real document is summarised end-to-end through the queue |
 
 **Both metrics always.** Time-to-first-token (prefill, compute-bound) and
 tokens/sec (generation, bandwidth-bound) are separate numbers with separate
@@ -245,13 +233,11 @@ needs evidence.
 1. **CPU prefill may be worse than expected.** Broadwell without AVX-512 on a
    4,000-token document could exceed a minute before first token. Measure early;
    it drives the GPU revisit decision and possibly the choice of workload.
-2. **RPC pushes weights over the wire on every start.** 140 GB over gigabit is a
-   long wait per restart. `rpc-server -c` enables a local file cache — verify on
-   the built version before accepting slow iteration as normal.
-3. **Rungs 3 and 4 depend on RAM purchases** that may not materialise. Rung 2 is
-   deliberately specced to need no new hardware, so there is always a
-   deliverable.
-4. **Swap death.** With models sized to pooled RAM, any overshoot pushes a node
+2. **RPC pushes weights over the wire on every start.** 32 GB over gigabit is
+   several minutes per restart, which makes iteration painful. `rpc-server -c`
+   enables a local file cache — verify on the built version before accepting
+   slow iteration as normal.
+3. **Swap death.** With models sized to pooled RAM, any overshoot pushes a node
    into swap and collapses throughput. The 15% headroom exists for this; disable
    swap on worker nodes so failures are loud rather than silent.
 
