@@ -210,16 +210,108 @@ millisecond. **The network is not the bottleneck** — memory bandwidth is.
 
 ### OS and provisioning
 
-**Debian 12 headless.** No GUI, no display manager, no CUDA. Build llama.cpp
-once with AVX2 enabled; distribute binaries. Versions must match exactly across
-nodes or the RPC protocol mismatches — never build per-node.
+**Debian 12 headless.** No GUI, no display manager, no CUDA.
 
-Disks vary in size and type, which breaks block-level `dd` cloning. Use a Debian
-preseed for unattended base install plus one idempotent `setup.sh`.
+#### Preseed
 
-**Identity hygiene** — on first boot every node must regenerate `/etc/machine-id`,
-regenerate SSH host keys, and clear `/var/lib/tailscale` before joining. Cloned
-auth state collides.
+Disks vary in size and type, which breaks `dd` cloning. Use a preseed for
+unattended install. The idiomatic way to handle varying disks is to **leave
+`partman-auto/disk` unset** — with one disk the installer uses it whatever it is
+called. For nodes with more than one disk, Debian's own dynamic pattern:
+
+```
+d-i partman/early_command \
+    string debconf-set partman-auto/disk "$(list-devices disk | head -n1)"
+```
+
+Never hardcode `/dev/sda`; kernel disk naming is not deterministic.
+
+**Set `d-i apt-setup/non-free-firmware boolean true`.** This is a new apt
+component in Bookworm, and on recycled hardware missing NIC firmware is a
+realistic way to end up with a node that installs but cannot reach the network.
+
+Bake the preseed into a remastered netinst ISO (zero typing per machine, no LAN
+dependency during install). Fallback if the repack tooling misbehaves: stock USB
+plus one typed line per node —
+`auto=true priority=critical preseed/url=http://<host>:8000/preseed.cfg`.
+
+#### Identity hygiene
+
+Every node must, before joining anything:
+
+```bash
+# machine-id
+truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id
+systemd-machine-id-setup
+ln -sf /etc/machine-id /var/lib/dbus/machine-id
+
+# SSH host keys
+rm -f /etc/ssh/ssh_host_* && ssh-keygen -A && systemctl restart ssh
+
+# Tailscale state
+systemctl stop tailscaled
+rm -rf /var/lib/tailscale/tailscaled.state /var/cache/tailscale
+systemctl start tailscaled
+```
+
+**Why machine-id matters specifically:** systemd-networkd derives its DHCP
+client-ID from it. Duplicate machine-ids across the fleet cause nodes to collide
+on a single DHCP lease, presenting as intermittent network flapping — invisible
+when testing one node, miserable to debug across seven. (systemd #9609, #9228.)
+
+Duplicate SSH host keys let any node cryptographically impersonate any other.
+Duplicate Tailscale state makes nodes race on one tailnet identity.
+
+Use `ssh-keygen -A` rather than `dpkg-reconfigure openssh-server` — the latter
+can fail in headless contexts.
+
+#### Tailscale
+
+Reusable, pre-approved, **non-ephemeral** auth key (ephemeral keys remove nodes
+on disconnect, which is wrong for permanent servers):
+
+```bash
+tailscale up --auth-key=file:/path/to/key --hostname="$(hostname)" \
+             --ssh --accept-dns=false
+```
+
+**Never pass `--advertise-routes` on any node.** Tailscale only owns
+`100.64.0.0/10` and does not touch existing LAN routing, so RPC traffic stays on
+raw LAN IPs automatically. Advertising the LAN subnet is the one way to
+accidentally pull the hot path onto WireGuard.
+
+Pass the key via `file:` so it does not land in shell history or the process
+list.
+
+#### Memory tuning
+
+```bash
+swapoff -a
+sed -i '/\sswap\s/s/^/#/' /etc/fstab
+systemctl --type swap          # then mask each unit found
+```
+
+- **`vm.overcommit_memory=1`** — llama.cpp has hit overcommit-related OOM kills
+  directly (ggml-org/llama.cpp #22629).
+- **`--mlock`** plus `* soft/hard memlock unlimited` in
+  `/etc/security/limits.conf` to pin weights in RAM.
+- **Transparent hugepages: leave alone.** Debian 12 defaults to `madvise`, and
+  benchmarking found `madvise` slightly *faster* than `always` for llama.cpp CPU
+  inference. Assert the default; do not build tooling to change it.
+
+#### Building and distributing llama.cpp
+
+Build once on a fleet node, `rsync` binaries to the rest. Versions must match
+exactly across nodes or the RPC protocol mismatches — never build per-node.
+
+Build with `-DLLAMA_CURL=OFF` (models are provisioned by script, not downloaded
+by llama.cpp).
+
+**Build on a fleet node, not in a newer container or chroot.** glibc is
+forward-incompatible: binaries built against a newer glibc fail with
+`GLIBC_2.XX not found` on older systems. Building natively on identical Debian 12
+makes this a non-issue — add an `apt-cache policy libc6` version assertion to
+`setup.sh` as cheap insurance.
 
 ## Missing Link
 

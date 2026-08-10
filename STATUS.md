@@ -43,6 +43,12 @@ Not blocking, decide on measurement:
 - [ ] Whether time-to-first-token is bad enough to reconsider GPUs for prefill
 - [ ] Whether Qwen3.5/3.6-35B-A3B supersede the target (newer, not a drop-in)
 
+Verify empirically on node 1 (cheap, no source found):
+
+- [ ] Bookworm netinst initrd path (`install.amd/`?) — `ls` the actual ISO
+- [ ] `ldd` output for a CPU-only `llama-server` / `rpc-server` build
+- [ ] Whether `/etc/apt/sources.list` is populated correctly post-preseed
+
 ## Research findings so far
 
 - **No public benchmark exists** for this model class on Broadwell/DDR3/AVX2.
@@ -53,6 +59,16 @@ Not blocking, decide on measurement:
   context costs ~3 GB. Long context is limited by prefill time, not memory.
 - **Thread count needs separate tuning for prefill vs generation.** Generation
   peaks well below core count due to memory-controller contention.
+- **Duplicate `machine-id` breaks DHCP, not just logging.** systemd-networkd
+  derives its DHCP client-ID from it, so identical IDs make nodes collide on one
+  lease — presents as intermittent fleet-wide network flapping.
+- **Tailscale LAN isolation is automatic.** It only owns `100.64.0.0/10`. The
+  only way to pull RPC onto WireGuard is to pass `--advertise-routes`, so the
+  rule is simply never to pass it.
+- **THP already correct on Debian 12** (`madvise`), and measurably better than
+  `always` for llama.cpp. Assert the default rather than tuning it.
+- **Preseed must set `non-free-firmware`** or recycled hardware may install
+  without working NIC firmware.
 
 ## In flight
 
