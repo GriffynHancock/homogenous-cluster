@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stand up 7 surplus desktops as a CPU-only llama.cpp RPC cluster serving Qwen3-30B-A3B Q8_0, fronted by Open WebUI and Missing Link.
+**Goal:** Stand up 7 surplus desktops as a CPU-only llama.cpp RPC cluster running a model no single machine could hold, fronted by Open WebUI and Missing Link, with a defensible measured quality claim.
 
 **Architecture:** Debian 12 headless on each node, provisioned by preseed + idempotent `setup.sh`. llama.cpp built once and distributed fleet-wide. One `rpc-server` per node holding a layer range in system RAM; `llama-server` on the master assigns layers via explicit `--tensor-split` and serves an OpenAI-compatible API. RPC mesh on raw LAN IPs; Tailscale for admin SSH and web only.
 
@@ -1196,7 +1196,7 @@ An async job runner: submit a document and a task, collect the result later. Del
   - `claim_next_pending(path: str) -> dict | None`
   - `complete_job(path: str, job_id: str, result: str, metrics: dict) -> None`
   - `fail_job(path: str, job_id: str, error: str) -> None`
-  - Job dict keys: `id, kind, document, status, result, error, created_at, started_at, finished_at, ttft_s, total_s, tokens`
+  - Job dict keys: `id, kind, document, status, result, error, created_at, started_at, finished_at, ttft_s, total_s, tokens, chunks`
   - `status` ∈ `pending | running | done | failed`
 
 - [ ] **Step 1: Write requirements and pytest config**
@@ -1272,12 +1272,13 @@ def test_complete_job_records_result_and_metrics(dbpath):
     job_id = db.create_job(dbpath, "summarise", "a")
     db.claim_next_pending(dbpath)
     db.complete_job(dbpath, job_id, "the summary",
-                    {"ttft_s": 12.5, "total_s": 60.0, "tokens": 128})
+                    {"ttft_s": 12.5, "total_s": 60.0, "tokens": 128, "chunks": 3})
     job = db.get_job(dbpath, job_id)
     assert job["status"] == "done"
     assert job["result"] == "the summary"
     assert job["ttft_s"] == 12.5
     assert job["tokens"] == 128
+    assert job["chunks"] == 3
     assert job["finished_at"] is not None
 
 
@@ -1339,7 +1340,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     finished_at TEXT,
     ttft_s      REAL,
     total_s     REAL,
-    tokens      INTEGER
+    tokens      INTEGER,
+    chunks      INTEGER
 );
 """
 
@@ -1403,9 +1405,9 @@ def complete_job(path, job_id, result, metrics):
     with _connect(path) as conn:
         conn.execute(
             "UPDATE jobs SET status='done', result=?, finished_at=?, "
-            "ttft_s=?, total_s=?, tokens=? WHERE id=?",
+            "ttft_s=?, total_s=?, tokens=?, chunks=? WHERE id=?",
             (result, _now(), metrics.get("ttft_s"), metrics.get("total_s"),
-             metrics.get("tokens"), job_id),
+             metrics.get("tokens"), metrics.get("chunks"), job_id),
         )
 
 
@@ -1446,9 +1448,29 @@ git commit -m "feat(missing-link): SQLite job store with persistence tests"
 - Consumes: `db.claim_next_pending`, `db.complete_job`, `db.fail_job`.
 - Produces:
   - `PROMPTS: dict[str, str]` — keyed by job kind
+  - `REDUCE_PROMPTS: dict[str, str]` — keyed by job kind, for combining chunk summaries
+  - `CHUNK_TOKENS: int`, `OVERLAP_TOKENS: int`
+  - `chunk_document(text: str, chunk_tokens: int, overlap_tokens: int) -> list[str]`
   - `build_prompt(kind: str, document: str) -> str`
+  - `build_reduce_prompt(kind: str, summaries: list[str]) -> str`
+  - `summarise(kind: str, document: str, base_url: str, client) -> str` — map-reduce
   - `run_one(db_path: str, base_url: str, client) -> bool` — processes one job, returns True if a job was handled
   - `run_forever(db_path: str, base_url: str, poll_s: float = 5.0) -> None`
+
+**Design note — map-reduce, decided on evidence.** Long documents are chunked,
+each chunk summarised, then the summaries summarised. This is *not* a fallback
+for oversized input; it is the strategy for all input, because:
+
+- **"Lost in the middle" is not fixed by a bigger context window.** Accuracy
+  drops sharply for material in the middle of long contexts, and extended-context
+  model variants show the same position bias (arXiv:2307.03172).
+- **CPU prefill collapses with length** — ~58% throughput loss from 512 to 32K
+  context, since attention becomes bandwidth-bound. Small chunks stay in the
+  efficient range.
+- **Map-reduce beats refine decisively** on book-length text (arXiv:2310.00785),
+  and refine is strictly sequential, so far slower in wall-clock.
+- **Chunk size barely matters for map-reduce** (unlike refine), so ~4K with 10%
+  overlap is fine and is not worth tuning.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1485,6 +1507,65 @@ def test_build_prompt_rejects_unknown_kind():
         worker.build_prompt("nonsense", "x")
 
 
+def test_short_document_is_one_chunk():
+    chunks = worker.chunk_document("short text", 4000, 400)
+    assert chunks == ["short text"]
+
+
+def test_long_document_splits_into_multiple_chunks():
+    # chunk_tokens is approximated as 4 chars/token, so 100 tokens ~= 400 chars.
+    text = "word " * 2000            # ~10000 chars
+    chunks = worker.chunk_document(text, 100, 10)
+    assert len(chunks) > 1
+    assert all(len(c) <= 100 * 4 + 50 for c in chunks)
+
+
+def test_chunks_overlap():
+    text = "".join(f"{i:04d} " for i in range(500))
+    chunks = worker.chunk_document(text, 100, 20)
+    assert len(chunks) > 1
+    # The tail of chunk 0 must reappear at the head of chunk 1.
+    tail = chunks[0][-40:].strip()
+    assert tail and tail in chunks[1]
+
+
+def test_chunking_covers_whole_document():
+    text = "".join(f"{i:04d} " for i in range(500))
+    joined = "".join(worker.chunk_document(text, 100, 20))
+    for marker in ("0000", "0250", "0499"):
+        assert marker in joined
+
+
+def test_summarise_single_chunk_makes_one_call():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "one summary"}}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = worker.summarise("summarise", "a short document", "http://x", client)
+    assert result == "one summary"
+    assert len(calls) == 1
+
+
+def test_summarise_long_document_maps_then_reduces():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": f"summary {len(calls)}"}}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    long_doc = "word " * 20000
+    result = worker.summarise("summarise", long_doc, "http://x", client)
+    # N chunk calls plus one reduce call.
+    assert len(calls) > 2
+    assert result == f"summary {len(calls)}"
+
+
 def test_run_one_returns_false_when_no_jobs(dbpath):
     client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
     assert worker.run_one(dbpath, "http://x", client) is False
@@ -1496,7 +1577,6 @@ def test_run_one_completes_a_job(dbpath):
     def handler(request):
         return httpx.Response(200, json={
             "choices": [{"message": {"content": "a summary"}}],
-            "usage": {"completion_tokens": 42},
         })
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -1505,7 +1585,7 @@ def test_run_one_completes_a_job(dbpath):
     job = db.get_job(dbpath, job_id)
     assert job["status"] == "done"
     assert job["result"] == "a summary"
-    assert job["tokens"] == 42
+    assert job["chunks"] == 1
     assert job["total_s"] is not None
 
 
@@ -1557,7 +1637,7 @@ from . import db
 
 PROMPTS = {
     "summarise": (
-        "Summarise the following document. Give a short paragraph of overview, "
+        "Summarise the following text. Give a short paragraph of overview, "
         "then the key points as a bulleted list. Be faithful to the source and "
         "do not speculate beyond it.\n\n---\n\n{document}"
     ),
@@ -1568,7 +1648,34 @@ PROMPTS = {
     ),
 }
 
-# Generous: a slow cluster may legitimately take many minutes per job.
+# The reduce step sees summaries, not source text, and must be told so --
+# otherwise models tend to summarise the summaries into uselessly terse output.
+REDUCE_PROMPTS = {
+    "summarise": (
+        "The following are summaries of consecutive sections of one long "
+        "document, in order. Combine them into a single coherent summary of the "
+        "whole document: a short overview paragraph, then the key points as a "
+        "bulleted list. Remove duplication across sections. Do not add anything "
+        "not present in the sections.\n\n---\n\n{document}"
+    ),
+    "report": (
+        "The following are summaries of consecutive sections of one long source, "
+        "in order. Using only this material, draft a single clear report with "
+        "headings and complete sentences. Remove duplication across sections.\n\n"
+        "---\n\n{document}"
+    ),
+}
+
+# Chunk size is deliberately modest. CPU prefill throughput degrades sharply
+# with context length (attention becomes bandwidth-bound), and map-reduce
+# quality is largely insensitive to chunk size -- so there is no reason to
+# push it larger. See the design note in the plan.
+CHUNK_TOKENS = 4000
+OVERLAP_TOKENS = 400
+CHARS_PER_TOKEN = 4  # rough, and deliberately so: exact tokenisation is not
+                     # needed to pick a chunk boundary.
+
+# Generous: a slow cluster may legitimately take many minutes per call.
 REQUEST_TIMEOUT = httpx.Timeout(3600.0, connect=10.0)
 
 
@@ -1578,6 +1685,70 @@ def build_prompt(kind, document):
     return PROMPTS[kind].format(document=document)
 
 
+def build_reduce_prompt(kind, summaries):
+    if kind not in REDUCE_PROMPTS:
+        raise ValueError(f"unknown job kind: {kind}")
+    numbered = "\n\n".join(
+        f"[Section {i}]\n{s}" for i, s in enumerate(summaries, 1)
+    )
+    return REDUCE_PROMPTS[kind].format(document=numbered)
+
+
+def chunk_document(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
+    """Split text into overlapping chunks, breaking on whitespace where possible.
+
+    Overlap exists so a sentence spanning a boundary appears whole in at least
+    one chunk.
+    """
+    size = chunk_tokens * CHARS_PER_TOKEN
+    overlap = overlap_tokens * CHARS_PER_TOKEN
+    if len(text) <= size:
+        return [text]
+
+    chunks, start = [], 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            # Prefer a whitespace boundary, but only if one is reasonably near.
+            space = text.rfind(" ", start + size - 200, end)
+            if space > start:
+                end = space
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return chunks
+
+
+def _complete(base_url, client, prompt, max_tokens=2048):
+    response = client.post(
+        f"{base_url}/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": prompt}],
+              "max_tokens": max_tokens},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+    return response.json()["choices"][0]["message"]["content"]
+
+
+def summarise(kind, document, base_url, client):
+    """Map-reduce: summarise each chunk, then summarise the summaries.
+
+    A single-chunk document skips the reduce step entirely -- there is nothing
+    to combine, and a second pass would only lose detail.
+    """
+    chunks = chunk_document(document)
+    if len(chunks) == 1:
+        return _complete(base_url, client, build_prompt(kind, chunks[0]))
+
+    partials = [
+        _complete(base_url, client, build_prompt(kind, chunk))
+        for chunk in chunks
+    ]
+    return _complete(base_url, client, build_reduce_prompt(kind, partials))
+
+
 def run_one(db_path, base_url, client):
     """Process one pending job. Returns True if a job was handled."""
     job = db.claim_next_pending(db_path)
@@ -1585,28 +1756,13 @@ def run_one(db_path, base_url, client):
         return False
 
     try:
-        prompt = build_prompt(job["kind"], job["document"])
         started = time.monotonic()
-        response = client.post(
-            f"{base_url}/v1/chat/completions",
-            json={
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 2048,
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
+        content = summarise(job["kind"], job["document"], base_url, client)
         total_s = time.monotonic() - started
-
-        if response.status_code != 200:
-            db.fail_job(db_path, job["id"],
-                        f"HTTP {response.status_code}: {response.text[:500]}")
-            return True
-
-        payload = response.json()
-        content = payload["choices"][0]["message"]["content"]
-        tokens = payload.get("usage", {}).get("completion_tokens")
+        chunks = len(chunk_document(job["document"]))
         db.complete_job(db_path, job["id"], content,
-                        {"total_s": total_s, "tokens": tokens, "ttft_s": None})
+                        {"total_s": total_s, "tokens": None, "ttft_s": None,
+                         "chunks": chunks})
     except Exception as exc:  # noqa: BLE001 - any failure must mark the job
         db.fail_job(db_path, job["id"], f"{type(exc).__name__}: {exc}")
 
@@ -1627,7 +1783,7 @@ cd missing-link && . .venv/bin/activate
 python -m pytest tests/test_worker.py -v
 ```
 
-Expected: 7 passed.
+Expected: 13 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1862,12 +2018,13 @@ document.getElementById('f').addEventListener('submit', async (e) => {
 </script>
 
 <table>
-  <tr><th>ID</th><th>Kind</th><th>Status</th><th>Time</th><th>Result</th></tr>
+  <tr><th>ID</th><th>Kind</th><th>Status</th><th>Chunks</th><th>Time</th><th>Result</th></tr>
   {% for j in jobs %}
   <tr>
     <td><code>{{ j.id }}</code></td>
     <td>{{ j.kind }}</td>
     <td class="status {{ j.status }}">{{ j.status }}</td>
+    <td>{{ j.chunks or '' }}</td>
     <td>{% if j.total_s %}{{ '%.0f'|format(j.total_s) }}s{% endif %}</td>
     <td><pre>{{ (j.result or j.error or '')[:600] }}</pre></td>
   </tr>
@@ -1882,7 +2039,7 @@ cd missing-link && . .venv/bin/activate
 python -m pytest tests/ -v
 ```
 
-Expected: all tests pass (8 db + 7 worker + 7 app = 22).
+Expected: all tests pass (8 db + 13 worker + 7 app = 28).
 
 - [ ] **Step 6: Write the run script and start it**
 
@@ -1949,9 +2106,9 @@ Append to `docs/measurements.md`:
 
 **Date:** <YYYY-MM-DD>
 
-| Document | Approx input tokens | Kind | Wall clock | Output quality |
-|---|---|---|---|---|
-| | | | | |
+| Document | Approx input tokens | Chunks | Kind | Wall clock | Output quality |
+|---|---|---|---|---|---|
+| | | | | | |
 ```
 
 - [ ] **Step 3: Update STATUS.md**
@@ -1967,17 +2124,196 @@ git commit -m "docs: Missing Link end-to-end measurements; cluster operational"
 
 ---
 
-## Open decision for the user
+### Task 14: Quality evaluation harness
 
-**Long-document chunking is deliberately not implemented.** `worker.py` sends the whole document in one request. With an 8k context, a document longer than roughly 6,000 words will be truncated or rejected by `llama-server`.
+The blog needs a defensible quality claim. **No public leaderboard compares
+locally-run llama.cpp models against frontier models on summarisation** — so
+this is a genuine gap being filled, and should be described that way rather than
+implying precedent.
 
-There are three reasonable strategies, and the right one depends on what the documents actually look like:
+**Files:**
+- Create: `eval/fetch-dataset.py`
+- Create: `eval/run-eval.py`
+- Modify: `docs/measurements.md`
 
-1. **Reject oversized documents** at submission with a clear error. Honest, trivial, and no silent quality loss — but the user has to split things by hand.
-2. **Map-reduce**: chunk, summarise each chunk, then summarise the summaries. Handles any length, but costs N+1 cluster passes and loses cross-chunk context. On a cluster this slow, a 10-chunk document is a genuinely long wait.
-3. **Raise the context window** to 32k (KV cache is only ~3 GB at that length — memory is not the constraint here) and reject beyond that. Simplest, but prefill time grows with context and prefill is the slow part on CPU.
+**Interfaces:**
+- Consumes: Missing Link API on `:8090`.
+- Produces: `eval/results.json` and a summary table in `docs/measurements.md`.
 
-This is a real trade-off between wait time, fidelity, and implementation cost, and it depends on document length distribution that only you know. Once measurements from Task 8 show actual prefill cost at 2k vs 8k, the answer may be obvious — revisit it then rather than guessing now.
+- [ ] **Step 1: Fetch the evaluation set**
+
+BillSum is **CC0**, so example inputs and outputs can be republished in the blog
+without licensing concerns. GovReport is thematically closer to the sensitive-
+records story; use it if licence terms allow for your purposes.
+
+Create `eval/fetch-dataset.py`:
+
+```python
+"""Sample documents for quality evaluation.
+
+BillSum is CC0, so sampled documents and generated summaries can be quoted
+freely in the write-up. GovReport is a closer thematic fit but check its terms
+before republishing any of it.
+"""
+import json
+import random
+from datasets import load_dataset
+
+SAMPLE_SIZE = 20
+SEED = 20260810  # fixed so the sample is reproducible
+
+
+def main():
+    ds = load_dataset("FiscalNote/billsum", split="test")
+    random.seed(SEED)
+    idx = random.sample(range(len(ds)), SAMPLE_SIZE)
+    rows = [{"id": i, "document": ds[i]["text"], "reference": ds[i]["summary"]}
+            for i in idx]
+    with open("eval/dataset.json", "w") as f:
+        json.dump(rows, f, indent=2)
+    lengths = [len(r["document"].split()) for r in rows]
+    print(f"{len(rows)} documents, {min(lengths)}-{max(lengths)} words "
+          f"(median {sorted(lengths)[len(lengths)//2]})")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+pip install -q datasets
+python eval/fetch-dataset.py
+```
+
+- [ ] **Step 2: Write the evaluation runner**
+
+Create `eval/run-eval.py`:
+
+```python
+"""Submit the eval set through Missing Link and record quality inputs.
+
+Deliberately does NOT compute a single blended score. Factual consistency and
+holistic quality are separate axes with separate failure modes, and averaging
+them hides exactly the thing worth knowing.
+
+ROUGE is recorded only as a cheap baseline for comparison against published
+numbers -- it is not the headline metric. It measures lexical overlap, swings
+up to 40 points depending on reference choice, and correlates poorly with human
+judgement.
+"""
+import json
+import time
+import httpx
+
+MISSING_LINK = "http://127.0.0.1:8090"
+POLL_S = 30
+
+
+def submit(client, document):
+    r = client.post(f"{MISSING_LINK}/jobs",
+                    json={"kind": "summarise", "document": document})
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def wait_for(client, job_id):
+    while True:
+        job = client.get(f"{MISSING_LINK}/jobs/{job_id}").json()
+        if job["status"] in ("done", "failed"):
+            return job
+        time.sleep(POLL_S)
+
+
+def main():
+    dataset = json.load(open("eval/dataset.json"))
+    results = []
+    with httpx.Client(timeout=60) as client:
+        for i, row in enumerate(dataset, 1):
+            print(f"[{i}/{len(dataset)}] submitting doc {row['id']}", flush=True)
+            job_id = submit(client, row["document"])
+            job = wait_for(client, job_id)
+            results.append({
+                "doc_id": row["id"],
+                "input_words": len(row["document"].split()),
+                "chunks": job.get("chunks"),
+                "wall_clock_s": job.get("total_s"),
+                "status": job["status"],
+                "reference": row["reference"],
+                "generated": job.get("result"),
+                "error": job.get("error"),
+            })
+            with open("eval/results.json", "w") as f:
+                json.dump(results, f, indent=2)
+
+    ok = [r for r in results if r["status"] == "done"]
+    print(f"\n{len(ok)}/{len(results)} completed")
+    if ok:
+        times = sorted(r["wall_clock_s"] for r in ok)
+        print(f"wall clock: median {times[len(times)//2]:.0f}s  "
+              f"min {times[0]:.0f}s  max {times[-1]:.0f}s")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 3: Run the evaluation**
+
+```bash
+python eval/run-eval.py 2>&1 | tee /tmp/eval.log
+```
+
+This takes hours by design. It is the workload the cluster exists to serve, so
+its duration is itself a result worth recording.
+
+- [ ] **Step 4: Score on two independent axes**
+
+Score `eval/results.json` with an LLM judge. **Use a different model than the
+one under test** — self-evaluation inflates scores. Two axes, kept separate:
+
+1. **Factual consistency (reference-free).** For each summary, does it assert
+   anything not supported by the source document? This is the axis that matters
+   most for sensitive records — a fluent summary that invents a fact is worse
+   than a clumsy accurate one.
+2. **Quality rubric (SummEval dimensions).** Coherence, consistency, fluency,
+   relevance — 1–5 each, with the judge required to give reasoning before
+   scoring.
+
+Record **spread, not just means** — 20 documents does not support a bare average.
+
+- [ ] **Step 5: Record the results**
+
+Append to `docs/measurements.md`:
+
+```markdown
+## Quality evaluation
+
+**Date:** <YYYY-MM-DD> | **Dataset:** BillSum test, n=20, seed 20260810
+**Model:** <model> | **Judge:** <different model>
+
+| Metric | Median | Range |
+|---|---|---|
+| Factual consistency (0–1) | | |
+| Coherence (1–5) | | |
+| Consistency (1–5) | | |
+| Fluency (1–5) | | |
+| Relevance (1–5) | | |
+| Wall clock per document (s) | | |
+| Chunks per document | | |
+
+**Caveat:** BillSum is old and widely mirrored, so frontier models may have
+memorised its reference summaries. Reference-free factual-consistency scoring
+sidesteps this; overlap metrics do not.
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add eval/ docs/measurements.md
+git commit -m "feat: quality evaluation harness on BillSum"
+```
+
+---
 
 ---
 
@@ -1992,6 +2328,7 @@ Before declaring the cluster done, every one of these must have been run and its
 - [ ] `curl` against `:8080/v1/chat/completions` returns coherent prose
 - [ ] Concurrency test run, output confirmed not garbled
 - [ ] Open WebUI reachable over Tailscale, streams a reply
-- [ ] `python -m pytest missing-link/tests/ -v` — 22 passed
+- [ ] `python -m pytest missing-link/tests/ -v` — 28 passed
 - [ ] A real document completes end to end through Missing Link
+- [ ] `python eval/run-eval.py` completes; quality scored on both axes
 - [ ] `docs/measurements.md` contains every number, none estimated

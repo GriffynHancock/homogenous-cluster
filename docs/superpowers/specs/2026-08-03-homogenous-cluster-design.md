@@ -522,9 +522,73 @@ The work happens entirely on hardware the organisation already owns. Cloud is
 not part of this design — no hybrid architectures, no framing local inference as
 a preprocessing step for something else.
 
+### Chunking: map-reduce, decided on evidence
+
+Documents are chunked and summarised hierarchically — summarise each chunk, then
+summarise the summaries — rather than stuffed into one large context.
+
+**Why not a bigger context window:**
+
+- **"Lost in the middle" is not fixed by more context.** Liu et al.
+  (arXiv:2307.03172) measured accuracy falling from 75.8% to 53.8% as relevant
+  material moved to the middle of context, at times *below* the no-context
+  baseline. The 16K extended-context model showed nearly identical position
+  bias to the base model. It is a separate failure mode from context capacity.
+- **CPU prefill degrades badly with length.** Measured on a Ryzen 7950X,
+  prefill fell from 394 t/s at 512 tokens to 163 t/s at 32K — a ~58% loss, as
+  attention becomes memory-bandwidth-bound. This cluster lives in exactly that
+  regime, so long contexts are doubly expensive here.
+- **Stuffing does not measurably win.** SummHay (arXiv:2407.01370) found
+  full-context 37.8 vs chunked 36.0 on ~100K-token sets — no decisive gap.
+
+**Why map-reduce and not refine:** BooookScore (arXiv:2310.00785) tested both on
+book-length text. Hierarchical beat incremental for every model (Claude 2:
+91.1 vs 78.6; Mixtral-8x7B: 81.5 vs 64.5; LLaMA 2 failed refine entirely).
+Refine is also strictly sequential, so on a slow cluster it is far slower in
+wall-clock — one report showed hours versus ~27 minutes on comparable input.
+
+**Chunk size is not worth tuning.** BooookScore found map-reduce quality largely
+insensitive to it, unlike refine. Start at ~4K tokens with ~10% overlap and
+leave it alone — this keeps prefill in its efficient range.
+
+The large context window remains configured (KV cache is cheap at 128 GB/node)
+but is *capacity for headroom*, not the summarisation strategy.
+
+### Evaluating output quality
+
+The blog needs a defensible quality claim, and **no existing leaderboard
+compares locally-run llama.cpp models against frontier models on
+summarisation.** Producing one is a genuine contribution — worth stating as a
+gap being filled rather than implying precedent.
+
+- **Datasets:** GovReport (19,463 US government reports with expert summaries —
+  thematically ideal) and BillSum (23,455 legislative bills, **CC0**, so example
+  outputs can be republished freely).
+- **Do not use ROUGE alone.** Lexical overlap only, swings up to 40 points on
+  reference choice, poor correlation with human judgement.
+- **Score two independent axes, unblended:** factual consistency (reference-free,
+  QAFactEval/SummaC style — does the summary claim anything absent from the
+  source) and a quality rubric (SummEval's coherence / consistency / fluency /
+  relevance, scored G-Eval style).
+- **Report spread, not just means** — a sample of 15–30 documents does not
+  support a bare average.
+- **Report TTFT and generation time alongside quality.** The argument is
+  quality-parity *at an honest latency cost*, not quality-parity alone.
+- Cite the Vectara Hallucination Leaderboard for context — ~7,700 documents,
+  100+ models including open-weight, scored on factual consistency.
+
+**Caveat worth stating in the post:** these datasets are old and widely mirrored,
+so frontier models may have memorised the reference summaries. Reference-free
+factual-consistency metrics sidestep this; overlap metrics do not.
+
 ### Scope
 
 Deliberately minimal — Missing Link is a demonstrator, not a product.
+
+Research confirmed **no mature self-hosted project already does this** — point
+at llama.cpp, queue overnight, summarise long documents. The nearest standalone
+tool has 624 stars and is semi-stale. Building it is filling a real gap, not
+reinventing something.
 
 - Submit a job (document + task template), receive an ID
 - Persistent queue surviving restart (SQLite; jobs outlive any single run)
