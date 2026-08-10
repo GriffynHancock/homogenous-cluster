@@ -1,7 +1,9 @@
 # Status
 
 **Updated:** 2026-08-10
-**Phase:** Research complete; implementation plan not yet written
+**Phase:** Plan written; awaiting hardware to begin execution
+
+Implementation plan: `docs/superpowers/plans/2026-08-10-cluster-bringup.md`
 
 ## Where things stand
 
@@ -110,12 +112,21 @@ Verify empirically on node 1 (cheap, no source found):
 
 ## Next
 
-1. Write the implementation plan
-2. **Run the localhost RPC overhead test** — `llama-bench` local vs
-   `--rpc localhost:PORT`, same machine, same model. Needs one machine, no
-   cluster. Converts the overhead question from inference to fact and is the
-   cheapest high-value measurement available.
-3. Provision node 1, benchmark, replace estimates with measurements
+Execute the plan. Phases, in order:
+
+0. **Measurement gate** (Tasks 1–3) — node 1 base install, pinned llama.cpp
+   build, **localhost RPC overhead test**, single-node baseline. The overhead
+   test has an explicit stop-and-escalate threshold; do not provision the fleet
+   before it passes.
+1. **Fleet provisioning** (Tasks 4–5) — `setup.sh` on all 7, binary
+   distribution with version and libc assertions.
+2. **Sharded inference** (Tasks 6–9) — `rpc-server` services, model fetch,
+   both memory checks, cluster launch, measurement, Open WebUI.
+3. **Missing Link** (Tasks 10–13) — job store, worker, web API, end-to-end.
+
+One design decision is deliberately deferred to the user in the plan:
+**long-document chunking strategy** (reject / map-reduce / larger context).
+Best answered once Task 8 shows real prefill cost at 2k vs 8k.
 2. Provision node 1, run `llama-bench`, replace estimates with measurements
 3. Resolve the `ik_llama.cpp` RPC-support question (only blocking item left,
    and only if we want the fork at all — mainline is the default)
