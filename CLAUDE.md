@@ -4,60 +4,148 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Homogenous Cluster
 
-A 7-node CPU-only LLM inference cluster built from surplus school hardware,
-serving as a working demonstrator for a blog post about **repurposing idle
-organisational compute for private, on-premises inference**.
+Turning idle organisational hardware into a private LLM cluster, for work that
+legally cannot leave the building.
+
+**Immediate deliverable: the cluster.** A 7-node CPU-only llama.cpp RPC cluster
+doing real work on real sensitive documents.
+
+**Long-term deliverable: a Claude Skill** that lets an organisation without a
+specialist do the same with whatever hardware it has. The cluster comes first
+because the skill must dispense *measured* advice, not arithmetic. Do not start
+building the skill until the cluster has produced numbers.
 
 ## The argument
 
-Organisations with data-sovereignty constraints — schools, clinics, councils,
-legal practices — often cannot send sensitive data to hosted APIs. They also
-often have a room full of decommissioned desktops. The claim is that those two
-facts cancel out: pooled system RAM across obsolete machines can hold
-frontier-class open-weights MoE models, and while generation is glacial compared
-to cloud offerings, **a great many valuable workloads do not need to be fast.**
+**Data sovereignty is a hard constraint, not a preference.** Many Australian
+organisations — health, legal, education, government, community services —
+cannot send data offsite. It is statutory or contractual, and vendor assurances
+do not move it.
+
+The perverse result: the tasks that would benefit most obviously from AI are
+exactly the ones touching protected material. So only a thin, uninteresting
+slice of the workflow gets automated while the substantial work stays manual.
+
+**On-prem infrastructure is the obvious answer and it rarely survives a
+budget.** Acquisition is the small part. What kills it is the ongoing cost —
+power, cooling, rack space, patching, monitoring, physical security, insurance,
+and staff who can run it. Few organisations will fund that for a handful of
+internal workflows.
+
+**But those organisations usually already have the hardware.** Store rooms of
+machines from refresh cycles and departed staff. Hardware as recent as **2019**
+is useful, often with substantial RAM already installed — the resource that
+actually matters. Acquisition cost is zero, and it is already inventoried,
+depreciated, and inside the building.
+
+So: **for an organisation with large volumes of text and modest security
+requirements, pool the idle machines into a local cluster on a secure or
+air-gapped network, and run the legally sensitive language work there.**
+Generation is slow, but a summary that arrives overnight beats one that never
+gets written.
+
+## Target user and workloads
+
+**Fits:** large volumes of text, genuine sovereignty constraints, *modest*
+security requirements, and idle hardware. **Does not fit:** organisations with
+high security requirements — see the security posture below.
+
+Workloads, in order of maturity:
+
+- **Document summarisation** — submit overnight, read in the morning.
+- **Medium-horizon multi-step search and Q&A** — questions needing several
+  passes over a corpus. Slow is fine; nobody is waiting at a prompt.
+- **Report writing / drafting** from source material.
+
+## Security posture
+
+**The skill will not advise on security, deliberately.** A cluster holding an
+organisation's sensitive documents is a **very high risk asset**. It belongs
+either fully offline — reachable only over its own ethernet segment — or inside
+a mature, properly segmented network.
+
+Getting that right depends on obligations, existing controls, and risk appetite
+that no tool can assess. So: ask about the network, state plainly that securing
+and validating it is the organisation's responsibility, and otherwise care
+about exactly one thing — **a fast, low-latency connection between machines.**
+
+Do not write security guidance into this project. Do not imply the tooling
+makes a network safe. Point at the requirement and move on.
+
+## Why old hardware works at all
 
 Two technical facts carry the whole argument:
 
 1. **Active params, not total params, determine speed.** Bytes read per token
    ≈ active params × bits-per-weight. Everything else is storage. A 1T-param
    model with 32B active is tractable on system RAM; a 70B dense model is not.
-2. **Pipeline sharding buys capacity, not speed.** For one request, nodes run
+   **This is why sparse MoE models are the enabling technology here** — they
+   decouple capability (what you store) from speed (what you read).
+2. **Pooling buys capacity, not speed.** For one request, nodes run
    sequentially — 7 nodes ≈ 1 node with 7× the RAM. The cluster exists to hold
    a model no single machine could, not to run it faster.
 
 The honest pitch is therefore not "slow chatbot" but **"a few seats, each slow,
 running something the organisation could not otherwise touch at all."**
 
-**Unresolved — do not assert this in the blog until measured.** The "a few
-seats" half of that pitch assumed concurrent requests are cheap, which is true
-for dense models (measured ~5.75× throughput from batch 1→32 on CPU) but
-**probably not for a very sparse MoE.** Each token routes to its own experts, so
-batch B touches ≈ `min(B × top_k, n_experts)` experts — meaning bytes read grow
-roughly in step with tokens produced, and throughput stays flat. The sparsity
-that makes a 550 GB model tractable at batch 1 is what stops batching helping.
-Run `llama-batched-bench` at `-np 1,2,4,8` before claiming multiple seats.
+**Unresolved — do not assert the "few seats" half until measured.** It assumed
+concurrent requests are cheap, which holds for dense models (measured ~5.75×
+throughput from batch 1→32 on CPU) but **probably not for a very sparse MoE.**
+Each token routes to its own experts, so batch B touches ≈ `min(B × top_k,
+n_experts)` experts — bytes read grow roughly in step with tokens produced, and
+throughput stays flat. The sparsity that makes a 550 GB model tractable at batch
+1 is what stops batching helping. Run `llama-batched-bench` at `-np 1,2,4,8`
+before claiming multiple seats anywhere.
 
 ## Missing Link
 
-**Missing Link** is the demo we are building: an **asynchronous long-workload
-runner** on top of the cluster. Rather than a chat window where slowness is a
-defect, it is a job queue where slowness is irrelevant — submit work, collect
-results later.
+**Missing Link** is the async long-workload runner on top of the cluster.
+Rather than a chat window where slowness is a defect, it is a job queue where
+slowness is irrelevant — submit work, collect results later.
 
-Missing Link is the centrepiece of the argument, not a nice-to-have. It is what
-converts "too slow to be useful" into "fast enough for this class of work."
-
-The workloads are:
-
-- **Document summarisation** of sensitive records — submit overnight, read in
-  the morning.
-- **Report writing / drafting** where a multi-minute turnaround is fine.
+It is the centrepiece, not a nice-to-have: it converts "too slow to be useful"
+into "fast enough for this class of work." It is also the prototype for the
+skill's task-profile mechanism — each workload type is a plug-in with its own
+prompts, chunking and evaluation.
 
 **Cloud is not part of the story.** Do not frame local inference as a
 preprocessing step that makes cloud safe, and do not propose hybrid
-local/cloud architectures. The argument is that the work happens entirely
-on hardware the organisation already owns, and the data never leaves.
+local/cloud architectures. The work happens entirely on hardware the
+organisation already owns, and the data never leaves.
+
+## The skill (later, not now)
+
+Once the cluster produces measurements, package it as a Claude Skill that takes
+a non-technical user from "we have a room of old computers" to a working
+cluster:
+
+1. **Assess** — inventory the machines, ask what the organisation wants to do,
+   and answer straight, including "no, and here is what would be needed."
+2. **Generate** — produce the actual provisioning scripts, configuration and
+   model selection for *that* hardware and *that* workload. Not a tutorial.
+3. **Operate** — a web UI for the people doing the work, plus an **agent
+   appliance**: a single out-of-band machine that watches the cluster, keeps it
+   patched, resumes failed jobs, and reports on whether it is actually working.
+   The appliance is separate hardware by design — a monitor that shares the
+   cluster's failure modes is not a monitor.
+
+Extensible in two directions, because neither the hardware nor the work is
+uniform:
+
+- **Hardware profiles** — CPU + RAM (this reference case), GPU clusters,
+  high-CPU/low-RAM, GPU MoE offloading, and whatever accelerators turn up.
+- **Task profiles** — summarisation, multi-step search and Q&A, drafting. Each
+  is a skill extension with its own prompts, chunking strategy and evaluation.
+
+**Every recommendation the skill makes must trace to a measurement in
+`docs/measurements.md`.** A skill that confidently dispenses datasheet
+arithmetic to a non-technical user is worse than no skill.
+
+Direction recorded in `docs/superpowers/specs/2026-08-11-skill-direction.md`.
+**Do not begin implementing it.** One thing to carry into Missing Link now,
+though: keep prompts, chunking and evaluation separable from the queue and
+worker. That seam becomes the task-profile interface later, and it is far
+cheaper to preserve than to retrofit.
 
 ## Where you are running
 

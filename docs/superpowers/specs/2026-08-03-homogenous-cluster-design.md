@@ -6,16 +6,21 @@
 
 ## Purpose
 
-Build a 7-node CPU-only LLM inference cluster from surplus school hardware,
-running a frontier-class open-weights MoE model with no data leaving the
-building, fronted by **Missing Link** — an asynchronous long-workload runner.
+Build a 7-node CPU-only LLM inference cluster from surplus hardware, running a
+frontier-class open-weights MoE model with no data leaving the building,
+fronted by **Missing Link** — an asynchronous long-workload runner.
 
-The cluster is a working demonstrator for a blog post arguing that
-organisations with data-sovereignty constraints can repurpose idle compute for
-private inference. See `CLAUDE.md` for the argument this build exists to make.
+The cluster serves organisations that cannot send data offsite for statutory or
+contractual reasons, and that already own idle hardware. See `CLAUDE.md` for
+the full argument.
 
-This spec covers the **cluster build and Missing Link**. Blog prose and
-publishable artifacts are out of scope.
+**This spec covers the cluster and Missing Link only.** It is the immediate
+deliverable, and it is also the evidence base for a later Claude Skill that
+generalises the approach — so **every design choice here should end in a
+measurement**, not an assertion. The skill's eventual value rests entirely on
+those numbers being real.
+
+Out of scope: the skill itself, the agent appliance, and security guidance.
 
 ## Hardware
 

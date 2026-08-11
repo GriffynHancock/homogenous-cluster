@@ -7,6 +7,8 @@
 Implementation plan: `docs/superpowers/plans/2026-08-10-cluster-bringup.md`
 (14 tasks). Design spec:
 `docs/superpowers/specs/2026-08-03-homogenous-cluster-design.md`.
+Long-term direction (do not start yet):
+`docs/superpowers/specs/2026-08-11-skill-direction.md`.
 
 ---
 
@@ -30,6 +32,18 @@ Never report a step done without having seen its output.
 Design and plan are settled and committed. **No hardware provisioned, nothing
 measured.** Every performance number in the spec is arithmetic on datasheets and
 is marked as such.
+
+**Deliverables, in order:**
+
+1. **The cluster (now).** 7 nodes doing real work on real sensitive documents.
+2. **A Claude Skill (later).** Assess → generate → operate, for organisations
+   without a specialist. Extensible by hardware profile (GPU, high-CPU/low-RAM,
+   MoE offload, coprocessors) and task profile (summarisation, multi-step Q&A,
+   drafting). Includes an **agent appliance** — separate out-of-band machine
+   that monitors, patches, resumes failed jobs and reports.
+
+Do not start the skill before the cluster produces measurements. Its whole value
+is that its advice is measured rather than arithmetic.
 
 ## Decided
 
@@ -98,7 +112,7 @@ argument: run what no single machine could hold, at any speed.
       tokens produced — flat throughput. Dense CPU scales ~5.75× from batch
       1→32; sparse MoE may scale ~1×. **No public measurement exists.** Run
       `llama-batched-bench -np 1,2,4,8` on the real model. This decides whether
-      the blog's "a few seats" claim survives.
+      the "a few seats" claim survives at all.
 - [ ] **Cross-talk test before enabling `--parallel`.** Trigger for #14893 was
       **FA off + multi-slot + RPC**; `-fa auto` may resolve to off on CPU, which
       matches this architecture exactly. Fix has no build tag — test explicitly
@@ -289,7 +303,15 @@ API, end-to-end.
 - **2026-08-11** — **Batching research qualified a core claim.** Free batching
   is a dense-model property; on a sparse MoE, batch B touches ≈ B × top_k
   experts, so bytes read grow with tokens produced and throughput may stay flat.
-  The "sharding multiplies seats" line in CLAUDE.md is now marked unresolved
-  pending `llama-batched-bench`. Also confirmed `-c` divides across slots, that
+  The "multiplies seats" line in CLAUDE.md is now marked unresolved pending
+  `llama-batched-bench`. Also confirmed `-c` divides across slots, that
   unset `--parallel` silently means 4 slots, that `--ctx-shift` must stay off to
   avoid silent KV eviction, and that builds from b8492 broke RPC tensor-split.
+- **2026-08-11** — **Reframed around data sovereignty and a two-stage
+  deliverable.** The argument is now: Australian organisations with statutory
+  constraints cannot send data offsite; on-prem infra dies on *ongoing* cost,
+  not acquisition; but those organisations already own idle hardware (2019-era
+  and newer is useful). Immediate deliverable is the cluster; long-term is a
+  Claude Skill (assess → generate → operate) extensible by hardware profile and
+  task profile, including an out-of-band agent appliance. Security is
+  explicitly out of scope — state the requirement, do not advise.
