@@ -62,7 +62,7 @@ room of old computers" to a working cluster:
    model selection for *that* hardware and *that* workload. Not a tutorial —
    the scripts.
 3. **Operate.** Ship a web UI for the people doing the work, and an **agent
-   appliance** — a single out-of-band machine that watches the cluster, keeps
+   appliance** — a single out-of-band machine from the pool that watches the cluster, keeps
    it patched, resumes failed jobs, and reports on whether it is actually
    working.
 
