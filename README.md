@@ -1,4 +1,4 @@
-# Homogenous Cluster
+# Homogenous Cluster - Heterogeneous Future
 
 **Turning the old computers an organisation already owns into a private LLM
 cluster — for the work it legally cannot send offsite.**
