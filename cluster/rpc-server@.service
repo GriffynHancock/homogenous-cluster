@@ -1,0 +1,34 @@
+[Unit]
+Description=llama.cpp RPC server (port %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cluster
+# RPC_THREADS is written per-node by install-services.sh from that node's real
+# PHYSICAL core count. systemd does not expand shell substitutions, hence the
+# EnvironmentFile.
+#
+# It is deliberately NOT nproc. Measured on node 1 (4 cores / 8 threads,
+# docs/measurements.md): generation is 26% SLOWER at -t 8 than at -t 4, because
+# SMT siblings contend for the same memory pipe, and generation is bandwidth-
+# bound (running at ~99% of STREAM). Prefill saturates at 4 and gains nothing
+# from SMT either. nproc would pick the worst value available.
+EnvironmentFile=/etc/default/rpc-server
+# -c enables the local tensor cache. Without it every restart re-pushes the
+#    full model over the wire -- at ~550 GB that is not survivable -- and there
+#    is a report of the process going <defunct> when run headless without it.
+# -t must be set explicitly: the default is HALF the logical cores.
+# -H 0.0.0.0 binds the LAN interface. RPC stays on raw LAN IPs, never Tailscale;
+#    upstream is explicit that RPC must not be exposed to any untrusted network.
+ExecStart=/opt/llama.cpp/bin/rpc-server -H 0.0.0.0 -p %i -t ${RPC_THREADS} -c
+Restart=always
+RestartSec=5
+LimitMEMLOCK=infinity
+# Models are sized to fit RAM and swap is disabled fleet-wide; if a node is
+# genuinely out of memory, failing loudly beats thrashing.
+OOMPolicy=stop
+
+[Install]
+WantedBy=multi-user.target

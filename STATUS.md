@@ -1,8 +1,15 @@
 # Status
 
-**Updated:** 2026-08-11
-**Phase:** Planning complete. Awaiting node 1 to begin execution.
+**Updated:** 2026-08-12
+**Phase:** **Task 1 in progress on node 1.** Hardware facts recorded; llama.cpp
+b10369 building. Node 2 being installed by hand in parallel.
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
+
+> **Read `docs/FINDINGS.md` before trusting the constraints below.** Research on
+> 2026-08-12 disproved the citation behind the per-node 75% RAM rule (F1) and
+> found an **open, unmerged upstream bug that breaks clusters with 2+ RPC
+> workers** (F2). The latter changes the task order: smoke-test two nodes
+> before committing to seven.
 
 Implementation plan: `docs/superpowers/plans/2026-08-10-cluster-bringup.md`
 (14 tasks). Design spec:
@@ -62,18 +69,31 @@ is that its advice is measured rather than arithmetic.
 | Concurrency | **Sequential until measured.** MoE may make batching worthless. |
 | Quality eval | BillSum (CC0), factual consistency + SummEval, scored separately |
 
-## Hardware (revised 2026-08-10 — much better than first assumed)
+## Hardware (node 1 MEASURED 2026-08-12 — see `docs/measurements.md`)
 
 | | Per node | × 7 |
 |---|---|---|
-| RAM | **128 GB DDR4-2400 ECC** (4 × 32 GB) | ~896 GB |
-| Pooled limit | `(896 − 7) × 0.85` | ~756 GB |
-| **Per-node limit** | 128 × 0.75 = 96 GB | **~672 GB ← binds** |
-| CPU | Unconfirmed. ECC implies Xeon. | — |
-| Network | Gigabit, same switch | — |
+| CPU | **Xeon E5-1620 v4 — 4 cores / 8 threads, 1 socket, 1 NUMA node** | — |
+| ISA | **AVX2, FMA, F16C. NO AVX-512.** | — |
+| RAM | **131.8 GB** (`MemTotal`), i.e. 122.7 GiB | ~922 GB |
+| Pooled limit | `(RAM − 1 GB/node) × 0.85` | ~747 GB |
+| **Per-node 75%** | 98.8 GB | **~692 GB ← still binds** |
+| Disk | NVMe 477 GB Intel SSDPEKKF512G7L | — |
+| Network | Gigabit, LAN `10.10.0.34/24` on `eno1` | — |
 
-**Only two of seven nodes are confirmed at 128 GB.** If the rest differ,
-recompute both constraints before fetching Model B.
+**Only node 1 is measured.** Node 2 is being installed now and is reported to
+be near-identical. Nodes 3–7 unverified.
+
+**Two things the plan got wrong here (F7):** it assumed a many-core Xeon and
+derived `-t` from `nproc`. Four physical cores and no AVX-512 make **TTFT, not
+tokens/sec, the metric at risk** — the GPU-revisit threshold is now much more
+likely to trigger. And `nproc` returns 8 while only 4 cores are real, so
+`rpc-server -t $(nproc)` needs measuring before it is baked in fleet-wide.
+
+**The 75% rule is now a chosen safety margin, not a known constraint (F1).**
+Its cited source (#15055) turned out to be a fixed syscall-size bug, not a RAM
+percentage. Worth measuring the real ceiling — at 85% the budget would be
+~784 GB, which changes which Kimi K2 quant is reachable.
 
 **A single node holds 96 GB.** So the cluster is only justified above that —
 which is why Model B is Kimi K2 and not something mid-sized. This sharpens the
