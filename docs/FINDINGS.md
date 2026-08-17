@@ -1663,3 +1663,231 @@ was output that looked fine.
 passing tests, then 66, and still fell over on the first *real* file. Synthetic
 fixtures test the half we wrote. **Exercise it with the operator's actual inputs before
 believing anything about it.**
+
+---
+
+## F39. The F36 watchdog killed a healthy job in 79 minutes. `/health` shares the queue it is meant to be probing, so it cannot tell BUSY from WEDGED.
+
+**CONFIRMED by forensics on the destroyed job, by reading `server.cpp`, and by
+reproduction under real load on node 1, 2026-08-18.**
+
+`cluster/llama-watchdog.sh` was installed at **22:24 on 2026-08-17** as F36's fix:
+probe `/health` every 60 s with `--max-time 25`, restart after **two** consecutive
+failures. At **23:43:57 the same evening** it restarted a perfectly healthy server
+and destroyed Missing Link job `06af2911d7fc` — a 97,299-character document,
+**10m55s** of completed work, chunk 1 finished and chunk 2 in flight. The client
+saw `RemoteDisconnected`. **Zero chunk summaries were persisted.**
+
+### The server was not even loaded — and its own slot counters said so
+
+At no point was more than **one of four slots** occupied. Worse, and correcting a
+detail that was believed during triage: `/health`'s slot counters reported
+`n_idle_slots=4 n_processing_slots=0` **while the server was prefilling**, and
+`3/1` only during the generation phase:
+
+```
+23:33:02  launch_slot_with_task  id_slot=0 id_task=51
+23:34:32  slot data  n_idle_slots=4 n_processing_slots=0   <- mid-prefill of task 51
+23:36:11  slot data  n_idle_slots=4 n_processing_slots=0   <- mid-prefill of task 51
+23:36:53  slot data  n_idle_slots=3 n_processing_slots=1   <- now generating
+23:39:16  release_slots  id_task=51
+23:39:17  launch_slot_with_task  id_slot=1 id_task=718
+23:41:16  slot data  n_idle_slots=4 n_processing_slots=0   <- mid-prefill of task 718
+23:43:26  slot data  n_idle_slots=4 n_processing_slots=0   <- mid-prefill of task 718
+23:43:57  RESTART
+```
+
+**So a "smarter" watchdog that read `slots_processing` from `/health` would have
+concluded the server had nothing to do at the exact moment it was working hardest.**
+The payload of the in-band probe is as misleading as its latency. The watchdog log
+shows flapping, not failure:
+
+```
+23:35:47  did not answer /health within 25s (failure 1/2)
+23:36:53  healthy again after 1 failure(s)
+23:40:27  did not answer /health within 25s (failure 1/2)
+23:41:16  healthy again after 1 failure(s)
+23:42:47  did not answer /health within 25s (failure 1/2)
+23:43:57  did not answer /health within 25s (failure 2/2)
+23:43:57  restarting llama-server@8080 -- hung but alive
+```
+
+### Mechanism: `/health` is not an out-of-band probe
+
+`/opt/ik_llama.cpp/src/examples/server/server.cpp`, `handle_health` (lines 726–765),
+builds a `SERVER_TASK_TYPE_METRICS` task, calls `ctx_server.queue_tasks.post(...)`
+onto **the same single task queue `update_slots()` drains for token generation**,
+then blocks on `ctx_server.queue_results.recv(task.id)`. `handle_slots` (line 798)
+and `handle_metrics` (line 822) use the **identical** pattern. So none of the three
+is an independent signal — **all of them go quiet exactly when the server is
+busiest.**
+
+**How long can they legitimately be quiet? Measured from the incident log itself.**
+During prefill the queue is drained only once per `n_batch` (2048 tokens) step:
+
+```
+23:33:02  kv cache rm [p0, end) ... p0=0
+23:34:32  kv cache rm [p0, end) ... p0=2048     <- 90 s later
+23:36:11  kv cache rm [p0, end) ... p0=4096     <- 99 s later
+23:39:16  prompt eval time = 231281.07 ms / 4890 tokens (21.14 tokens per second)
+```
+
+2048 tokens ÷ 21.14 t/s = **~97 s between task-queue service points.** The second
+document's prefill (task 718) was served at 23:41:16 and 23:43:26 — gaps of **120 s
+and 130 s.** The same log shows a probe issued at ~23:35:22 being answered at
+**23:36:11 — 49 s later — with `status=200`**, long after `curl` had given up.
+
+**So `/health` has a legitimate worst-case latency of 97–130 s on a perfectly
+healthy server — twice the 60 s timer period. No `--max-time` value separates busy
+from wedged.** A proposal to raise the timeout to 45 s and require an unbroken
+480 s failure streak was evaluated and **rejected on this evidence**: at 45 s the
+probe still times out through most of every prefill step, so the streak would
+accumulate on a fully healthy server and the design would rest entirely on the
+grace period being longer than the document, which is not a property anyone can
+guarantee for the next document.
+
+**The 503 path is a red herring.** `handle_health` does return 503 when
+`n_idle_slots == 0`, but only `if (req.has_param("fail_on_no_slot"))`, which the
+watchdog never sent. Every observed failure was a bare timeout (`HTTP 000`), never
+a 503. "Accept 503 as healthy" would have changed nothing.
+
+### What actually separates them: the unit's own CPU time
+
+F36's genuine wedge answered **zero probes for 7+ minutes at load 0.11** — silent
+*and* doing nothing. A busy server is silent *but burning CPU*. That distinction is
+genuinely out of band: it touches neither the task queue, nor the HTTP layer, nor
+the model.
+
+**Measured on node 1, `CPUUsageNSec` for `llama-server@8080.service`:**
+
+| Server state | CPU over a 20 s probe window | `/health` |
+|---|---:|---|
+| idle | **0 ms** (exactly) | 200 in 0.99 ms |
+| 4 concurrent real completions | **80,086 ms — 400% of one core** | 000 (timeout) |
+| SIGSTOPped (simulated wedge) | **0 ms** | 000 (timeout) |
+
+**Two orders of magnitude of separation, in seconds rather than minutes.** The
+rewritten `cluster/llama-watchdog.sh` therefore decides:
+
+- `/health` returns **any** HTTP code → alive, clear the streak. (503 "Loading
+  model" counts: it is talking, and `TimeoutStartSec` owns startup.)
+- silent **and** CPU advancing ≥ 5% of one core → **BUSY**, never restart.
+- silent **and** CPU flat → start/extend a wall-clock streak; restart only after
+  **300 s of unbroken** silent-and-idle evidence.
+- CPU accounting unavailable → log loudly and **take no action**.
+
+`/props` is probed as corroboration only. It is the one endpoint that does **not**
+post to the task queue — it reads model metadata directly — so it distinguishes
+"HTTP layer alive, inference dead" (F36's signature) from "whole process gone". It
+never decides anything by itself.
+
+### Two signals that were considered and are worse
+
+- **Load average — rejected, and this box proves why.** It is machine-wide. During
+  this investigation node 1 read `load average: 2.30` while `llama-server` was
+  completely idle, because other agents were running a pytest suite, a `pip
+  install` and a 65 GB model download. `CPUUsageNSec` is scoped to the unit's own
+  cgroup and was `0` throughout. **A coordinator is never a quiet machine.**
+- **Journal-line advance — rejected.** `llama-server` logs per *request*, not per
+  ubatch. Across the 97 s prefill step above, its only journal output was the line
+  the watchdog's own probe provoked. Journal advance would largely have measured
+  the watchdog.
+
+### Verification actually run (not a test count)
+
+- **Healthy idle server:** silent no-op, exit 0, no state file, `ActiveEnterTimestamp`
+  unchanged.
+- **Four concurrent real completions, ~2000-word prompts, `max_tokens: 1024`, eight
+  60 s ticks:** six probes returned `HTTP 000` — *the old script would have restarted
+  at tick 2* — and every one was classified `BUSY, not wedged` at 399–400% of one
+  core. `ActiveEnterTimestamp` never moved.
+- **Simulated wedge (`SIGSTOP`):** `connect=0.000157s` but `starttransfer=0.000000s,
+  code=000` — **the kernel completes the TCP handshake from the listen backlog while
+  the process is frozen**, reproducing F36's "accepting TCP, answering nothing"
+  exactly. CPU delta `0ms/20010ms (0%)`. The script held at `streak=0s/300s`,
+  `65s/300s`, `131s/300s` without acting. `SIGCONT` → `/health` 200 in 1.5 ms, and
+  the next tick logged `answered /health (HTTP 200) -- clearing fault streak`.
+- **Restart path, `WATCHDOG_GRACE=60`:** `SUSPECT` at tick 1, `RESTARTING ... WEDGED:
+  71s of unbroken silence` at tick 2, `systemctl rc=0`, new MainPID, `/health` 200
+  within 15 s, `n_ctx_slot=8192` intact.
+
+**Where SIGSTOP differs from F36, honestly:** freezing the process stops the HTTP
+accept threads too, so `/props` also times out and the script takes the "whole
+process unresponsive" branch. F36's real wedge had the HTTP layer alive with the
+task queue dead — the other branch. Both branches feed the same streak and the same
+decision, so the difference is only in the logged evidence string, but the
+"HTTP-alive, queue-dead" branch has **not** been exercised against a real wedge.
+
+### Cost of being wrong, in both directions
+
+- **A false restart** now requires **300 s of unbroken evidence that the unit's own
+  cgroup consumed no CPU while answering nothing on two independent endpoints.** No
+  amount of load produces that.
+- **A genuine wedge** is now caught in **300–380 s** (five to six ticks), against
+  the old design's ~2 minutes. That is slower, and it is the right trade: the job
+  is already lost when the server wedges, and `worker.py`'s `DEFAULT_TIMEOUT_S =
+  3600` means nothing else is waiting on the watchdog.
+- **One case is knowingly weaker.** With `--rpc` backends the coordinator
+  legitimately sits idle on a socket while a remote shard computes, so local CPU is
+  *not* proof of life. The script detects `--rpc` in the unit's cmdline and raises
+  the grace to 900 s. **That number is a safety margin, not a measurement** — it has
+  not been tested against a wedge in a sharded topology.
+
+### Making the failure legible
+
+Today nothing tells an operator that a job died *because the watchdog fired*; the
+job just says `RemoteDisconnected`. The script now (a) logs the restart with the
+evidence inline and the explicit sentence **"ANY IN-FLIGHT JOB ON PORT 8080 DIED AT
+THIS TIMESTAMP"**, and (b) appends a machine-readable line to
+`/var/lib/llama-watchdog/restarts.jsonl`:
+
+```json
+{"ts":"2026-08-18T06:55:48+10:00","epoch":1787000148,"unit":"llama-server@8080",
+ "port":"8080","action":"restart","reason":"wedged","streak_s":71,"grace_s":60,
+ "cpu_delta_ms":0,"window_ms":20013,"cpu_pct_of_core":0,"health":"000",
+ "props":"000","probe_timeout_s":20,"server_active_since":"Mon 2026-08-17 23:43:57 AEST"}
+```
+
+That file is the correlation key: a job that failed with `RemoteDisconnected` within
+seconds of an `epoch` in this file was killed by the watchdog, not by the model.
+
+### What this generalises to for the skill
+
+**A liveness probe that shares the resource it is probing cannot distinguish
+saturation from failure.** `/health` looked like the obvious out-of-band check and
+was in fact the single most in-band thing available — it rides the same queue as the
+work. Under load it reports *dead*; the recovery action for *dead* is a restart; and
+the restart destroys the work that caused the load. **The check does not merely fail
+to detect the fault, it manufactures one, and it does so preferentially against the
+longest-running jobs — which on this cluster are the only jobs that matter.**
+
+The rule for the skill, in three parts:
+
+1. **Read the health endpoint's implementation before trusting it.** In llama.cpp
+   and ik_llama.cpp, `/health`, `/slots` and `/metrics` all post to
+   `queue_tasks`. Any monitoring built on them inherits the queue's latency.
+2. **A liveness signal must be observable when the service is fully saturated.**
+   Process CPU time, cgroup accounting, `/proc`, file mtimes — things the kernel
+   maintains whether or not the application can answer. Prefer per-unit accounting
+   over machine-wide load: a coordinator runs other work.
+3. **Recovery must be gated on positive evidence of death, not on absence of
+   evidence of life** — because the recovery action is destructive and the absence
+   of evidence is exactly what a busy server produces.
+
+**This is the second time this project has been bitten by a health check failing for
+reasons unrelated to what it was testing.** F31: `bench/two-node-smoke.sh` reported
+`FAIL: no usable response` on a fully working two-node cluster, because it read
+`choices[0].message.content` from a reasoning model that had spent its budget in
+`reasoning_content` (F21). There the false negative would have sent a team
+cherry-picking an upstream patch for bug #26500, which they did not have. **Here the
+false positive did not mislead anyone — it deleted eleven minutes of work.** F31's
+generalisation was "a gate must report *which* thing failed"; F39 extends it: **a
+gate that can also *act* must first prove it is not the load itself it is
+detecting.**
+
+**And a note on the watchdog's own footprint.** `n_threads_http=7` on this server.
+Every timed-out `/health` probe leaves one of those seven worker threads blocked in
+`queue_results.recv()` until the queue drains — the monitor can exhaust the pool it
+is monitoring. This is why the rewritten probe timeout is *short* (20 s) rather than
+long: there is no benefit to waiting, because the CPU signal has already answered
+the question.
