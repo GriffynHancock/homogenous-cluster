@@ -612,6 +612,56 @@ gate fails.
 
 ---
 
+## F20. The plan's job-claim logic races and runs jobs twice
+
+**CONFIRMED by reproduction.** The plan's `claim_next_pending` (Task 10, Step 4)
+is a `SELECT` followed by an `UPDATE` inside a `with conn:` block. Python's
+sqlite3 driver opens a **deferred** transaction there, so the write lock is not
+taken until the `UPDATE` — leaving a window in which two workers read the same
+pending row and both claim it.
+
+Reproduced with 8 threads draining a 20-job queue, three consecutive runs:
+
+```
+claims: 26  unique: 20   DOUBLE-CLAIMED
+claims: 24  unique: 20   DOUBLE-CLAIMED
+claims: 23  unique: 20   DOUBLE-CLAIMED
+```
+
+**It fails every time, not occasionally.** On a queue whose jobs are
+multi-hour document summarisations, running one twice is an expensive way to
+discover a race — and it would present as "the cluster is mysteriously slow"
+rather than as a bug.
+
+The plan's own test suite passes against this implementation, because every
+test in it is single-threaded.
+
+**Fixed** by taking the write lock up front:
+
+```python
+conn.execute("BEGIN IMMEDIATE")
+row = conn.execute("SELECT ... WHERE status='pending' ... LIMIT 1").fetchone()
+conn.execute("UPDATE jobs SET status='running' ... WHERE id=?", ...)
+conn.execute("COMMIT")
+```
+
+with `isolation_level=None` so the explicit `BEGIN IMMEDIATE` is honoured rather
+than overridden by the driver's own transaction handling. Added
+`test_claim_is_atomic_under_concurrency` to `tests/test_db.py`, which fails
+against the original and passes against the fix.
+
+**Two related hardenings added at the same time:**
+
+- **`requeue_running()`** — returns stranded `running` jobs to `pending` at
+  worker startup. Jobs here take hours, so an OOM kill or power cut mid-job is
+  routine, and the plan had no recovery path: a job stuck in `running` with no
+  process behind it is invisible work that never finishes and never errors.
+- **WAL journal mode + `busy_timeout`** — so the web process can read job status
+  while the worker holds a write transaction. Without it the status page blocks
+  behind the queue, which on a multi-hour job means the UI appears hung.
+
+---
+
 ## F9. Operational notes for the bring-up scripts
 
 **CONFIRMED by direct observation on node 1.**
