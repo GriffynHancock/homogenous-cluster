@@ -202,3 +202,19 @@ same sequence in front of a non-technical user during setup and several fail sil
    conventions in `CLAUDE.md`.
 3. **Scripts must be re-runnable and must verify their own effect** — the discipline
    `setup.sh` already follows, and the reason the five N=2 bugs (F30) were survivable.
+
+**Status, 2026-08-18: requirement 2 is done.** `PreToolUse` hooks are implemented in
+`.claude/settings.json` + `.claude/hooks/cluster-guard.py`, both now tracked (the
+`.gitignore` rule was narrowed from `.claude/` to `.claude/*` plus negations, so the
+guard travels with the repo). `git add -A`, `git commit -a`, `pkill -f` and inline
+Python that does not compile are blocked outright; cluster service control, `git push`,
+mutating SQL against the live job store, writes to `/opt/models`, and git operations in
+the live checkout are gated to the operator. **Tested in both directions** — 105 harness
+cases plus an end-to-end run under `--dangerously-skip-permissions` — and swept against
+1071 lines of this repo's own scripts for false positives. Requirements 1 and 3 are
+unchanged and still stand.
+
+**Read `docs/AGENT-HARDENING.md`** for the rule-by-rule evidence, what is deliberately
+*not* hooked, and — most important for the Skill — **what a hook fundamentally cannot
+catch.** The off-by-one SQL predicate is genuinely uncatchable by any command pattern;
+it needs a row-count-asserting helper script that does not exist yet.
