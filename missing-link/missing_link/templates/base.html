@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Missing Link{% endblock %}</title>
+<style>
+  :root { --fg:#1a1a1a; --bg:#fbfbf9; --mut:#6b6b6b; --line:#e0ded8; --accent:#3b5f4a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e6e1; --bg:#16181a; --mut:#9a9a94; --line:#2c2f33; --accent:#7fb195; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:2rem 1rem; background:var(--bg); color:var(--fg);
+         font:16px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif; }
+  .wrap { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size:1.4rem; margin:0 0 .2rem; letter-spacing:-.01em; }
+  .sub { color:var(--mut); font-size:.85rem; margin-bottom:2rem; }
+  a { color:var(--accent); }
+  table { width:100%; border-collapse:collapse; font-size:.9rem; }
+  th,td { text-align:left; padding:.5rem .6rem; border-bottom:1px solid var(--line); }
+  th { font-weight:600; color:var(--mut); font-size:.75rem; text-transform:uppercase;
+       letter-spacing:.04em; }
+  .tbl-wrap { overflow-x:auto; }
+  form { border:1px solid var(--line); border-radius:8px; padding:1.1rem; margin-bottom:2rem; }
+  label { display:block; font-size:.8rem; color:var(--mut); margin:.6rem 0 .25rem; }
+  textarea,select,input[type=file] { width:100%; padding:.5rem; font:inherit;
+       background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; }
+  textarea { min-height:8rem; font-family:ui-monospace,monospace; font-size:.85rem; }
+  button { margin-top:.9rem; padding:.5rem 1.1rem; font:inherit; cursor:pointer;
+           background:var(--accent); color:var(--bg); border:0; border-radius:6px; }
+  code,pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  pre { white-space:pre-wrap; background:color-mix(in srgb,var(--fg) 5%,transparent);
+        padding:1rem; border-radius:8px; overflow-x:auto; font-size:.85rem; }
+  .badge { font-size:.7rem; padding:.15rem .45rem; border-radius:4px; border:1px solid var(--line); }
+  .pending{color:var(--mut)} .running{color:#b8860b} .done{color:var(--accent)} .failed{color:#c0392b}
+</style></head><body><div class="wrap">
+<h1><a href="/" style="text-decoration:none;color:inherit">Missing Link</a></h1>
+<p class="sub">{% block sub %}Submit work. Collect it later.{% endblock %}</p>
+{% block body %}{% endblock %}
+</div></body></html>

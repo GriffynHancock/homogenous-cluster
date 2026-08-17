@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block body %}
+<form method="post" action="/jobs" enctype="multipart/form-data">
+  <label for="kind">Task</label>
+  <select name="kind" id="kind">
+    {% for k in kinds %}<option value="{{ k }}">{{ k }}</option>{% endfor %}
+  </select>
+  <label for="upload">Document file</label>
+  <input type="file" name="upload" id="upload">
+  <label for="document">…or paste text</label>
+  <textarea name="document" id="document" placeholder="Paste the document here."></textarea>
+  <button type="submit">Queue it</button>
+</form>
+
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Job</th><th>Task</th><th>Status</th><th>Chunks</th>
+             <th>Time</th><th>Submitted</th></tr></thead>
+  <tbody>
+  {% for j in jobs %}
+    <tr>
+      <td><a href="/jobs/{{ j.id }}"><code>{{ j.id }}</code></a></td>
+      <td>{{ j.kind }}</td>
+      <td><span class="badge {{ j.status }}">{{ j.status }}</span></td>
+      <td>{{ j.chunks if j.chunks is not none else "—" }}</td>
+      <td>{{ "%.0fs"|format(j.total_s) if j.total_s else "—" }}</td>
+      <td>{{ j.created_at[:19].replace("T"," ") }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" style="color:var(--mut)">No jobs yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

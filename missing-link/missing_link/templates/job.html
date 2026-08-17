@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Job {{ job.id }}{% endblock %}
+{% block sub %}Job <code>{{ job.id }}</code> — {{ job.kind }}
+  <span class="badge {{ job.status }}">{{ job.status }}</span>{% endblock %}
+{% block body %}
+{% if job.status in ("pending","running") %}
+  <!-- Jobs run for hours; a manual refresh is the wrong interaction. -->
+  <meta http-equiv="refresh" content="15">
+  <p style="color:var(--mut)">This page refreshes every 15 seconds. Nothing is
+  waiting on you — close it and come back.</p>
+{% endif %}
+
+<div class="tbl-wrap"><table>
+  <tr><th>Submitted</th><td>{{ job.created_at[:19].replace("T"," ") }}</td></tr>
+  {% if job.started_at %}<tr><th>Started</th><td>{{ job.started_at[:19].replace("T"," ") }}</td></tr>{% endif %}
+  {% if job.finished_at %}<tr><th>Finished</th><td>{{ job.finished_at[:19].replace("T"," ") }}</td></tr>{% endif %}
+  {% if job.chunks %}<tr><th>Chunks</th><td>{{ job.chunks }}</td></tr>{% endif %}
+  {% if job.total_s %}<tr><th>Wall clock</th><td>{{ "%.1f s"|format(job.total_s) }}</td></tr>{% endif %}
+</table></div>
+
+{% if job.status == "failed" %}
+  <h3>Error</h3><pre>{{ job.error }}</pre>
+{% elif job.status == "done" %}
+  <h3>Result <a href="/jobs/{{ job.id }}/result" style="font-size:.8rem">(plain text)</a></h3>
+  <pre>{{ job.result }}</pre>
+{% endif %}
+
+<h3>Source document</h3>
+<pre>{{ job.document[:4000] }}{% if job.document|length > 4000 %}
+
+… truncated for display ({{ job.document|length }} characters total){% endif %}</pre>
+{% endblock %}
