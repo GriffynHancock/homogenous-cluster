@@ -186,8 +186,13 @@ argument: run what no single machine could hold, at any speed.
 - [ ] Whether TTFT is bad enough to reconsider GPUs for prefill (threshold: 90 s
       at ~2000 tokens).
 - [ ] Exact Kimi K2 quant — pick the largest that keeps every node ≤75%.
-- [ ] Whether `ik_llama.cpp` beats mainline here. It *does* support `rpc-server`
-      (confirmed). Evidence split; A/B it only after the cluster works.
+- [x] **ANSWERED: yes for our workload.** ik_llama.cpp 8337e4cd vs mainline
+      b10369, same model and flags: **prefill +52%** (16.08 -> 24.49 t/s),
+      **generation -14%** (6.04 -> 5.17). Since prefill is 79% of document
+      wall-clock, that is **~22% faster end-to-end** (78.8 -> 61.6 min on a
+      50K-token document). Output verified coherent. This explains the "split
+      evidence": generation benchmarks say no, prefill benchmarks say yes, and
+      our workload is prefill-dominated. See F27.
 
 **Verify empirically (cheap, no source found):**
 

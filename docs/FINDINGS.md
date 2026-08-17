@@ -978,6 +978,65 @@ speed.
 
 ---
 
+## F27. ik_llama.cpp is 52% faster at prefill and 14% slower at generation — net +22% for document work
+
+**CONFIRMED by measurement**, same model file, same flags, same machine. This
+settles the last open software question in `STATUS.md` and it is the only
+remaining lever that delivered.
+
+`llama-bench -m gpt-oss-120b-F16.gguf -t 4 -p 512,2048 -n 128 -r 2`
+
+| Metric | mainline b10369 | **ik_llama.cpp 8337e4cd** | Delta |
+|---|---:|---:|---:|
+| pp512 | 16.57 | **25.24** | **+52%** |
+| pp2048 | 16.08 | **24.49** | **+52%** |
+| tg128 | **6.04** | 5.17 | **−14%** |
+
+**Output verified coherent** — a hospital/data-sovereignty prompt produced
+accurate, on-topic prose citing HIPAA, availability and existing IT investment.
+A faster fork that degraded output would be worthless; this one does not.
+
+### Why the trade lands in our favour
+
+The two effects pull in opposite directions, and **prefill is 79% of document
+wall-clock**, so the prefill win dominates:
+
+| Build | Prefill | Generation | **Total (50K-token doc, 14 chunks)** |
+|---|---:|---:|---:|
+| mainline | 59.4 min | 19.3 min | **78.8 min** |
+| **ik_llama** | **39.0 min** | 22.6 min | **61.6 min** |
+
+**~22% faster end-to-end.** Combined with replication across 7 nodes, that is
+**~8.8 minutes per document equivalent.**
+
+This also explains the "evidence split" the spec noted: people benchmarking
+**generation** find ik_llama slower and conclude it is not worth it; people
+benchmarking **prefill** find it much faster. Both are right. **Which one you
+care about depends entirely on your workload**, and for long-document
+summarisation it is unambiguously prefill.
+
+### Adoption caveats
+
+- **It is a fork of an older llama.cpp base.** Its CLI differs — `-no-cnv` does
+  not exist, for one — so any script must be adapted, not just re-pointed.
+- **Do not mix builds across the fleet.** The RPC protocol will not match
+  mainline. All-ik or all-mainline.
+- **This concern largely evaporates under the replicated topology**
+  (`DESIGN-NOTES.md` C), where nodes are independent and no RPC handshake
+  happens at all — another argument for replication-first.
+- It reports the model as `gpt-oss ?B` rather than `120B`, i.e. it does not
+  fully parse this architecture's metadata. Output is correct regardless, but
+  **re-verify coherence per model** before adopting it for a new one.
+
+### Recommendation
+
+**Adopt ik_llama.cpp for the document-summarisation workload**, keeping mainline
+built alongside for comparison and for anything RPC-sharded. The two prefixes
+(`/opt/llama.cpp`, `/opt/ik_llama.cpp`) coexist cleanly, so this costs nothing
+to keep reversible.
+
+---
+
 ## F9. Operational notes for the bring-up scripts
 
 **CONFIRMED by direct observation on node 1.**
