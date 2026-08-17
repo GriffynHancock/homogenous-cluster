@@ -466,10 +466,17 @@ def count_chunks(document):
     return len(chunk_document(document))
 
 
-def run_one(db_path, base_url, client=None):
+def run_one(db_path, base_url, client=None, on_claim=None):
     """Process one job. Returns True if a job was handled, False if idle.
 
-    RESUMABILITY (Part 1). Previously, save_chunk_summaries was called exactly
+    `on_claim`, if given, is called with the claimed job dict right after the
+    atomic claim succeeds. Optional and additive -- existing callers are
+    unaffected. It exists for job-level fan-out (see app.py's per-endpoint
+    worker loop): the loop needs to know which job a given endpoint is
+    currently working on for the status page, and this is cheaper and safer
+    than a second query racing against the worker that already holds the row.
+
+    RESUMABILITY. Previously, save_chunk_summaries was called exactly
     once, after summarise_traced returned -- i.e. after the WHOLE document
     (every map chunk, plus reduce) had finished. A job killed mid-document
     (OOM, power cut, an operator stop) lost every completed chunk summary with
@@ -485,6 +492,8 @@ def run_one(db_path, base_url, client=None):
     job = db.claim_next_pending(db_path)
     if job is None:
         return False
+    if on_claim is not None:
+        on_claim(job)
 
     if client is None:
         client = LlamaClient(base_url)
@@ -779,7 +788,6 @@ def summarise_traced(kind, document, client,
         more before the reduce step. If it returns True, raises JobCancelled
         immediately rather than starting that call -- see JobCancelled for
         exactly how far this goes.
->>>>>>> worktree-agent-a2c3ef4fcf6c9806f
     """
     chunks = chunk_spans(document)
     if not chunks:

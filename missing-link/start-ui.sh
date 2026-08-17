@@ -13,6 +13,11 @@ cd "$(dirname "$0")"
 LLAMA_URL="${1:-http://127.0.0.1:8080}"
 PORT="${2:-8000}"
 DB="${MISSING_LINK_DB:-/opt/missing-link/jobs.sqlite}"
+# Fan out across R endpoints (job-level, see docs/DESIGN-NOTES.md section G):
+# set LLAMA_URLS in the environment as a comma-separated list, e.g. from
+# provisioning/nodes.env's INFERENCE_ENDPOINTS. Left unset, app.py falls back
+# to the single LLAMA_URL above -- one worker, one server, exactly as before.
+LLAMA_URLS="${LLAMA_URLS:-}"
 
 mkdir -p "$(dirname "$DB")" 2>/dev/null || sudo mkdir -p "$(dirname "$DB")"
 [ -w "$(dirname "$DB")" ] || sudo chown "$(id -un)" "$(dirname "$DB")"
@@ -23,11 +28,15 @@ pkill -f "uvicor[n] missing_link.app" 2>/dev/null
 sleep 1
 
 echo "=== starting Missing Link UI ==="
-echo "  backend : $LLAMA_URL"
+if [ -n "$LLAMA_URLS" ]; then
+  echo "  backends: $LLAMA_URLS"
+else
+  echo "  backend : $LLAMA_URL"
+fi
 echo "  db      : $DB"
 echo "  port    : $PORT"
 
-MISSING_LINK_DB="$DB" LLAMA_URL="$LLAMA_URL" \
+MISSING_LINK_DB="$DB" LLAMA_URL="$LLAMA_URL" LLAMA_URLS="$LLAMA_URLS" \
   nohup .venv/bin/python -m uvicorn missing_link.app:app \
     --host 0.0.0.0 --port "$PORT" > /tmp/missing-link.log 2>&1 &
 

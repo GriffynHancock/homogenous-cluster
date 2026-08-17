@@ -232,9 +232,15 @@ def requeue_running(path):
     stuck in 'running' with no process behind it is invisible work that never
     completes and never reports an error.
 
-    Safe only because the runner is deliberately single-worker (see the plan).
-    If Missing Link ever grows concurrent workers, this must key off a heartbeat
-    or a worker id rather than blanket-requeueing everything.
+    Missing Link now runs one concurrent worker per inference endpoint
+    (job-level fan-out), but that does NOT make this unsafe: it is called
+    exactly ONCE per process, at startup, BEFORE any worker task is created
+    (see app.py's lifespan). So every 'running' row it finds was left behind by
+    a PREVIOUS process, never by a sibling worker in this one. If that ordering
+    ever changes -- e.g. this gets called per-worker, or after the worker tasks
+    already exist -- this must key off a heartbeat or a worker id rather than
+    blanket-requeueing everything, or a live worker's in-progress job would be
+    yanked back to 'pending' and claimed a second time.
     """
     conn = _connect(path)
     try:
