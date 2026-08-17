@@ -826,3 +826,74 @@ A real completion, verbatim, from the run:
 
 On-topic, accurate, and coherent — so the throughput above was not bought by
 degrading output, per the standing rule in `CLAUDE.md`.
+
+---
+
+## ik_llama.cpp vs mainline through `llama-server` — the RELIABILITY A/B, and why F27's numbers do not transfer
+
+**Node 2 (10.10.0.39), 2026-08-18, 07:30–08:00.** Same machine, same model file
+(`gpt-oss-120b-F16.gguf`), same flags (`-t 4 -c 32768 --parallel 4 --host 0.0.0.0
+--port 8080 --no-warmup --jinja`), same `/v1/chat/completions` client, and — the
+point of the exercise — **the same prompts in the same order**, taken from the real
+document in job `06af2911d7fc` chunked at `chunk_tokens=1024`. `max_tokens=64` so
+the comparison is prefill-dominated and cheap to repeat.
+
+**This measurement exists because F27's does not describe the deployment.** F27 used
+`llama-bench`, which issues one sequence. The server runs four slots. See F40.
+
+### The headline is not a speed number, it is a survival number
+
+| Request | prompt tokens | ik_llama.cpp `8337e4cd` | mainline `b10369` |
+|---|---:|---|---|
+| 1 | 1339 | ok | ok |
+| 2 | 1410 | ok | ok |
+| 3 | 1126 | ok | ok |
+| 4 | 1060 | ok | ok |
+| **5** | 995 | **FATAL — `iqk_flash_attn.cpp:347`, server wedged** | **ok** |
+
+Reproduced on ik **twice from a clean restart**, both times on request 5, both times
+on the slot-0 wrap-around. Mainline logged `kv_unified = 'false'` at startup — each
+slot owns its own KV cache — and **completed all 9 requests of the run, two full
+slot cycles**, ending `ALL REQUESTS SURVIVED`.
+
+### Speed, on the requests both engines completed
+
+Read from the servers' own `slot print_timing` lines, never from client-side
+timing (F17).
+
+| prompt tokens | ik prefill (tok/s) | mainline prefill (tok/s) | ik advantage | ik gen (tok/s) | mainline gen (tok/s) |
+|---:|---:|---:|---:|---:|---:|
+| 1339 | 23.25 | 16.29 | **+42.7%** | 5.21 | 5.26 |
+| 1410 | 21.46 | 16.26 | **+32.0%** | 5.22 | 5.26 |
+| 1126 | 19.64 | 16.27 | **+20.7%** | 5.24 | 5.34 |
+| 1060 | 18.76 | 16.36 | **+14.7%** | 5.24 | 5.34 |
+
+End-to-end wall clock for the same four requests: ik **69.9 / 78.0 / 69.5 / 68.7 s**
+against mainline **94.4 / 98.9 / 81.2 / 76.8 s** — ik ahead by 26% / 21% / 14% / 11%.
+
+**Three corrections to what F27 led this project to expect:**
+
+1. **The prefill advantage is not a flat +52%, and it decays.** Through the server on
+   real harmony-templated requests it ran **+43% down to +15%**, because ik's own
+   prefill rate falls monotonically as the KV cache fills (23.25 → 21.46 → 19.64 →
+   18.76 tok/s) while **mainline's does not move** (16.29, 16.26, 16.27, 16.36 —
+   a spread of 0.6%, and if anything trending up). F27's `pp512`/`pp2048` pair could
+   not show this: it measures a cold cache twice.
+2. **The −14% generation penalty did not appear.** Both engines generated at
+   **~5.2–5.3 tok/s**, indistinguishable. F27's mainline figure of 6.04 tok/s came
+   from `llama-bench`; through `llama-server` with `--jinja` and four slots, mainline
+   generates at 5.26. The trade F27 described — buy prefill, pay generation — is not
+   the trade actually on offer.
+3. **So the honest end-to-end figure for adopting ik is ~+11% to +26% on short
+   requests, not +22% guaranteed** — and it is only collectable for four requests.
+
+### What this costs, and what it buys
+
+Moving node 2 to mainline costs roughly **20% of prefill throughput** on
+document work. It buys a server that finishes the document. Given that prefill is
+79% of wall clock, ~20% of prefill is ~16% of end-to-end — **the price of the
+mitigation is about one sixth of the time, against a current failure rate of 100%
+of jobs longer than four chunks.**
+
+Untested, and both must be measured before either is adopted (F40): ik at
+`--parallel 1`, and ik with flash attention explicitly off.

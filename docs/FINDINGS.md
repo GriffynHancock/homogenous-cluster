@@ -1891,3 +1891,227 @@ Every timed-out `/health` probe leaves one of those seven worker threads blocked
 is monitoring. This is why the rewritten probe timeout is *short* (20 s) rather than
 long: there is no benefit to waiting, because the CPU signal has already answered
 the question.
+
+---
+
+## F40. ik_llama.cpp fatal-errors on the 5th request of any multi-slot job, and takes the whole server down into a hang that `Restart=always` cannot see. This is F36's real cause, and it unsettles F27.
+
+**CONFIRMED by reproduction on node 2, twice, deterministically; by the source at
+`iqk_flash_attn.cpp:317-350`; by process forensics (`/proc/<pid>/syscall`); and by
+node 1's own journal**, which shows the same fatal error at 22:01:53 on 2026-08-17
+— **ten minutes before the log line F36 blamed for the same hang.** It was noticed
+then; it was diagnosed wrongly.
+
+```
+iqk_flash_attn_noalibi: found empty attention mask: nek1 = 512, first_k = 512
+/opt/ik_llama.cpp/src/ggml/src/iqk/iqk_flash_attn.cpp:347: Fatal error
+```
+
+### It is not rare, not chunk-size dependent, and not something the benchmark did
+
+`-fa` was **never passed**. Node 2's command line was byte-identical to node 1's —
+`-t 4 -c 32768 --parallel 4 --host 0.0.0.0 --port 8080 --no-warmup --jinja` — and
+the server logged `llama_init_from_model: flash_attn = 1` anyway. **ik_llama.cpp
+turns flash attention on by default for this model**, so this is the default path,
+not an opt-in one.
+
+Reproduced twice, from a clean `systemctl restart`, with nothing but sequential
+`/v1/chat/completions` calls:
+
+| | request 1 | 2 | 3 | 4 | **5** |
+|---|---|---|---|---|---|
+| original run (06:27–06:37) | slot 0, `p0=0` | slot 1, `p0=0` | slot 2, `p0=0` | slot 3, `p0=0` | **slot 0, `p0=67` → FATAL** |
+| deliberate repro (07:33–07:38) | slot 0, `p0=0` | slot 1, `p0=0` | slot 2, `p0=0` | slot 3, `p0=0` | **slot 0, `p0=103` → FATAL** |
+
+Slot assignment read from `launch_slot_with_task` in the server's own journal, not
+inferred. In the original run request 1 was an unrelated smoke prompt, so the
+benchmark's own **chunk 4** was request 5 — which is why the sweep log stops after
+three chunks.
+
+**The trigger is the first request that reuses a slot after the other slots have
+written KV cells** — i.e. request `--parallel + 1`, which for the standard
+configuration is **request 5**. Prompt lengths were 1060–1410 tokens throughout and
+the four survivors were indistinguishable from the killer. It would have died at
+**every** chunk size in the sweep, and **any Missing Link job longer than four
+chunks kills the server it is running on.**
+
+### The mechanism, from the source on disk
+
+`ggml/src/iqk/iqk_flash_attn.cpp`, guarded by `if (n_swa > 0 && mask)`:
+
+```cpp
+constexpr int kMinBatch = 256;
+int ntokens = std::max(kMinBatch, neq1);
+int nblock  = (ntokens + n_swa + kMinBatch - 1)/kMinBatch;
+int first   = nek1 - nblock*kMinBatch;      // keep only the LAST nblock*256 cells
+```
+
+gpt-oss-120b sets `n_swa = 128` (`gpt-oss.attention.sliding_window = 128` in the
+GGUF), so `nblock*kMinBatch` is **512** — exactly the `nek1 = 512` in the error. The
+optimisation keeps only the last 512 KV cells on the assumption that they are a
+superset of every query's sliding window. **That holds for one sequence, whose cells
+are appended in position order. It does not hold for four interleaved slots**, where
+the last 512 cells can belong entirely to *other* sequences. The mask for the
+current sequence is then wholly masked, `first_k` runs to `last_k`, and the guard
+added by upstream PR #1923 aborts.
+
+The abort fires only during **decode** (`neq1 == 1`), which is why every crash
+landed 50–85 s into a request — right after prefill finished.
+
+### Upstream status: the CPU twin of an OPEN, unfixed bug
+
+- **CONFIRMED.** The abort itself was *added deliberately* by
+  [PR #1923, "CPU FA: Check for empty attention mask"](https://github.com/ikawrakow/ik_llama.cpp/pull/1923)
+  (merged `b50b091`, 2026-06-08), to replace the confusing
+  `GGML_ASSERT(S > 0)` of
+  [issue #1910](https://github.com/ikawrakow/ik_llama.cpp/issues/1910). **It is a
+  diagnostic, not a fix.** Our tree is `8337e4cd` (2026-08-15), two months *after*
+  it — so we are not behind on this; there is nothing to pull.
+- **REPORTED, and it is the same defect.**
+  [Issue #2186](https://github.com/ikawrakow/ik_llama.cpp/issues/2186), *"CUDA
+  flash-attention SWA tail slice is unsound with `--parallel > 1` (silently drops
+  in-window cells)"*, filed 2026-07-25 and **still open**, describes the identical
+  reasoning error in the CUDA path: *"That is sound for ONE sequence: cells are
+  appended in position order… It is not sound for several sequences."* Its
+  suggested fix — only apply the slice when `n_seq_max == 1` — would fix ours too.
+- **INFERRED but well supported:** on CUDA this bug **silently corrupts output**
+  (2 of 4 slots produced different text, max logprob delta 7.11 vs a 0.31 noise
+  floor). On CPU, post-#1923, it **aborts loudly instead**. Given this project's
+  faithfulness requirement, the loud version is the better of the two — but see
+  below for what it does while aborting.
+- No issue reports the CPU path at `--parallel > 1`. **This is worth reporting
+  upstream**: it is a one-line reproduction against a stock `llama-server` on a
+  stock gpt-oss GGUF, and #2186 already contains the diagnosis.
+
+### Why the crash produced a HANG instead of a restart — the forked-abort deadlock
+
+This is the part that matters more than the crash, and it is now **mechanically
+established rather than hypothesised**.
+
+`ggml_abort` calls `ggml_print_backtrace`, which in `src/ggml/src/ggml.c:216-219`
+does:
+
+```c
+int pid = fork();
+if (pid == 0) { execlp("gdb", ...); execlp("lldb", ...); exit(EXIT_FAILURE); }
+else { waitpid(pid, &wstatus, 0); }
+```
+
+**`fork()` from a multithreaded process gives the child exactly one thread and every
+lock the other threads were holding.** The child then needs the allocator to reach
+`execlp` and deadlocks on an inherited mutex. Four compute threads hit the assert
+simultaneously, so there were four such children. Measured on node 2 while it was
+wedged:
+
+| | pid | `/proc/<pid>/syscall` | `wchan` | CPU over 5 s |
+|---|---|---|---|---|
+| `sh -c` wrapper (systemd's `MainPID`) | 16040 | — | `do_wait` | 0 |
+| **llama-server** | 16041 | **61 = `wait4`** | `do_wait` | **0 ticks** |
+| forked abort children ×4 | 16451–4 | **202 = `futex`** | `futex_wait_queue` | 0 |
+
+So the parent blocks in `wait4()` forever, never reaches `abort()`, and **never
+exits**. `systemctl show` reported `ActiveState=active`, `SubState=running`,
+**`NRestarts=0`** for 48 minutes. Two further consequences worth knowing:
+
+- **The listening socket survives.** `ss -ltnp` showed *all five* processes holding
+  `fd=3` on `:8080`, because the children inherited it. TCP connects therefore still
+  succeed and nothing answers — **a port-open check reports green through this.**
+- **`MainPID` is the `sh -c` wrapper, not the server.** Even a clean crash of the
+  server is one indirection away from systemd, though in this case it made no
+  difference: neither process exited.
+
+### This is F36, and F36's diagnosed cause was wrong
+
+F36 recorded a wedge on node 1 on 2026-08-17 and attributed it to *"a client
+disconnecting mid-generation"*, citing `srv stop: cancel task, id_task = 220`.
+Node 1's journal says otherwise:
+
+```
+21:58:40  srv stop: cancel task, id_task = 36        <- a REAL client disconnect
+21:58:40  launch_slot_with_task id_slot=0 id_task=215  <- server carries on fine
+22:00:35  kv cache rm [p0, end) id_slot=0 id_task=215 p0=2048
+22:01:53  iqk_flash_attn_noalibi: found empty attention mask   <- THE FATAL ERROR
+22:07:40  srv stop: cancel task, id_task = 215       <- client gives up on a corpse
+22:11:43  srv stop: cancel task, id_task = 220       <- the line F36 blamed
+22:21:47  systemd: Stopping llama-server@8080        <- the operator's restart
+```
+
+**A client disconnect happened at 21:58:40 and the server kept serving.** The fatal
+error came ten minutes before the line F36 identified as the cause, and everything
+after it was clients timing out. So:
+
+- **F36's symptom description is correct and its three fixes remain right.** The
+  wedge is real, `Restart=always` is blind to it, `_worker_loop` needed guarding.
+- **F36's *cause* is superseded.** It was not an ordinary operational action. It was
+  this bug. Correct `CLAUDE.md`'s "a client disconnecting mid-generation is enough"
+  when the plan is next folded back.
+- **Both known "up and lying" incidents on this cluster are now the same bug**, and
+  this is the first one with a definite cause — established by reproduction rather
+  than by correlation.
+
+### Blast radius: mainline is unaffected
+
+`kv_unified = 'false'` — mainline b10369 gives each slot its **own** KV cache, so
+the interleaving that breaks ik's tail slice cannot arise. Verified, not assumed:
+the identical reproducer against `/opt/llama.cpp/bin/llama-server` on the same node,
+same model file, same flags, **completed all nine requests — two full slot cycles,
+four past the point where ik dies twice out of twice.** Prefill and generation
+figures for both engines are in `docs/measurements.md`.
+
+Node 1 runs `LLAMA_BIN=/opt/ik_llama.cpp/bin` with `--parallel 4` and has the
+identical exposure; it has already hit this once (22:01:53, above).
+
+### What this does to F27 — stated plainly
+
+**F27's recommendation ("adopt ik_llama.cpp for the document-summarisation
+workload") does not survive this finding in its current form.**
+
+F27 measured `llama-bench`, which issues **one** sequence. It could not have seen
+this: the defect needs `--parallel > 1` and a slot reuse, and `llama-bench` does
+neither. The +52% prefill number is not wrong — it is measured on a configuration
+we cannot actually serve documents from.
+
+**A 22% speedup that aborts on the 5th request of every job is not a speedup, it is
+a 100% failure rate on real work.** Missing Link's map-reduce sends one request per
+chunk; the reference document is 26 chunks. Every job would kill its server, and —
+because of the forked-abort hang — kill it in the one way that neither
+`Restart=always` nor a port check nor `/health` can report.
+
+So, in order of confidence:
+
+1. **ik_llama.cpp at `--parallel 4` is NOT safe for unattended document work.** Not
+   "needs care" — it fails deterministically, on request 5, every time.
+2. **Mainline is the safe default until this is fixed**, and it costs what
+   `docs/measurements.md` records, not what F27 predicted from `llama-bench`.
+3. **Two ik configurations are worth measuring before abandoning it**, and neither
+   has been tested yet: `--parallel 1` (removes the interleaving that #2186
+   identifies, at the cost of F24's 1.79× batching gain), and flash attention
+   explicitly disabled (removes the tail-slice path entirely, at the cost of most of
+   ik's prefill advantage). **Neither may be adopted on reasoning alone** — the
+   whole point of this finding is that a plausible configuration was standardised
+   from a benchmark that could not exercise the failure.
+
+**The transferable lesson, and it is the same one as F34.** `llama-bench` is a
+single-sequence microbenchmark. Every number in F27 came from it, and the decision
+it drove was about a four-slot server under a map-reduce workload. **The benchmark
+did not resemble the deployment in the one dimension that mattered.** For the skill:
+an engine may not be adopted on synthetic-benchmark evidence alone — it must survive
+`--parallel` × (chunks per document) real requests through the real client first.
+
+### Node 2 has no watchdog, and the watchdog merged tonight would have caught this
+
+Confirmed: node 2 has **no** `llama-watchdog` unit, timer or script — only node 1
+does. Node 2 was therefore dead and silent for 48 minutes with nobody looking, and
+the blocked benchmark driver on node 1 waited on it the whole time.
+
+**F39's rewritten CPU-progress watchdog matches this failure exactly.** Its rule is
+*silent AND the unit's own CPU flat → restart after 300 s of unbroken evidence*, and
+this wedge is the purest possible instance: `/health` timed out, `CPUUsageNSec` was
+**bit-for-bit unchanged over a 5 s sample** (`utime` 211087 ticks, twice), and load
+average was 0.02. It would have restarted node 2 within ~5 minutes instead of 48,
+and — unlike the `/health`-only version F39 retired — it could not have been fooled
+into calling a busy server dead. **This is direct evidence for the fleet-wide
+watchdog rollout, not merely an argument for it.**
+
+It is also a reminder that the watchdog is a *mitigation*, not a fix: restarting
+into the same engine means the next job dies on its 5th chunk too.
