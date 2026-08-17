@@ -1,0 +1,280 @@
+{
+  "_about": [
+    "Negation / polarity battery for the faithfulness auditor.",
+    "",
+    "Ground truth is TRUE BY CONSTRUCTION, not by annotation: for every pair the",
+    "`supported` claim is entailed by `doc`, and the `negated` claim contradicts it.",
+    "A checker that works must score supported > 0.5 and negated < 0.5.",
+    "",
+    "This is a REGRESSION FIXTURE, not a throwaway. If either MiniCheck model is",
+    "ever changed, re-run `python -m missing_link.audit battery` and compare against",
+    "docs/audit-ledger.md before adopting the new model.",
+    "",
+    "Documents are deliberately SHORT (one to three sentences). That isolates the",
+    "polarity question: there is no redundant restatement elsewhere in the document",
+    "to rescue a checker that has misread the obligation. It is the hard case, and",
+    "the spike (docs/minicheck-spike.md section 5) explicitly could not tell whether",
+    "length and redundancy were what saved the one real-data row.",
+    "",
+    "Categories match the clause types this project's real material is made of:",
+    "retention, access_permission, statutory_duty, deadline, exemption,",
+    "conditional_obligation, quantifier.",
+    "",
+    "Pairs 1, 6, 7, 11 and 12 are the five from docs/minicheck-spike.md section 4,",
+    "kept verbatim so the spike's result stays reproducible inside the larger battery."
+  ],
+  "pairs": [
+    {
+      "id": "retention_seven_years",
+      "category": "retention",
+      "doc": "Clinical records must be retained for seven years from the date of last service, or until the client turns twenty-five, whichever is later.",
+      "supported": "Records must be kept for seven years from the last service.",
+      "negated": "Records must not be retained beyond seven years from the last service."
+    },
+    {
+      "id": "retention_minor_until_25",
+      "category": "retention",
+      "doc": "Records relating to a client who was a minor at the time of service must be retained until the client's twenty-fifth birthday.",
+      "supported": "Records for clients who were minors must be kept until they turn twenty-five.",
+      "negated": "Records for clients who were minors may be destroyed before they turn twenty-five."
+    },
+    {
+      "id": "retention_financial_five_years",
+      "category": "retention",
+      "doc": "Financial records supporting the annual acquittal must be retained for five years after the end of the funding period.",
+      "supported": "Financial acquittal records must be kept for five years after the funding period ends.",
+      "negated": "Financial acquittal records need not be kept once the funding period ends."
+    },
+    {
+      "id": "retention_cctv_thirty_days",
+      "category": "retention",
+      "doc": "CCTV footage from the reception area is retained for thirty days and is then automatically overwritten.",
+      "supported": "Reception CCTV footage is kept for thirty days before it is overwritten.",
+      "negated": "Reception CCTV footage is retained indefinitely and is never overwritten."
+    },
+    {
+      "id": "retention_departed_mailboxes",
+      "category": "retention",
+      "doc": "Corporate email is archived for seven years. The personal mailboxes of departed staff are deleted after ninety days.",
+      "supported": "The mailboxes of departed staff are deleted after ninety days.",
+      "negated": "The mailboxes of departed staff are archived for seven years alongside corporate email."
+    },
+    {
+      "id": "access_41_staff",
+      "category": "access_permission",
+      "doc": "Incident reports were stored on a shared drive with permissions inherited from a parent folder, granting read access to 41 staff who had no clinical role.",
+      "supported": "41 non-clinical staff had read access to the incident reports.",
+      "negated": "No non-clinical staff had read access to the incident reports."
+    },
+    {
+      "id": "archive_authorisation",
+      "category": "access_permission",
+      "doc": "Staff may access archived records only with written authorisation from the clinical director.",
+      "supported": "Access to archived records requires written authorisation from the clinical director.",
+      "negated": "Staff may access archived records without authorisation from the clinical director."
+    },
+    {
+      "id": "access_contractor_read_only",
+      "category": "access_permission",
+      "doc": "External contractors are granted read-only access to the case management system and cannot amend or delete records.",
+      "supported": "Contractors can read case records but cannot change them.",
+      "negated": "Contractors may amend and delete records in the case management system."
+    },
+    {
+      "id": "access_after_hours",
+      "category": "access_permission",
+      "doc": "Remote access to the clinical database is disabled between 10 pm and 6 am for all users other than the on-call clinician.",
+      "supported": "Between 10 pm and 6 am only the on-call clinician can reach the clinical database remotely.",
+      "negated": "All users keep remote access to the clinical database between 10 pm and 6 am."
+    },
+    {
+      "id": "access_shared_password",
+      "category": "access_permission",
+      "doc": "The reporting account password was shared among team members, contrary to policy, until it was rotated in April 2026.",
+      "supported": "A shared password was in use until April 2026.",
+      "negated": "The reporting account password was never shared between team members."
+    },
+    {
+      "id": "breach_notification_72h",
+      "category": "statutory_duty",
+      "doc": "The provider must notify the regulator within 72 hours of becoming aware of a data breach affecting client records.",
+      "supported": "The provider is required to notify the regulator within 72 hours of a breach.",
+      "negated": "The provider is not required to notify the regulator following a data breach."
+    },
+    {
+      "id": "litigation_hold_destruction",
+      "category": "statutory_duty",
+      "doc": "Records subject to a litigation hold must not be destroyed while the hold remains in effect.",
+      "supported": "Records under litigation hold may not be destroyed while the hold is in effect.",
+      "negated": "Records under litigation hold may be destroyed at any time, including during a hold."
+    },
+    {
+      "id": "duty_mandatory_report_same_day",
+      "category": "statutory_duty",
+      "doc": "A staff member who forms a reasonable belief that a child has suffered harm must report that belief to the department on the same day.",
+      "supported": "Staff must report a reasonable belief that a child has suffered harm to the department on the same day.",
+      "negated": "Staff are not obliged to report a reasonable belief that a child has suffered harm."
+    },
+    {
+      "id": "duty_declare_interest",
+      "category": "statutory_duty",
+      "doc": "Board members must declare any material personal interest before the matter is discussed.",
+      "supported": "A board member must declare a material personal interest before the matter is discussed.",
+      "negated": "Board members may take part in the discussion without declaring a material personal interest."
+    },
+    {
+      "id": "duty_annual_information_statement",
+      "category": "statutory_duty",
+      "doc": "The organisation is required to lodge an annual information statement with the regulator within six months of the end of its financial year.",
+      "supported": "An annual information statement must be lodged with the regulator within six months of the end of the financial year.",
+      "negated": "The organisation is exempt from lodging an annual information statement with the regulator."
+    },
+    {
+      "id": "deadline_complaint_28_days",
+      "category": "deadline",
+      "doc": "A complaint must be acknowledged in writing within three business days and resolved within twenty-eight days.",
+      "supported": "A complaint must be resolved within twenty-eight days.",
+      "negated": "There is no fixed time limit for resolving a complaint."
+    },
+    {
+      "id": "deadline_appeal_21_days",
+      "category": "deadline",
+      "doc": "An applicant may appeal a decision within twenty-one days of receiving the written reasons.",
+      "supported": "An appeal may be lodged within twenty-one days of receiving the written reasons.",
+      "negated": "An appeal may be lodged at any time, with no limit on how long after the written reasons are received."
+    },
+    {
+      "id": "deadline_invoice_thirty_days",
+      "category": "deadline",
+      "doc": "Invoices are payable thirty days from the date of issue, and interest accrues on any amount outstanding after that date.",
+      "supported": "Invoices must be paid within thirty days of the date of issue.",
+      "negated": "Invoices are not due until ninety days from the date of issue."
+    },
+    {
+      "id": "deadline_audit_response_14_days",
+      "category": "deadline",
+      "doc": "The service must respond to audit findings within fourteen days of receiving the draft report.",
+      "supported": "A response to the audit findings is due within fourteen days of receiving the draft report.",
+      "negated": "The service is not required to respond to the audit findings within any set period."
+    },
+    {
+      "id": "deadline_extension_granted",
+      "category": "deadline",
+      "doc": "The regulator granted an extension to 30 June 2026 for submission of the remediation plan.",
+      "supported": "The deadline for submitting the remediation plan was extended to 30 June 2026.",
+      "negated": "The regulator refused to extend the deadline for submitting the remediation plan."
+    },
+    {
+      "id": "exemption_deidentified_data",
+      "category": "exemption",
+      "doc": "The consent requirement does not apply to de-identified data used for internal service planning.",
+      "supported": "De-identified data used for internal service planning is exempt from the consent requirement.",
+      "negated": "Consent is required for de-identified data used for internal service planning."
+    },
+    {
+      "id": "exemption_small_provider_carve_out",
+      "category": "exemption",
+      "doc": "Organisations with an annual turnover of three million dollars or less are exempt from the reporting obligation, unless they provide a health service.",
+      "supported": "A small organisation that provides a health service is not exempt from the reporting obligation.",
+      "negated": "Every organisation with a turnover of three million dollars or less is exempt from the reporting obligation."
+    },
+    {
+      "id": "exemption_serious_threat_disclosure",
+      "category": "exemption",
+      "doc": "Disclosure without consent is permitted only where there is a serious and imminent threat to life or health.",
+      "supported": "Disclosure without consent is permitted where there is a serious and imminent threat to life or health.",
+      "negated": "Disclosure without consent is prohibited in all circumstances, including a serious and imminent threat to life."
+    },
+    {
+      "id": "exemption_legal_privilege",
+      "category": "exemption",
+      "doc": "Documents subject to legal professional privilege are excluded from the production order.",
+      "supported": "Privileged documents do not have to be produced under the order.",
+      "negated": "Documents subject to legal professional privilege must be produced under the order."
+    },
+    {
+      "id": "exemption_quality_assurance_ethics",
+      "category": "exemption",
+      "doc": "Research use of client records requires ethics committee approval. Quality assurance activities carried out within the service do not.",
+      "supported": "Quality assurance activities within the service do not need ethics committee approval.",
+      "negated": "Quality assurance activities within the service require ethics committee approval."
+    },
+    {
+      "id": "conditional_unless_written_consent",
+      "category": "conditional_obligation",
+      "doc": "Records must not be transferred to a third party unless the client has given written consent.",
+      "supported": "Transferring records to a third party requires the client's written consent.",
+      "negated": "Records may be transferred to a third party without the client's written consent."
+    },
+    {
+      "id": "conditional_except_police_investigation",
+      "category": "conditional_obligation",
+      "doc": "All incidents must be entered in the register within 24 hours, except where the incident is under police investigation, in which case entry is deferred until the investigation concludes.",
+      "supported": "Entry in the register is deferred while an incident is under police investigation.",
+      "negated": "An incident under police investigation must still be entered in the register within 24 hours."
+    },
+    {
+      "id": "conditional_only_if_competency",
+      "category": "conditional_obligation",
+      "doc": "Staff may administer medication only if they have completed the medication competency assessment in the last twelve months.",
+      "supported": "Only staff who completed the medication competency assessment in the last twelve months may administer medication.",
+      "negated": "Any staff member may administer medication regardless of the competency assessment."
+    },
+    {
+      "id": "conditional_where_client_under_sixteen",
+      "category": "conditional_obligation",
+      "doc": "Where the client is under sixteen, consent must be obtained from a parent or guardian in addition to the client.",
+      "supported": "For a client under sixteen, consent is needed from a parent or guardian as well as from the client.",
+      "negated": "For a client under sixteen, the client's own consent is sufficient."
+    },
+    {
+      "id": "conditional_subject_to_funding",
+      "category": "conditional_obligation",
+      "doc": "The additional outreach position will be created subject to continued funding beyond June 2027.",
+      "supported": "Creation of the outreach position depends on funding continuing beyond June 2027.",
+      "negated": "The outreach position will be created whether or not funding continues beyond June 2027."
+    },
+    {
+      "id": "quantifier_all_staff_trained",
+      "category": "quantifier",
+      "doc": "All staff, including volunteers and contractors, completed the annual privacy training in February 2026.",
+      "supported": "Volunteers and contractors completed the annual privacy training in February 2026.",
+      "negated": "No volunteers or contractors completed the annual privacy training."
+    },
+    {
+      "id": "quantifier_three_of_twelve_files",
+      "category": "quantifier",
+      "doc": "Three of the twelve sampled files contained a signed consent form.",
+      "supported": "Three sampled files contained a signed consent form.",
+      "negated": "All twelve sampled files contained a signed consent form."
+    },
+    {
+      "id": "quantifier_no_breaches_reported",
+      "category": "quantifier",
+      "doc": "No breaches were reported to the regulator during the 2025 financial year.",
+      "supported": "There were no breaches reported to the regulator in the 2025 financial year.",
+      "negated": "Several breaches were reported to the regulator during the 2025 financial year."
+    },
+    {
+      "id": "quantifier_two_of_seven_sites",
+      "category": "quantifier",
+      "doc": "Only two of the seven sites have implemented automated archival.",
+      "supported": "Automated archival is in place at two of the seven sites.",
+      "negated": "Automated archival has been implemented at all seven sites."
+    },
+    {
+      "id": "quantifier_access_reduced_to_six",
+      "category": "quantifier",
+      "doc": "Following remediation, access was reduced from 41 staff to 6 staff who hold a clinical role.",
+      "supported": "After remediation, six staff with a clinical role retained access.",
+      "negated": "After remediation, all 41 staff retained access."
+    },
+    {
+      "id": "quantifier_one_incident_open",
+      "category": "quantifier",
+      "doc": "Every incident recorded in 2025 was closed within the target timeframe, apart from one that remained open at year end.",
+      "supported": "One incident recorded in 2025 was still open at year end.",
+      "negated": "All incidents recorded in 2025 were closed within the target timeframe."
+    }
+  ]
+}
