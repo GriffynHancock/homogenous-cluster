@@ -151,6 +151,45 @@ different from the tensor-parallel all-reduce that got `distributed-llama`
 rejected in the spec — that moves full activations every layer; this moves one
 token's hidden state.
 
+#### CAVEAT ADDED 2026-08-17: that conclusion is GIGABIT-DEPENDENT, and this fleet is not on gigabit
+
+**The network was measured on 2026-08-17 and it is 100 Mb/s, not gigabit**
+(93.8 Mbit/s = 11.7 MB/s; see `docs/measurements.md`). Both NICs support
+1000baseT/Full, so the cap is the switch, but the analysis above assumed a link
+the cluster does not currently have. Re-running it on measured numbers:
+
+| Ceiling | On gigabit (assumed above) | **On the measured 100 Mb link** |
+|---|---:|---:|
+| Latency-bound (122 RT × RTT) | ~27 tok/s (RTT ~0.3 ms) | **~9.9 tok/s** (RTT **0.827 ms** measured, idle) |
+| Bandwidth-bound (122 × 14 KB = 1.71 MB/token) | ~68 tok/s | **~6.8 tok/s** |
+| **Binding comms ceiling** | **~27 tok/s** | **~6.8 tok/s** |
+| Bandwidth *target* to beat | 5–7 tok/s | 5–7 tok/s |
+
+**On gigabit the comms ceiling sits ~4–5× above the target, so it is ignorable.
+On this 100 Mb link it lands directly on top of it.** The headroom that made the
+"communication would not kill it" conclusion safe does not exist here.
+
+Two further reasons the 100 Mb figure above is optimistic, not pessimistic:
+
+1. **Fan-out is not counted.** "122 round-trips" counts one scatter and one
+   gather per layer, each carrying a single 14 KB hidden state. But with
+   `top_k = 8` spread across 7 nodes, a layer's scatter goes to *several* peers
+   and gathers *several* partials, so per-layer volume is a multiple of 14 KB.
+   The true byte count needs deriving properly before anyone relies on it.
+2. **Latency collapses under load.** RTT was measured twice: **0.827 ms on an
+   idle link, 9.544 ms while a single rsync saturated it** (min 6.78, max 11.89)
+   — an 11.5× degradation from ordinary bufferbloat. A latency-bound design is
+   exactly the design that cannot tolerate this, and a real cluster always has
+   concurrent traffic (job dispatch, model distribution, monitoring).
+
+**Consequence for the recommendation, and it is a cheap one:** a ~$20–30
+gigabit switch is a *precondition* for expert parallelism ever being viable on
+this fleet, and it also helps sharding today (measured: two-node sharded
+generation is −47% vs single-node, against the −5.2% localhost floor in F14).
+It does not change the verdict below — llama.cpp still has no expert
+parallelism — but it does mean **"comms is fine" must not be carried forward as
+a settled fact.** It is settled only for a network this cluster does not have.
+
 ### Why we are still not doing it
 
 **llama.cpp has no expert parallelism, and it is not a flag.** RPC is
@@ -236,3 +275,77 @@ model.** Qwen3-Next is the natural place to test the technique.
 **Verdict: cheap to test, worth testing on Qwen3-Next, but do
 `llama-batched-bench` first** — it is the gating measurement for both, and it
 runs single-node with no RPC involved.
+
+---
+
+## D. "Two pipelines": a speed-optimised one and a memory-optimised one
+
+**Raised 2026-08-17.** The proposal: run **two** distinct pipelines — a
+*speed-optimised* one (a smaller-but-still-large MoE, with active experts spread
+across the cluster) and a *memory-optimised* one (layer sharding, to fit a
+gigantic model however slowly) — framed as the classic time/space trade-off.
+
+**The framing is right, and it is already the S/R model in `CLAUDE.md` — but the
+axis is not preference, it is whether the model fits one node.** You do not
+choose between these two pipelines; the model's size chooses for you.
+
+| Regime | S | R | What wins | Does expert parallelism help? |
+|---|---:|---:|---|---|
+| Model fits one node | 1 | N | **Replication — linear N×** | **No. It would make things worse.** |
+| Model needs the whole fleet | N | 1 | Sharding, capacity only, 1/S utilisation | **Yes — this is the only place it pays (~4×)** |
+
+### The correction that matters: the "speed pipeline" describes two mutually exclusive things
+
+The proposal has a smaller MoE **loaded on each machine** *and* **active experts
+spread across the cluster**. Those cannot both hold. If every machine already
+has the whole model, there is nothing to distribute — that **is** replication.
+Expert parallelism only means anything when each node holds a *subset* of
+experts, i.e. when the model does **not** fit one node.
+
+And in the S = 1 regime, expert parallelism is not merely unnecessary, it is
+**strictly worse**:
+
+- Replication gives **R × single-node throughput**, linearly, with **zero
+  network on the hot path**.
+- Expert parallelism gives ~4× on **one request's latency** while adding **122
+  round-trips per token** — on a link measured at 100 Mb/s with 0.827 ms idle
+  RTT, degrading to 9.5 ms under load.
+- **This workload is asynchronous.** `CLAUDE.md`: *"submit overnight, read in the
+  morning"*, *"slow is fine; nobody is waiting at a prompt."* The metric is
+  documents per night — **throughput**, not per-request latency.
+
+**So expert parallelism optimises the one metric this project explicitly does not
+care about, at the cost of building a new inference engine, in the regime where a
+free linear win is already available.** That is the sharpest reason to leave it
+alone — sharper than the scope argument in A.
+
+### Where the trade-off is real
+
+It is a **threshold, not a smooth curve**. Crossing S = 1 → 2 costs a factor of
+N (you go from R = N to R = N/2 *and* pay RPC overhead). That is why `CLAUDE.md`
+calls the size at which S goes 1 → 2 the most consequential number in model
+selection, and why the correct move is **the largest model with S = 1**, not the
+largest model that fits at all.
+
+The genuinely interesting consequence: a *smaller* model that keeps S = 1 can
+beat a *larger* one at S = 2 on total useful work, even though the larger one is
+more capable per token. Faithfulness (F25) then decides between the S = 1
+candidates. This is the real "time vs space" decision in this project, and it is
+made at **model selection**, not at pipeline architecture.
+
+### What to do instead, in the S > 1 case
+
+Do not build an engine. Recover the idle nodes with what already exists:
+
+- **Batching** — measured **1.79× at batch 4** on sparse MoE. Under sharding the
+  nodes are idle 1−1/S of the time; concurrent requests partially refill them.
+  **Never batch 8** (worse than 1).
+- **Watch upstream** — async/pipelined RPC (#18626) would attack the same idle
+  time directly. Stalled 7+ months (F5), but it is the cheap version of this idea.
+- **Get gigabit** (~$20–30 switch). Precondition for expert parallelism ever
+  being viable here, and it helps sharding today.
+
+**Verdict: no separate pipelines. One decision rule — pick the largest model with
+S = 1 and replicate it — with sharding reserved for the single frontier model
+that genuinely cannot fit.** Which is the architecture already recorded; this
+note exists so the question is not re-opened a third time.

@@ -1,17 +1,30 @@
 # Status
 
-**Updated:** 2026-08-17
-**Phase:** Node 1 fully provisioned, built and measured. Phase 0 complete.
-Missing Link built through Task 12 (41 tests passing). **Node 2 not yet joined.**
+**Updated:** 2026-08-17 (evening — node 2 session)
+**Phase:** **N=2. Node 2 joined, provisioned, characterised and serving.** Both
+engines distributed fleet-wide. **Upstream bug #26500 gate PASSED across real
+machines.** Missing Link built through Task 12 (41 tests passing).
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
+
+**The one measurement still owed from this session:** aggregate throughput across
+two independent `llama-server`s (the R × single-node replication model). Blocked
+only on the 65 GB gpt-oss-120b copy to node 2 — see "In flight" below.
+
+**Two corrections to long-standing assumptions, both from measurement:**
+
+- **The network is 100 Mb/s, not gigabit** (93.8 Mbit/s measured). Both NICs are
+  gigabit and the switch is the cap. This **inverts** F23's peer-pull preference
+  and qualifies the expert-parallelism comms analysis. See **F28**.
+- **`nodes.env` had node 1's RAM as 125629 MB, which `free -m` does not report**
+  (128709 on both nodes). Corrected — it sets `--tensor-split` ratios. See F29.
 
 ---
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** 27 findings from running this on real hardware.
-   Several correct the plan or the spec. Do not trust the original plan's
-   numbers over these.
+1. **Read `docs/FINDINGS.md`.** **32 findings** from running this on real
+   hardware. Several correct the plan or the spec — **and F28 corrects this file
+   and F23.** Do not trust the original plan's numbers over these.
 2. `docs/measurements.md` is the only place performance numbers may be quoted
    from.
 3. `docs/UPSTREAM-PATCHES.md` lists the concrete corrections still to fold back
@@ -22,15 +35,117 @@ Missing Link built through Task 12 (41 tests passing). **Node 2 not yet joined.*
 5. **You are the operator.** Run the commands, read the output, record the
    numbers. Never report a step done without having seen its output.
 
-**Everything is built and working on node 1.** llama.cpp b10369 at
-`/opt/llama.cpp/bin`, ik_llama.cpp at `/opt/ik_llama.cpp/bin`, models in
-`/opt/models`, Missing Link in `missing-link/`.
+**Everything is built and working on nodes 1 AND 2.** llama.cpp b10369 at
+`/opt/llama.cpp/bin` and ik_llama.cpp at `/opt/ik_llama.cpp/bin` **on both**,
+models in `/opt/models`, Missing Link in `missing-link/` (coordinator only).
+`rpc-server@50052` is **active on both nodes** at `-t 4` as user `cluster`.
+
+**Access:** node 1 is reachable over Tailscale with Tailscale SSH enabled, and a
+detached tmux session named `cluster` is waiting on it. **The address is in
+`network.md`** (gitignored, site-specific — this file is published):
+
+```bash
+ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'   # then: claude --continue
+```
+
+---
+
+## In flight right now (2026-08-17 evening)
+
+**A 65 GB `rsync` of `gpt-oss-120b-F16.gguf` from node 1 to node 2**, at a
+measured 11.18 MB/s, ETA ~97 min from 19:28 AEST. Log: `/tmp/rsync-gptoss.log`.
+
+```bash
+# is it still going / did it finish?
+pgrep -af 'rsync -a --partial' ; tail -c 200 /tmp/rsync-gptoss.log
+ssh debian1@10.10.0.39 'ls -lh /opt/models/gpt-oss-120b/'   # want 65369017728 bytes
+# if interrupted, it resumes -- --partial --inplace, so just re-run:
+rsync -a --partial --inplace --info=progress2 \
+  /opt/models/gpt-oss-120b/gpt-oss-120b-F16.gguf \
+  debian1@10.10.0.39:/opt/models/gpt-oss-120b/
+```
+
+**Do not benchmark either node while this runs.** It reads 65 GB off node 1's
+disk, burns CPU on SSH crypto at both ends, and streams 65 GB through node 2's
+page cache — every one of which perturbs an inference measurement. It also
+saturates the link, which took RTT from 0.827 ms to 9.544 ms (F28).
+
+**When it completes, do this — it is the measurement the architecture rests on:**
+
+```bash
+# Independent llama-server per node. NO --rpc, NO --tensor-split: replication,
+# not sharding. ik_llama.cpp, because prefill is 79% of document wall-clock (F27).
+# -t 4 = PHYSICAL cores. --parallel 4, never 8.
+/opt/ik_llama.cpp/bin/llama-server -m /opt/models/gpt-oss-120b/gpt-oss-120b-F16.gguf \
+  -t 4 -c 4096 --parallel 4 --host 0.0.0.0 --port 8080   # on BOTH nodes
+
+# Then: single-node baseline, then both nodes concurrently, and compare
+# AGGREGATE tokens/sec. Expect ~2x. Record in docs/measurements.md.
+```
+
+Watch for: ik_llama.cpp's CLI **differs from mainline** (`-no-cnv` does not
+exist), and it reports gpt-oss as `?B` rather than `120B` — output is still
+correct, but **re-verify coherence per model** (F27). Vary the prompt between
+runs or you measure the prompt cache (F17).
 
 ---
 
 ## NEXT TASKS, in order
 
-### 1. Join node 2 — the highest-value work available
+### 1. ~~Join node 2~~ — DONE 2026-08-17, except the replication measurement
+
+**Completed and verified by output:**
+
+| Step | Result |
+|---|---|
+| Key auth + NOPASSWD sudo on node 2 | working (was already in place) |
+| `harden-ssh.sh 10.10.0.39` | **key-only, passwords refused** |
+| Characterisation before assuming anything | **node 2 is a twin of node 1** (F29) |
+| STREAM triad on node 2 | **27.9 GB/s** vs node 1's 28.4 same-day control |
+| `nodes.env` populated with MEASURED values | node1 + node2, both 128709 MB / 4 cores |
+| `setup.sh node2` | hostname, identity, swap off, THP, service account |
+| `distribute.sh` (version + libc + ISA) | **node2 ok**, 24 MB / 35 files, exec-tested |
+| `distribute.sh /opt/ik_llama.cpp` | **node2 ok** — was impossible before (F32) |
+| `install-services.sh` | `rpc-server@50052` on both, **RPC_THREADS=4**, 0 restarts |
+| `two-node-smoke.sh 10.10.0.39` | **PASS — #26500 does not fire** (F31) |
+| Aggregate replication measurement | **STILL OWED** — see "In flight" above |
+
+**Five latent bugs were found and fixed on the way, every one of them specific to
+the 1 → 2 transition** (F30): the `User=cluster` account nothing created, the
+coordinator being unable to SSH to itself, host-key regeneration invalidating
+`known_hosts`, `machine-id` regeneration orphaning the journal, and a 14-hour
+timezone divergence. Plus the DIMM reporter printing an empty slot label, and
+F21 recurring in the smoke test as a **false negative on the go/no-go gate**.
+
+**Node 3 will be much cheaper than node 2 was.** The fixes above are in
+`setup.sh`/`distribute.sh`, so the path is: run `join-node.sh`, install the key,
+`harden-ssh.sh`, characterise + STREAM, add to `nodes.env`, `setup.sh node3`,
+both `distribute.sh` invocations, `install-services.sh`. **Run `ssh-keygen -R`
+after `setup.sh`** — see F30 item 3.
+
+### 1b. Owed follow-ups from this session
+
+- **A rigorous two-node sharding A/B.** The −47% generation figure is from a
+  single short chat request, not `llama-bench`. Run
+  `llama-bench` over the RPC devices **on an idle link** and record it properly.
+- **Re-check `cluster/models.sh pull`.** F28 inverts its peer-over-internet
+  preference at 11.7 MB/s vs 21 MB/s from HuggingFace.
+- **Get a gigabit switch (~$20–30).** Uplink it to the existing 100 Mb port;
+  node↔node then runs at gigabit. Preferred over daisy-chaining, which needs
+  N−1 ports per node and does not scale past 2. Slots 2 and 3 are free on the
+  P510 if a NIC is wanted instead, but the switch is the better buy.
+- **`node1`'s hostname is `debian1`.** Cosmetic, but inconsistent with
+  `nodes.env`. Left alone deliberately — renaming mid-session risked disturbing
+  Tailscale's registration for no benefit.
+- **Remote access is now set up:** Tailscale SSH enabled on node 1
+  (`tailscale set --ssh`, revert with `--ssh=false`), and a detached tmux session
+  named `cluster` exists. Reattach with
+  `ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'`, then
+  `claude --continue`. **Address is in `network.md`, not here** — this file is
+  published. (Note: `docs/measurements.md:13` already carries that IP from commit
+  `e908e33`, predating this session. Worth scrubbing if the repo goes public.)
+
+### 1c. Original node-2 procedure, retained for node 3+
 
 **The 1 → 2 transition is where all the risk lives.** Everything that can go
 wrong across a fleet appears at N=2 and nothing new appears at N=10.
@@ -156,7 +271,7 @@ sudo systemctl enable --now ssh
 # 4. Authorise the coordinator's key
 sudo -u debian1 mkdir -p /home/debian1/.ssh
 sudo -u debian1 tee -a /home/debian1/.ssh/authorized_keys <<'KEY'
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOR3eASKRk2WvCDC58A+xKEae5FnndW8Yrukr6fCp04L node1-cluster
+<PASTE THE COORDINATOR'S PUBLIC KEY -- run ./provisioning/join-node.sh to print it>
 KEY
 sudo chmod 700 /home/debian1/.ssh
 sudo chmod 600 /home/debian1/.ssh/authorized_keys
@@ -184,25 +299,36 @@ this exists to prevent.
 
 ## Where things stand
 
-**Node 1 (coordinator, user `debian1`, `10.10.0.34`)** — provisioned, built,
-measured.
+**Node 1 (coordinator, user `debian1`, `10.10.0.34`)** and **node 2 (worker /
+second replica, `10.10.0.39`)** — both provisioned, both serving.
 
-| Item | State |
-|---|---|
-| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin`, relocatable, verified |
-| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin`, output verified coherent |
-| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (61 GB); Qwen3-Next-80B downloading |
-| Missing Link | job store + worker + web API, **41 tests passing** |
-| Phase 0 gate | **PASSED** (RPC generation overhead 5.2%) |
+| Item | node 1 | node 2 |
+|---|---|---|
+| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` | **same, exec-verified** |
+| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` | **same, shipped 2026-08-17** |
+| `rpc-server@50052` | **active, `-t 4`, user `cluster`, 0 restarts** | **active, `-t 4`, 0 restarts** |
+| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB) | **gpt-oss-120b copying** |
+| SSH | password auth still ON (no key installed until this session) | **key-only, hardened** |
+| Disk free | 367 GB | 437 GB |
+| Missing Link | job store + worker + web API, **41 tests passing** | n/a (coordinator only) |
+| Phase 0 gate | **PASSED** | — |
+| #26500 gate | **PASSED across both machines** (F31) | — |
 
-**No `rpc-server` is running yet, on any node — that is expected.** The systemd
-unit is *templated*, so the name is `rpc-server@50052.service`, not
-`rpc-server` — plain `systemctl status rpc-server` reports "could not be found"
-and looks like a broken install. It is installed by `cluster/install-services.sh`,
-which is step 3 of joining node 2 and has never been run.
+**`rpc-server` IS now running on both nodes.** The unit is *templated*, so the
+name is `rpc-server@50052.service` — plain `systemctl status rpc-server` reports
+"could not be found" and looks like a broken install. Use:
 
-**Not done:** nodes 2+, replication measurement, Missing Link fan-out, Model B
-decision, Open WebUI, evaluation harness.
+```bash
+systemctl status rpc-server@50052
+ssh debian1@10.10.0.39 'systemctl status rpc-server@50052'
+```
+
+It runs as the **`cluster`** system user, whose account and tensor-cache
+directory (`/var/lib/cluster/.cache/llama.cpp/rpc`) nothing created until this
+session — see F30.
+
+**Not done:** the aggregate replication measurement (in flight), nodes 3+,
+Missing Link fan-out, Model B decision, Open WebUI, evaluation harness.
 
 ---
 
@@ -215,25 +341,32 @@ decision, Open WebUI, evaluation harness.
 
 ---
 
-## Hardware — node 1 MEASURED, others unknown
+## Hardware — nodes 1 AND 2 MEASURED, 3+ unknown
 
-| | Node 1 |
-|---|---|
-| CPU | Xeon E5-1620 v4 — **4 cores / 8 threads**, 1 socket, 1 NUMA node |
-| ISA | AVX2, FMA, F16C. **No AVX-512** |
-| RAM | **131.8 GB** — 4 × 32 GB DDR4-2400, **all four channels at rated speed** |
-| **Achievable bandwidth** | **28.2 GB/s** (STREAM) — only 37% of quad-channel theoretical |
-| Disk | NVMe 477 GB — **368 GB free as of 2026-08-17**, re-check with `df -h /` |
-| Network | Gigabit, `10.10.0.34/24` on `eno1` |
+| | Node 1 | **Node 2** |
+|---|---|---|
+| CPU | Xeon E5-1620 v4 — **4 cores / 8 threads** | **identical** |
+| ISA | AVX2, FMA, F16C. **No AVX-512** | **identical** |
+| RAM | **131.8 GB** — 4 × 32 GB DDR4-2400, all four channels | **identical, confirmed by `dmidecode`** |
+| **Achievable bandwidth** | **28.4 GB/s** (STREAM, 2026-08-17 re-run; 28.2 on 08-12) | **27.9 GB/s** |
+| Disk | NVMe 477 GB — **367 GB free**, re-check `df -h /` | NVMe 477 GB — **437 GB free** |
+| Board | LENOVO 30B2S2E800 (ThinkStation P510) | **identical** |
+| Network | **100 Mb/s** (not gigabit — F28), `10.10.0.34/24` on `eno1` | **100 Mb/s**, `10.10.0.39/24` |
+| Hostname | `debian1` (inconsistent with `nodes.env`, left alone) | `node2` |
+
+**Node 2 is a bandwidth twin of node 1 — 1.8% apart, within run-to-run noise**
+(F29). That is a *measured* result, so `--tensor-split` by RAM is also correct by
+bandwidth here. **Do not assume it for nodes 3+**; re-run STREAM per node.
 
 **The bandwidth gap is the CPU, not the memory.** Four cores cannot generate
 enough memory-level parallelism to saturate a quad-channel bus — that needs
 ~8–14 cores on Broadwell. Uncore is already at its 2800 MHz ceiling and
-energy-perf-bias is 0, so **there is no BIOS lever.** (F12)
+energy-perf-bias is 0, so **there is no BIOS lever.** (F12) Node 2 reproducing
+27.9 GB/s on identical silicon is independent confirmation.
 
-**Nodes 2+ are uncharacterised.** If any has more cores it will be faster at
-generation despite identical RAM, and `--tensor-split` should then weight by
-measured bandwidth rather than RAM.
+**The network is the newly-discovered constraint.** 93.8 Mbit/s measured, both
+NICs gigabit-capable, switch is the cap. Replication is unaffected; sharding and
+model distribution are not. See **F28**.
 
 ---
 
@@ -258,16 +391,21 @@ most consequential number in model selection: crossing it costs a factor of N.
 
 | Measurement | Result |
 |---|---|
-| Memory bandwidth (STREAM) | **28.2 GB/s** at 4 threads |
-| Optimal threads | **4 = physical cores.** `-t 8` is 26% slower |
+| Memory bandwidth (STREAM), node 1 | **28.4 GB/s** at 4 threads (28.2 on 08-12) |
+| Memory bandwidth (STREAM), **node 2** | **27.9 GB/s** at 4 threads — **a twin** (F29) |
+| Optimal threads | **4 = physical cores.** `-t 8` is 26% slower. **Reproduced on node 2** |
 | Generation efficiency, dense | **~99% of STREAM** |
 | Generation efficiency, **sparse MoE** | **~61% of STREAM** |
-| RPC overhead | generation **−5.2%**, prefill **−39.4%** |
+| RPC overhead, **localhost** | generation **−5.2%**, prefill **−39.4%** |
+| RPC overhead, **two real machines** | generation **≈ −49%** ⚠ indicative only, not `llama-bench` (F28) |
+| **LAN throughput** | **93.8 Mbit/s = 11.7 MB/s.** NOT gigabit (F28) |
+| **LAN RTT** | **0.827 ms idle, 9.544 ms saturated** — 11.5× bufferbloat |
 | gpt-oss-120b, single node | pp2048 **16.08**, tg128 **6.05** t/s |
 | Qwen3-4B, single node | pp2048 28.33, tg128 **11.49** t/s |
 | TTFT @ 2214 tokens (4B model) | **89 s** |
 | Batching (MoE) | 1.79× at batch 4; **collapses at 8** |
 | ik_llama.cpp vs mainline | **prefill +52%**, generation −14%, **net +22%** |
+| **Aggregate throughput, 2 replicas** | **NOT YET MEASURED — the outstanding item** |
 
 **Sizing rule, validated both ways:**
 `tok/s ≈ effective_bandwidth / (active_params × bytes_per_weight)`,
@@ -278,7 +416,12 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
 
 ## Open questions
 
-- [ ] **Nodes 2+ hardware.** Core count is a bandwidth spec.
+- [ ] **⭐ Does replication actually deliver R×?** The whole architecture rests on
+      it and it has never been measured. In flight — see the top of this file.
+- [x] ~~Nodes 2+ hardware~~ — **node 2 measured, a twin of node 1** (F29).
+      Nodes 3+ still unknown; core count is a bandwidth spec.
+- [ ] **Rigorous two-node sharding A/B.** The ≈−49% generation figure is one
+      short chat request, not `llama-bench`. Must be re-run on an **idle link**.
 - [ ] **Does the 61% MoE efficiency generalise?** Measured on gpt-oss (128
       experts, top_k=4). Kimi K2 has 384 at top_k=8 — a more scattered gather
       could be worse.
@@ -287,6 +430,10 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
 - [ ] **GLM-5 active params** — unpublished; decides a leading candidate.
 - [ ] **Finix S1 32B** — best listed faithfulness (1.8%), uncharacterised.
 - [ ] `-fa` and `-ctk q8_0` — untested.
+- [ ] **Does `models.sh pull` still prefer a peer?** F28 inverts that choice at
+      11.7 MB/s LAN vs 21 MB/s from HuggingFace.
+- [ ] **Is the 100 Mb cap the cable or the switch port?** Both NICs advertise
+      1000baseT/Full. A gigabit switch settles it and is ~$20–30.
 
 ---
 
@@ -373,6 +520,20 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
 
 ## Log
 
+- **2026-08-17 (evening)** — **NODE 2 JOINED. The cluster is N=2.** Characterised
+  before assuming: node 2 is a **bandwidth twin** of node 1 (STREAM 27.9 vs 28.4
+  GB/s, identical 4 x 32 GB DDR4-2400 layout) — F29. Both engines distributed,
+  `rpc-server` running on both at `-t 4`, and the **#26500 gate PASSED across
+  real machines** (F31). **Five latent bugs found, all specific to the 1 -> 2
+  transition** (F30) plus the DIMM reporter and F21 recurring as a *false
+  negative on the gate itself*. **The network turned out to be 100 Mb/s, not
+  gigabit** (F28) — which inverts F23's peer-pull preference and qualifies the
+  expert-parallelism comms analysis. Aggregate replication measurement still owed,
+  blocked on a 65 GB model copy.
+- **2026-08-17 (evening)** — Expert parallelism re-raised and re-closed with a
+  sharper argument (`DESIGN-NOTES.md` D): in the S = 1 regime it is not merely
+  out of scope, it is **strictly worse** than replication, because it optimises
+  per-request latency on an explicitly asynchronous workload.
 - **2026-08-03** — Brainstormed. Initial design assumed GPU sharding.
 - **2026-08-03** — Pivoted to CPU-only; 14 GB pooled VRAM too little.
 - **2026-08-10** — Research across RPC internals, model performance,

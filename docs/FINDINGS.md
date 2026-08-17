@@ -1060,3 +1060,195 @@ to keep reversible.
   **last-match-wins**, and `sudo -l` showed *both* rules while the password was
   still demanded. Anything scripting unattended sudo across the fleet must
   append after the `@includedir` line, not rely on a `sudoers.d` drop-in.
+
+---
+
+## F28. The fleet network is 100 Mb/s, not gigabit — and that inverts a decision in F23
+
+**CONFIRMED by measurement, 2026-08-17.** `STATUS.md`, `network.md` and F23 all
+described the fleet as gigabit. Measured: **93.8 Mbit/s = 11.7 MB/s**.
+
+Both nodes' NICs are Intel I218-LM and both **support and advertise
+1000baseT/Full**, so the cap is the cable or switch port, not the hardware —
+confirmed independently by the operator checking the switch. The link achieves
+~94% of 100 Mb line rate, so it is healthy; it is simply a 100 Mb link.
+
+**What it changes, in order of consequence:**
+
+1. **F23's peer-pull preference is inverted.** F23 justified
+   `cluster/models.sh pull` preferring a peer over HuggingFace with "21 MB/s from
+   HuggingFace vs ~110 MB/s on gigabit LAN". At **11.7 MB/s the LAN is ~1.8×
+   slower than the internet download.** On this network, pulling from a peer is
+   the *wrong* default. Note the `~110` was never measured — it was inferred
+   from "gigabit", which is precisely the kind of unmeasured number this project
+   keeps getting caught by.
+2. **RPC sharding costs far more than F14's floor.** F14's −5.2% generation
+   penalty was localhost with the network removed. Across two real machines
+   generation was roughly **half** the single-node rate (indicative; see
+   `measurements.md`). "Sharding buys capacity, never speed" is now
+   "…and on a 100 Mb link it costs about half your generation."
+3. **Latency-bound designs are not viable here.** RTT is **0.827 ms idle but
+   9.544 ms while a single rsync saturates the link** — an 11.5× bufferbloat
+   collapse. This is what qualifies the expert-parallelism analysis in
+   `DESIGN-NOTES.md` A, whose "communication would not kill it" conclusion
+   assumed gigabit and does **not** survive on this link.
+4. **Replication is completely unaffected** — independent `llama-server`s share
+   no hot path. **Another argument for replication-first.**
+5. **Model distribution is slow but one-time:** 65 GB = ~97 min measured.
+
+**Cheapest fix: a ~$20–30 gigabit switch** uplinked to the existing 100 Mb port.
+Node↔node traffic is then switched locally at gigabit; each node keeps internet
+on one cable. **Preferred over daisy-chaining two nodes**, which needs N−1 ports
+per node and does not scale to nodes 3–7.
+
+**For the skill:** add link speed to the assessment's *measured* list, alongside
+physical cores, STREAM bandwidth and coordinator disk. `ethtool` reporting
+`1000baseT/Full` under *Supported* proves only what the NIC can do — the
+negotiated `Speed:` line and an `iperf3` run are the facts. A cluster whose
+switch silently caps at 100 Mb looks fine in an inventory.
+
+---
+
+## F29. Node 2 is a bandwidth twin — homogeneity is a MEASURED result, and it validates F10 independently
+
+**CONFIRMED by measurement.** Node 2 was characterised before anything was
+assumed, per the F12 warning that core count is a bandwidth spec.
+
+| | node 1 | node 2 |
+|---|---:|---:|
+| STREAM peak (4 threads) | 28.4 GB/s | **27.9 GB/s** |
+| Peak thread count | 4 | **4** |
+| 8-thread penalty | yes | **yes** |
+| DIMM layout | 4 × 32 GB @ 2400 | **4 × 32 GB @ 2400** |
+
+Node 1 was re-run the same day (28.2 → 28.4) so the comparison is not against a
+five-day-old figure; the **1.8%** gap is within that noise.
+
+**Three things this buys:**
+
+1. **`--tensor-split` by RAM is also correct by bandwidth** on these two nodes.
+   F12 warned it might not be. Re-check per node; do not assume it for 3–7.
+2. **F10 reproduces on independent hardware.** The 4-thread peak and the SMT
+   penalty are not an artefact of one machine, which is what licenses
+   generalising "threads = physical cores" into the skill.
+3. **`nodes.env` had node 1's RAM as 125629 MB, which `free -m` does not
+   report** (both nodes: **128709**). Origin unknown; corrected. It mattered
+   because RAM_MB sets `--tensor-split` ratios, so a 2.4% error would misweight
+   the split between physically identical nodes.
+
+---
+
+## F30. Five latent bugs sat in the bring-up path, and ALL of them fire only at N=2
+
+**CONFIRMED by hitting every one of them, 2026-08-17.** `CLAUDE.md` predicts
+that everything which can go wrong appears at the 1 → 2 transition. That was
+correct, and this is the concrete list. Each would have been found only after
+committing hardware.
+
+1. **`User=cluster` in `rpc-server@.service` referenced a user nothing created.**
+   Not `setup.sh`, not the preseed, nowhere in the repo. `install-services.sh`
+   does `enable --now`, so the unit would have died instantly with
+   **status=217/USER** — on every worker. **Fixed:** `setup.sh` now creates a
+   `cluster` system account (nologin, home `/var/lib/cluster`) and pre-creates
+   the `-c` tensor-cache directory, reporting free space on that filesystem
+   (F23's silent-fill trap).
+2. **The coordinator could not SSH to itself.** `install-services.sh` iterates
+   *all* nodes including the master (it runs a worker too), unlike
+   `distribute.sh` which skips it. Node 1 had **no `authorized_keys` at all**, so
+   the run aborted at the first `scp` with `Connection closed`. **Fixed:**
+   authorised the coordinator's own key to itself.
+3. **`setup.sh` regenerates SSH host keys, invalidating the coordinator's
+   `known_hosts`.** Every later script uses plain `ssh`, so the next one aborts
+   with `REMOTE HOST IDENTIFICATION HAS CHANGED` — which reads as an attack, not
+   as a provisioning step. **Fixed:** `setup.sh` now prints the exact
+   `ssh-keygen -R` remedy. Note the ordering trap: `harden-ssh.sh` accepted the
+   host key *before* `setup.sh` replaced it.
+4. **Regenerating `machine-id` orphaned the journal.** journald keys its
+   persistent directory by machine-id, so `/var/log/journal/<old-id>/` was
+   stranded and **`journalctl -u rpc-server@50052` returned "No journal files
+   were found"** — no logs at all on the new worker, exactly when a smoke test
+   might need them. Fixed by restarting `systemd-journald`.
+5. **Node 2 arrived on the wrong timezone.** `US/Eastern` against node 1's
+   `Australia/Melbourne`. The **clocks agreed** (both NTP-synced, identical UTC
+   epoch) but `journalctl` on the two nodes read **14 hours apart**, which makes
+   cross-node correlation actively misleading during a failure. **Fixed:**
+   `setup.sh` now aligns to `CLUSTER_TZ` (default `Australia/Melbourne`).
+
+**Also found and fixed: `setup.sh`'s DIMM reporter printed an empty label.**
+`dmidecode` prints `Size:` *before* `Locator:` within each Memory Device block,
+so stashing the locator and printing on size reported the *previous* block's
+label; and `Bank Locator:` also matches `/Locator:/`, so filtering `Bank`
+afterwards discarded all but one row. Net effect: a single line reading
+`-> 32GB` with **no slot label** — the one fact F12 says determines generation
+speed, silently blank. Now prints all four slots with size and clocked speed.
+
+**None of these are exotic.** They are the ordinary consequences of a script set
+that had only ever run against one machine, which is exactly why the project
+insists on testing at N=2 before N=7.
+
+---
+
+## F31. #26500 also clears across REAL machines — but the F21 empty-content bug made a passing cluster look broken
+
+**CONFIRMED by measurement.** Two distinct results.
+
+**1. The gate passes.** F22 cleared #26500 with two `rpc-server` processes on one
+box. It now clears with **two separate machines** — real TCP, distinct
+`machine-id`s, distinct host keys, a real NIC. Zero
+`[create_node] invalid data ptr`, zero aborts, coherent on-topic output.
+Still **model-dependent** (this was a dense 4B; the public reproductions are MoE
+graphs with unusual constant/view nodes), so re-run with the real Model B GGUF.
+
+**2. `bench/two-node-smoke.sh` reported FAIL while the cluster was working
+perfectly.** The script requested `max_tokens: 150` from Qwen3-4B and read
+`choices[0].message.content`. The budget was exhausted **mid-reasoning**, so
+`content` came back an **empty string** with `reasoning_content` populated — and
+the script printed `FAIL: no usable response`. The server log showed 150 tokens
+generated at 5.73 t/s with no errors at all.
+
+**This is F21 recurring in a different file.** F21 found and fixed it in Missing
+Link's worker; the same latent bug was sitting in the bench script, where its
+consequence is worse in kind: **it does not lose output, it produces a false
+negative on the project's own go/no-go gate.** A team following the plan would
+have concluded multi-worker RPC was broken and started cherry-picking an
+upstream patch to fix a bug they did not have.
+
+**Fixed** by sending `chat_template_kwargs: {"enable_thinking": false}`, raising
+`max_tokens` to 400, and — most importantly — making the failure path
+**distinguish a cluster fault from a parsing fault**: it now greps the server log
+for graph-compute aborts and, finding none, says so explicitly rather than
+implying #26500.
+
+**Generalisation worth carrying into the skill:** any health check that reads a
+single JSON field from a reasoning model can fail open or fail closed for reasons
+that have nothing to do with what it is testing. **A gate must report *which*
+thing failed**, and empty output must never be conflated with a broken backend.
+
+---
+
+## F32. ik_llama.cpp was on the coordinator only, and `distribute.sh` could never have shipped it
+
+**CONFIRMED by direct observation.** F27 adopted `ik_llama.cpp` for the document
+workload (+52% prefill, net +22% end-to-end). But `distribute.sh` hardcoded
+`SRC=/opt/llama.cpp`, so **the fork existed on node 1 and nowhere else**, with no
+code path capable of distributing it.
+
+Under the **replicated** topology this is not cosmetic: every node runs its own
+independent `llama-server`, so every node needs the engine the workload is
+actually supposed to use. A "fully distributed" fleet would have been quietly
+running mainline — i.e. **22% slower than the measured best** — on every node but
+the coordinator.
+
+**Fixed:** `distribute.sh` now takes the engine prefix as an argument
+(`./provisioning/distribute.sh /opt/ik_llama.cpp`) and defaults to mainline. Two
+wrinkles handled:
+
+- ik_llama.cpp is a fork with **no upstream b-tag**, so it ships a `COMMIT` but
+  no `VERSION`, which `set -euo pipefail` turned into a hard failure. A version
+  string is now synthesised from the prefix and commit
+  (`ik_llama.cpp-8337e4cd`); what matters is that master and worker *agree*, not
+  that the string looks like a release tag.
+- Both engines are now installed on both nodes and verified executable there.
+  **Never mix engines within one RPC shard group** — the protocols differ. Under
+  replication the nodes are independent, so holding both is safe and is exactly
+  the side-by-side A/B the north star asks for.

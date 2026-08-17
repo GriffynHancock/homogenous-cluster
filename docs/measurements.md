@@ -10,7 +10,8 @@ must be replaced by a measurement before it is cited.
 ## Hardware baseline — node 1
 
 **Date:** 2026-08-12
-**Node:** node1 (hostname `debian1`), LAN `10.10.0.34`, Tailscale `100.92.186.88`
+**Node:** node1 (hostname `debian1`), LAN `10.10.0.34` (Tailscale address in
+`network.md` — gitignored, site-specific)
 
 | Fact | Value | Source |
 |---|---|---|
@@ -208,27 +209,35 @@ essentially 100% of what the memory subsystem can deliver. **No software tuning
 — thread counts, quantisation format, NUMA flags, `ik_llama.cpp` — will move
 generation speed on this hardware.** The only lever is memory bandwidth itself.
 
-### The DIMMs are probably only in 2 of 4 channels
+### ~~The DIMMs are probably only in 2 of 4 channels~~ — RETRACTED
 
-**INFERRED, pending `dmidecode` confirmation.**
+**This hypothesis was WRONG and is retracted.** It is left here, struck
+through, because it is a worked example of the failure mode this file exists to
+prevent: a plausible inference from a single number, which would have sent
+someone to open four machines for nothing.
 
-| Configuration | Theoretical | Measured / theoretical |
-|---|---:|---:|
-| Quad-channel DDR4-2400 | 76.8 GB/s | 28.2 → **37%** |
-| **Dual-channel DDR4-2400** | **38.4 GB/s** | 28.2 → **73%** |
+It said: 28.2 GB/s is 37% of quad-channel theoretical but 73% of dual-channel,
+73% is a textbook STREAM result, therefore the board is half-populated and
+rebalancing the DIMMs is a free doubling of throughput.
 
-37% of theoretical is implausibly low for a healthy system; **73% is a textbook
-STREAM result.** The Xeon E5-1620 v4 supports quad-channel, so the board is
-very likely **half-populated** — e.g. 2 × 64 GB rather than 4 × 32 GB.
+`dmidecode` refuted it on **both** nodes (2026-08-17):
 
-**If confirmed, redistributing the DIMMs across all four channels is close to a
-free doubling of generation throughput, fleet-wide, at zero hardware cost.**
-That is worth checking on every node before any of them are racked, and it is
-exactly the kind of advice the eventual skill should give.
+```
+DIMM_1     32 GB    @ 2400 MT/s
+DIMM_2     32 GB    @ 2400 MT/s
+DIMM_3     32 GB    @ 2400 MT/s
+DIMM_4     32 GB    @ 2400 MT/s
+```
 
-**Action:** confirm with `sudo dmidecode -t memory`. If dual-channel, physically
-rebalance and re-run this measurement before accepting any generation number as
-a baseline.
+All four channels populated, at full rated speed, on node 1 **and** node 2. The
+real cause is core count — 4 cores cannot generate enough memory-level
+parallelism to saturate a quad-channel bus, which needs ~8–14 cores on
+Broadwell. See **F12**. There is no free doubling and no BIOS lever.
+
+**The lesson worth keeping:** "73% is a textbook result" was pattern-matching,
+not evidence. The distinguishing measurement — a single-core STREAM run
+reaching 13.7 GB/s, i.e. ~49% of the *dual*-channel figure all by itself — was
+already available and would have killed the hypothesis immediately.
 
 ---
 
@@ -541,3 +550,169 @@ less than the spec's "58% loss from 512 to 32K" warning suggests.
 A 50K-token document (14 chunks) is **~60 min of prefill plus ~20 min of
 generation — roughly 80 minutes single-node.** Comfortably inside an overnight
 window, which is the gate that matters (F19).
+
+---
+
+## Hardware baseline — node 2 (joined 2026-08-17)
+
+**Date:** 2026-08-17
+**Node:** node2 (hostname was `admin`, set to `node2`), LAN `10.10.0.39`
+
+**Characterised BEFORE anything was assumed about it.** It turns out to be a
+genuine twin of node 1 — but that is a measured result, not a starting premise,
+and the `nodes.env` comment warning against copying node 1's values stands.
+
+| Fact | node 1 | **node 2** | Same? |
+|---|---|---|---|
+| CPU | Xeon E5-1620 v4 @ 3.50 GHz | **Xeon E5-1620 v4 @ 3.50 GHz** | yes |
+| Physical cores / threads | 4 / 8 | **4 / 8** | yes |
+| Sockets / NUMA nodes | 1 / 1 | **1 / 1** | yes |
+| ISA | avx2, fma, f16c, **no AVX-512** | **avx2, fma, f16c, no AVX-512** | yes |
+| `MemTotal` | 131798676 kB | **131798676 kB** | yes |
+| `free -m` total | 128709 MB | **128709 MB** | yes |
+| DIMM layout | 4 × 32 GB @ 2400 MT/s | **4 × 32 GB @ 2400 MT/s** | yes |
+| Board | LENOVO 30B2S2E800 (ThinkStation P510) | **LENOVO 30B2S2E800** | yes |
+| Disk | NVMe 476.9 GB, 367 GB free | **NVMe 476.9 GB, 437 GB free** | same model |
+| L3 cache | 10 MiB | **10 MiB** | yes |
+| OS / kernel | Debian 12, 6.1.0-52-amd64 | **Debian 12, 6.1.0-52-amd64** | yes |
+| libc6 | 2.36-9+deb12u14 | **2.36-9+deb12u14** | yes |
+
+**Both nodes' DIMM layout confirmed by `dmidecode`** (this is what retracted the
+half-population hypothesis earlier in this file):
+
+```
+DIMM_1     32 GB    @ 2400 MT/s
+DIMM_2     32 GB    @ 2400 MT/s
+DIMM_3     32 GB    @ 2400 MT/s
+DIMM_4     32 GB    @ 2400 MT/s
+```
+
+Also present on node 2, and harmless: a 0 B `Multi-Card` reader at `/dev/sda`
+(same as node 1 — the trap `preseed.cfg` filters for) and a 59.8 GB USB flash
+drive at `/dev/sdb`.
+
+### STREAM triad — node 2, with a same-day node 1 control
+
+Identical source and method to the node 1 baseline (4.8 GB working set,
+`gcc -O2 -fopenmp`, `OMP_PROC_BIND=spread`, best of 5 reps). Node 1 was re-run
+the same day so the comparison is not against a 5-day-old number.
+
+| Threads | node 1 (2026-08-12) | **node 1 (2026-08-17 control)** | **node 2 (2026-08-17)** |
+|---:|---:|---:|---:|
+| 1 | 13.7 | 13.6 | **13.6** |
+| 2 | 24.2 | 24.4 | **24.0** |
+| **4** | **28.2 ← peak** | **28.4 ← peak** | **27.9 ← peak** |
+| 6 | — | 27.0 | 26.3 |
+| 8 | 27.3 | 27.8 | **27.6** |
+
+**Node 2 peaks at 27.9 GB/s against node 1's 28.4 — a 1.8% difference, i.e.
+within run-to-run noise.** Three conclusions:
+
+1. **The fleet is homogeneous in bandwidth**, so `--tensor-split` weighted by RAM
+   is also correct by bandwidth. F12 warned this might not hold; on these two
+   nodes it does. It must be re-checked per node, not assumed for nodes 3–7.
+2. **The 4-thread peak and the SMT penalty reproduce exactly** on independent
+   hardware — `-t` = physical cores is not an artefact of one machine (F10).
+3. **Node 1's 28.2 → 28.4 re-run confirms the measurement is stable**, which is
+   what makes the 1.8% gap readable as noise rather than as a real difference.
+
+---
+
+## Network — the link is 100 Mb/s, NOT gigabit
+
+**Date:** 2026-08-17 | **Nodes:** node1 ↔ node2 | **Measured, not assumed**
+
+`STATUS.md` and `network.md` both described the fleet as gigabit. It is not.
+
+| Measurement | Result | Method |
+|---|---:|---|
+| `eno1` negotiated speed, both nodes | **100 Mb/s, full duplex** | `ethtool` |
+| NIC *supported* link modes | **includes 1000baseT/Full** | `ethtool` |
+| NIC *advertised* link modes | **includes 1000baseT/Full** | `ethtool` |
+| TCP throughput node1 → node2 | **93.8 Mbit/s (11.7 MB/s)** | `iperf3 -t 10` |
+| TCP throughput node2 → node1 | **90.1 Mbit/s (11.3 MB/s)** | `iperf3 -t 10 -R` |
+| Sustained file transfer | **11.18 MB/s** | `rsync` of a 65 GB GGUF |
+| ICMP RTT, **idle** link | **0.827 ms** | `ping -c 2` |
+| ICMP RTT, link **saturated** by one rsync | **9.544 ms** (min 6.78 / max 11.89) | `ping -c 20` |
+
+**Both NICs are gigabit silicon (Intel I218-LM) and both advertise
+1000baseT/Full, so the 100 Mb cap is the cable or switch port, not the
+hardware.** Confirmed independently by the operator inspecting the switch. The
+link runs at ~94% of 100 Mb line rate, so it is *healthy* — just capped.
+
+### Consequences, in order of how much they matter
+
+1. **Peer-to-peer model pull is now SLOWER than the internet.** F23 justified
+   `cluster/models.sh pull` preferring a peer over HuggingFace on "21 MB/s from
+   HuggingFace vs ~110 MB/s on gigabit LAN". At **11.7 MB/s the LAN is ~1.8×
+   slower than the measured HuggingFace download.** That preference is inverted
+   on this network and `models.sh` should be re-checked against it.
+2. **Model distribution is slow.** 65 GB gpt-oss-120b = **~97 min** at 11.18
+   MB/s (measured, not estimated). A 189 GB GLM-4.6 would be ~4.7 h *per node*.
+   On gigabit these become ~9 min and ~27 min.
+3. **RPC sharding pays a much larger penalty than the localhost floor.** See
+   below.
+4. **Replication is entirely unaffected**, because independent `llama-server`s
+   share no hot path. This is a further argument for replication-first.
+5. **Latency-bound designs are not viable here.** RTT degrades 11.5× under a
+   single bulk transfer (0.827 → 9.544 ms) — ordinary bufferbloat. This is what
+   qualifies the expert-parallelism comms analysis in `DESIGN-NOTES.md` A.
+
+**Cheapest fix: a ~$20–30 gigabit switch**, uplinked to the existing 100 Mb
+port. Node↔node traffic is then switched locally at gigabit and never touches
+the uplink, while each node keeps internet on one cable. Preferred over
+daisy-chaining two nodes, which needs N−1 ports per node and does not scale to
+nodes 3–7.
+
+---
+
+## Two-node RPC sharding across REAL MACHINES
+
+**Date:** 2026-08-17 | **Model:** Qwen3-4B Q4_K_M | **Build:** b10369
+**Topology:** `llama-server` on node 1, `--rpc 127.0.0.1:50052,10.10.0.39:50052`,
+`--tensor-split 1,1`, `-t 4`, each `rpc-server -t 4`
+
+**This is the first time RPC has run across two physical machines.** F14's
+overhead figures were a localhost isolation test with the network removed.
+
+| Metric | Local (no RPC) | RPC on localhost (F14) | **Across 2 real machines** |
+|---|---:|---:|---:|
+| Prefill | 33.18 t/s | 20.11 t/s (−39.4%) | **17.76 t/s** |
+| Generation | 11.55 t/s | 10.95 t/s (−5.2%) | **5.89 t/s** |
+
+**⚠ INDICATIVE, NOT RIGOROUS — do not cite these two figures as a clean A/B.**
+They come from a single short chat request in `bench/two-node-smoke.sh`
+(33 prompt tokens, 54 generated), whereas the comparison columns are
+`llama-bench pp512`/`tg128`. Different workload, far fewer tokens, no repeats.
+**A proper `llama-bench` run over the RPC devices is still owed**, and must be
+done on an idle link — measuring it while a 65 GB transfer saturates the network
+would be meaningless.
+
+**What is nonetheless clear:** generation across two real machines is roughly
+**half** the single-node rate, against the −5.2% localhost floor. The difference
+between −5.2% and roughly −49% is the network, and on a 100 Mb link that is
+unsurprising. It reinforces the existing conclusion — **sharding buys capacity,
+never speed** — and sharpens it: on a 100 Mb link, sharding costs about half of
+generation, not 5%.
+
+### Upstream bug #26500 — the gate, and it PASSES on real hardware
+
+The reason this test exists (F2). Trigger is worker *count* ≥ 2, reproduced
+upstream on a CPU-only cluster running sparse MoE, fixed in **no released tag**.
+
+| Check | Result |
+|---|---|
+| Server reached healthy | **yes** |
+| `[create_node] invalid data ptr` in any log | **0 occurrences** |
+| Abort / SIGILL / malformed-response | **0** |
+| Generation completed | **yes** — coherent, on-topic prose |
+| Server-reported prompt eval | 17.76 t/s / 33 tokens |
+| Server-reported eval | 5.89 t/s / 54 tokens |
+
+F22 had already cleared this with two `rpc-server` processes on one box. **It now
+also clears with two separate machines**, i.e. with real TCP, distinct
+`machine-id`s, distinct host keys and a real NIC in the path.
+
+**Still model-dependent.** The public reproductions involve MoE graphs with
+unusual constant/view nodes; this was a **dense 4B**. Re-run with the actual
+Model B GGUF before committing to a 7-node launch.
