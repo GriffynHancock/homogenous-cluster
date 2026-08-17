@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
-# Install and start the rpc-server systemd unit on every node.
+# Install and start the per-node systemd units: rpc-server, and the liveness
+# watchdog agent + timers.
+#
+# ONLY_NODES=node1,node2 restricts the run to named nodes (or IPs). The default
+# is every node in nodes.env. It exists because provisioning one node must not
+# require touching the others -- a node mid-benchmark is a node you do not
+# restart services on.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source provisioning/nodes.env
+
+ONLY_NODES="${ONLY_NODES:-}"
+wanted() {
+  [ -z "$ONLY_NODES" ] && return 0
+  case ",${ONLY_NODES}," in *",$1,"*|*",$2,"*) return 0 ;; esac
+  return 1
+}
 
 # PHYSICAL cores, not nproc. Measured on node 1 (docs/measurements.md):
 # generation is 26% SLOWER at -t 8 than -t 4 on a 4c/8t CPU, because generation
@@ -14,6 +27,7 @@ CORE_CMD="lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l"
 for entry in "${NODES[@]}"; do
   set -- $entry
   NAME=$1; IP=$2; CORES=${4:-}
+  wanted "$NAME" "$IP" || { echo "  $NAME skipped (ONLY_NODES=$ONLY_NODES)"; continue; }
 
   # Prefer the measured value from nodes.env; fall back to deriving it.
   if [ -z "$CORES" ]; then
@@ -31,10 +45,24 @@ for entry in "${NODES[@]}"; do
   echo "  $NAME started ($ACTUAL, nproc=$(ssh "$IP" nproc))"
 done
 
+# ---------------------------------------------------------------------------
+# The liveness watchdog. Until 2026-08-18 `llama-watchdog@.service` and
+# `.timer` existed ONLY in /etc/systemd/system on node 1 and were untracked in
+# git, so the F36/F39 fix could not reach node 2 or any future node -- a fix
+# that cannot be provisioned is a fix for one machine.
+#
+# Delegated to install-watchdog.sh because it also creates a restricted SSH
+# credential, which deserves its own file and its own justification.
+# ---------------------------------------------------------------------------
+echo
+echo "Installing the liveness watchdog (agent, restricted key, in-band timer):"
+./cluster/install-watchdog.sh ${ONLY_NODES:+--nodes "$ONLY_NODES"}
+
 echo
 echo "Verifying all endpoints reachable from the master:"
 for entry in "${NODES[@]}"; do
   set -- $entry
+  wanted "$1" "$2" || continue
   if timeout 3 bash -c "cat < /dev/null > /dev/tcp/$2/$RPC_PORT" 2>/dev/null; then
     echo "  $1 $2:$RPC_PORT open"
   else

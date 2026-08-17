@@ -1,0 +1,31 @@
+[Unit]
+Description=Liveness watchdog for llama-server on port %i (IN-BAND, this node only)
+After=llama-server@%i.service
+
+[Service]
+Type=oneshot
+
+# IN-BAND instance: watches only this machine's own server, over no network at
+# all. `docs/REQUIREMENTS.md` (2026-08-17) is explicit that this is better than
+# nothing but is NOT sufficient -- it shares the host's failure modes and cannot
+# report that this node is down. The fleet/out-of-band sweep is
+# llama-watchdog-fleet.service. Run both; they are not alternatives.
+Environment=WATCHDOG_MODE=local
+EnvironmentFile=-/etc/default/llama-watchdog
+ExecStart=/usr/local/sbin/llama-watchdog %i
+
+# StateDirectory gives us /var/lib/llama-watchdog (the restart ledger) and
+# RuntimeDirectory gives /run/llama-watchdog (the suspect streaks) with correct
+# ownership and tmpfiles cleanup. The script no longer creates these itself when
+# run under systemd -- systemd owns them, which is also what makes the unit
+# removable by deleting one file.
+StateDirectory=llama-watchdog
+RuntimeDirectory=llama-watchdog
+RuntimeDirectoryPreserve=yes
+
+# A run must not outlive its own timer period by much, or runs pile up. The
+# CPU observation window is 10 s and the HTTP probes are 5 s each.
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target
