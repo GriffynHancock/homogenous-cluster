@@ -313,3 +313,35 @@ def test_run_one_still_works_with_a_client_that_reports_no_timings(dbpath):
     job = db.list_jobs(dbpath)[0]
     assert job["status"] == "done"
     assert job["ttft_s"] is None
+
+
+# --- per-model reasoning control (measured 2026-08-17) ------------------------
+# llama-server silently drops chat-template kwargs its template does not
+# reference, so the wrong family's knob is indistinguishable from the right one.
+
+def test_gpt_oss_gets_reasoning_effort_not_enable_thinking():
+    """MEASURED: enable_thinking is inert on harmony; reasoning_effort works.
+
+    Same prompt, same 80-token budget: no kwargs -> EMPTY content (F21);
+    reasoning_effort=low -> 49 tokens, clean stop.
+    """
+    kw = worker.reasoning_kwargs_for("/opt/models/gpt-oss-120b/gpt-oss-120b-F16.gguf")
+    assert kw == {"reasoning_effort": "low"}
+    assert "enable_thinking" not in kw
+
+
+def test_qwen3_gets_enable_thinking():
+    assert worker.reasoning_kwargs_for("qwen3-4b-q4km.gguf") == {"enable_thinking": False}
+
+
+def test_unknown_model_gets_NO_kwargs_rather_than_a_guess():
+    """Sending an inert flag is worse than sending nothing: it creates false
+    confidence that thinking is suppressed while the budget drains into it."""
+    assert worker.reasoning_kwargs_for("some-model-we-have-never-seen.gguf") == {}
+    assert worker.reasoning_kwargs_for("") == {}
+    assert worker.reasoning_kwargs_for(None) == {}
+
+
+def test_longest_family_match_wins():
+    """'qwen3' must beat the more general 'qwen' entry."""
+    assert worker.reasoning_kwargs_for("Qwen3-Next-80B") == {"enable_thinking": False}

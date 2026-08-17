@@ -87,6 +87,47 @@ WORDS_PER_TOKEN = 0.70
 # against a multi-minute backend that is a retry storm, not a summary.
 DEFAULT_TIMEOUT_S = 3600
 
+# Per-model reasoning suppression. There is NO universal flag, and assuming one
+# is how the replication benchmark lost a request to F21.
+#
+# MEASURED on gpt-oss-120b, 2026-08-17, same prompt, --jinja server:
+#   no kwargs                      -> 89 completion tokens
+#   {"enable_thinking": false}     -> 129 tokens  (IGNORED -- did nothing)
+#   {"reasoning_effort": "low"}    ->  61 tokens  (31% fewer than baseline)
+#   {"reasoning_effort": "low"} at max_tokens=80 -> 49 tokens, finish_reason=stop
+#
+# Confirmed from the template actually embedded in the GGUF (served at /props):
+# it mentions `reasoning_effort` 4 times and `enable_thinking` ZERO times. So the
+# Qwen-family knob is silently inert on harmony-format models.
+#
+# For map-reduce the reasoning trace is pure cost -- it is discarded, and on this
+# hardware every token costs ~110 ms.
+REASONING_KWARGS = {
+    "gpt-oss": {"reasoning_effort": "low"},   # harmony format
+    "qwen3":   {"enable_thinking": False},    # verified on Qwen3-4B
+    "qwen":    {"enable_thinking": False},
+    "deepseek": {"enable_thinking": False},   # UNVERIFIED -- same family convention
+    "glm":     {"enable_thinking": False},    # UNVERIFIED
+}
+
+
+def reasoning_kwargs_for(model_name):
+    """Pick the thinking-suppression kwargs for a model, or {} if unknown.
+
+    An unknown model gets NO kwargs rather than a guess: sending an inert flag
+    costs nothing but creates false confidence that thinking is suppressed, and
+    then the token budget silently goes to reasoning. Budget generously instead.
+    """
+    if not model_name:
+        return {}
+    lowered = str(model_name).lower()
+    # Longest key first, so "qwen3" wins over "qwen".
+    for family in sorted(REASONING_KWARGS, key=len, reverse=True):
+        if family in lowered:
+            return dict(REASONING_KWARGS[family])
+    return {}
+
+
 # Token budgets. The old single default of 512 was too small and failed SILENTLY:
 # the first real end-to-end run (2026-08-17, Qwen3-4B, a 2057-char document)
 # generated exactly 512 tokens, was cut off mid-sentence at "Recommendations
@@ -152,18 +193,49 @@ class LlamaClient:
         # under-reports by ~5800x (0.015 s reported against a real 89 s). Reading
         # the server's own number avoids the whole trap.
         self.timings_log = []
+        # Reasoning-suppression kwargs, resolved once from the server's own
+        # /props on first use. Lazy rather than in __init__ so constructing a
+        # client never does I/O and never fails because a node is down.
+        self._reasoning = None
+
+    def _detect_reasoning_kwargs(self):
+        """Ask the server which model it is serving, once, and map to a knob.
+
+        llama-server SILENTLY DROPS chat-template kwargs its template does not
+        reference -- no error, no warning. So sending the wrong family's knob
+        looks exactly like sending the right one, and the budget quietly goes to
+        reasoning. That is what cost the replication benchmark a request, so the
+        model must be identified rather than assumed.
+        """
+        if self._reasoning is not None:
+            return self._reasoning
+        name = ""
+        try:
+            req = urllib.request.Request(f"{self.base_url}/props")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                props = json.load(r)
+            name = props.get("model_name") or props.get("model_path") or ""
+        except Exception:
+            # A node that will not answer /props is a problem for the caller to
+            # discover on the actual request, not here. No kwargs is the safe
+            # default: it never silently misleads.
+            name = ""
+        self._reasoning = reasoning_kwargs_for(name)
+        return self._reasoning
 
     def complete(self, prompt, max_tokens=MAP_MAX_TOKENS):
-        body = json.dumps({
+        body_dict = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "stream": False,
-            # Spend the budget on the ANSWER, not the chain of thought. For
-            # map-reduce the reasoning trace is pure cost: it is discarded, and
-            # on this hardware every token costs ~110 ms. Requires the server to
-            # run with --jinja; harmlessly ignored otherwise.
-            "chat_template_kwargs": {"enable_thinking": False},
-        }).encode()
+        }
+        # Spend the budget on the ANSWER, not the chain of thought. For
+        # map-reduce the reasoning trace is pure cost: it is discarded, and on
+        # this hardware every token costs ~110 ms. Needs the server on --jinja.
+        kwargs = self._detect_reasoning_kwargs()
+        if kwargs:
+            body_dict["chat_template_kwargs"] = kwargs
+        body = json.dumps(body_dict).encode()
         req = urllib.request.Request(
             f"{self.base_url}/v1/chat/completions",
             data=body, headers={"Content-Type": "application/json"})

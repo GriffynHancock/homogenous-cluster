@@ -24,7 +24,7 @@ real hardware.** Full detail and caveats in `docs/measurements.md`.
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **34 findings** from running this on real
+1. **Read `docs/FINDINGS.md`.** **35 findings** from running this on real
    hardware. Several correct the plan or the spec — **and F28 corrects this file
    and F23.** Do not trust the original plan's numbers over these.
 2. `docs/measurements.md` is the only place performance numbers may be quoted
@@ -451,6 +451,57 @@ session — see F30.
 
 **Not done:** the aggregate replication measurement (in flight), nodes 3+,
 Missing Link fan-out, Model B decision, Open WebUI, evaluation harness.
+
+---
+
+## The web UI is RUNNING (2026-08-17)
+
+**Missing Link's own UI, not Open WebUI.** It already existed — `base.html`,
+`index.html`, `job.html`, plus submit/job-view/result/health/api routes — and is
+now serving. Open WebUI (plan Task 9) is a *chat* frontend and is still not
+deployed; this is the *job queue* UI, which is what the async workload needs.
+
+```bash
+./missing-link/start-ui.sh http://127.0.0.1:8081 8000   # backend url, port
+```
+
+Reach it over Tailscale at `http://<coordinator-tailscale-ip>:8000`
+(address in `network.md`). Submit a document, watch the job go
+pending -> running -> done, read the summary.
+
+**It needs a llama-server to point at.** `start-ui.sh` takes the backend URL as
+its first argument. Under replication there are R of them and Missing Link still
+targets ONE — that is the fan-out work in task 2 below, and the reason
+`INFERENCE_ENDPOINTS` already exists in `nodes.env`.
+
+**Verified working end-to-end 2026-08-17:** a records-retention memo submitted
+over HTTP was claimed by the background worker and processed against
+gpt-oss-120b. Form field is `document` (not `text`), `kind` is one of
+`summarise` / `report` / `qa`.
+
+---
+
+## The agent appliance — constraint RELAXED by the operator (2026-08-17)
+
+`CLAUDE.md` says the appliance must be **separate hardware**: "a monitor that
+shares the cluster's failure modes is not a monitor." **The operator has relaxed
+this**: it may be a small reserved VM, or reserved capacity on the coordinator.
+
+**Record what that trades away, so nobody rediscovers it during an outage:** an
+appliance hosted on the coordinator **cannot report that the coordinator is
+down**, and shares its RAM pressure, its kernel, and its power feed. The
+practical split that keeps most of the value:
+
+- **On-node is fine for the ACTIVE work** — queue triage, requeueing stranded
+  jobs, batch assembly, endpoint health-checking, routing around a dead worker.
+  All of that only needs to run when the coordinator is up anyway.
+- **Liveness reporting still wants an outside observer**, even a trivial one (a
+  cron'd curl from a laptop or phone). Otherwise the failure mode is silence, and
+  silence is indistinguishable from "no news is good news."
+
+**Sizing, from research 2026-08-17:** the recommended triage model is a **4B
+dense at ~11 tok/s** (see below), i.e. ~2.5 GB resident. That fits reserved space
+on a 131.8 GB node trivially and does not threaten the S=1 budget.
 
 ---
 

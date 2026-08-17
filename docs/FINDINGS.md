@@ -1423,3 +1423,57 @@ error.
   same inherited-unmeasured-number failure mode as the 75% RAM rule (F1) and the
   "~110 MB/s gigabit LAN" figure (F28). Bumped to current; **50 tests pass**,
   including a major starlette 0.41 → 1.6 jump.
+
+---
+
+## F35. There is no universal thinking-off switch. `enable_thinking` is INERT on gpt-oss, and llama-server drops unknown kwargs silently.
+
+**CONFIRMED by controlled measurement on node 1, and independently by mechanism.**
+This is what cost the replication benchmark a request.
+
+Same model (gpt-oss-120b), same prompt, same `--jinja` server:
+
+| Variant | max_tokens | Completion tokens | Result |
+|---|---:|---:|---|
+| no kwargs | 300 | 89 | OK |
+| `{"enable_thinking": false}` | 300 | **129** | OK — but MORE than baseline, i.e. **did nothing** |
+| `{"reasoning_effort": "low"}` | 300 | **61** | OK — **31% fewer than baseline** |
+| `{"reasoning_effort": "low"}` | **80** | **49** | **OK, clean stop** |
+| **no kwargs (control)** | **80** | **80** | ***EMPTY CONTENT — F21 failure*** |
+
+**The last two rows are the proof.** Identical budget, identical prompt; the only
+difference is the kwarg, and it converts a guaranteed F21 failure into a clean
+success.
+
+**Mechanism, confirmed two independent ways:**
+
+1. **From the template on our own disk.** `GET /props` returns the chat template
+   embedded in the GGUF. It mentions `reasoning_effort` **4 times** and
+   `enable_thinking` **zero times**. (It also opens with
+   `{# Chat template fixes by Unsloth #}` — Unsloth's template work is already in
+   our stack, unremarked.)
+2. **`chat_template_kwargs` is a generic pass-through into the Jinja template, and
+   llama-server SILENTLY DROPS keys the template does not reference — no error, no
+   warning.** So sending the wrong family's knob is indistinguishable from sending
+   the right one. llama.cpp's own server README uses `{"enable_thinking": false}`
+   as its generic example, which is exactly how the wrong knob spreads.
+
+**Consequences:**
+
+- **`enable_thinking` is a Qwen/ChatML-family variable, not a standard.** gpt-oss
+  (harmony) uses `reasoning_effort` with values low/medium/high — **there is no
+  "off"**.
+- **A silently-ignored flag is worse than no flag**, because it produces false
+  confidence while the token budget drains into reasoning. `worker.py` now maps
+  model family → kwargs and returns **`{}` for an unknown model** rather than
+  guessing, and detects the model from `/props` rather than assuming.
+- **REPORTED, untested here:** a harmony-native alternative is putting
+  `Reasoning: low` in the system prompt, which works regardless of whether the
+  kwargs plumbing round-trips. Also `--reasoning-format` (none/deepseek) controls
+  whether analysis text lands in `content` or `reasoning_content`, and Qwen3 may
+  need `--reasoning-budget 0` alongside `enable_thinking:false` on recent builds —
+  one report of an eval regression from that, so **coherence-check before
+  adopting.**
+- **Verify the knob per model family, by measurement.** F27 said re-verify
+  coherence per model; this extends it to control flags. The test is cheap: one
+  tight-budget request with and without the kwarg.
