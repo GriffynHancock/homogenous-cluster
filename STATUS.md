@@ -233,6 +233,41 @@ requirement of faithfulness over style. GLM-4.6 has identical active params
 546 GB — **which removes the coordinator-disk blocker entirely.** See F25 and
 `docs/MODEL-SELECTION.md`.
 
+**A constraint nobody crossed against N until 2026-08-17: the Model B choice
+implies a MINIMUM FLEET SIZE, and at N=2 it destroys the replication win.**
+
+F25 compared the candidates on faithfulness, disk and active params. None of that
+touched `S` — how many nodes one copy needs — so the interaction with fleet size
+stayed invisible:
+
+| Model | Size | S | **R at N=2** | What you actually get |
+|---|---:|---:|---:|---|
+| **gpt-oss-120b** | 65 GB | **1** | **2** | **replication, ~2x aggregate** |
+| GLM-4.6 IQ4_XS | 189 GB | 2 | **1** | **no replication at all**, plus RPC over 100 Mb |
+| DeepSeek-V3.2 | 363 GB | 4 | **0** | **does not run at N=2** |
+| Kimi K2 IQ4_XS | 546 GB | 6 | **0** | does not run at N=2 |
+
+(S = `ceil(size / (131.8 GB x 0.75))`, i.e. against the 98.9 GB per-node
+guideline.)
+
+**So GLM-4.6 — the faithfulness-led favourite — would take the fleet from R=2 to
+R=1 and add sharding overhead on a 100 Mb link (F28).** Plausibly slower than a
+single node running gpt-oss. It only starts paying at about **N=6** (R=3).
+
+**Consequences:**
+
+- **Do not download 189 GB over an 11 MB/s link before deciding this.** That is
+  ~4.7 h per node, and every node needs its own copy under replication.
+- **The faithfulness gain must be weighed against a factor-of-R throughput loss**,
+  not treated as free. `docs/EVALUATION.md` argues the leaderboard should pick the
+  model; it cannot price this in, because it knows nothing about our fleet.
+- **This is the "largest model with S = 1" rule from `CLAUDE.md` biting for real.**
+  At N=2 that rule selects gpt-oss-120b, and the 1 -> 2 threshold crossing costs
+  exactly the factor of N the rule warns about.
+- **It also means sharding stays untested until a model needs it.** Nothing on the
+  fleet does; S=1 holds to ~99 GB. See the sharding caveat in
+  `docs/measurements.md`.
+
 Two research gaps that would change the answer:
 
 - **GLM-5 / 5.1 / 5.2 active-parameter count** is not published anywhere found.

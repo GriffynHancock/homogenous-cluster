@@ -680,13 +680,22 @@ overhead figures were a localhost isolation test with the network removed.
 | Prefill | 33.18 t/s | 20.11 t/s (−39.4%) | **17.76 t/s** |
 | Generation | 11.55 t/s | 10.95 t/s (−5.2%) | **5.89 t/s** |
 
-**⚠ INDICATIVE, NOT RIGOROUS — do not cite these two figures as a clean A/B.**
+**⚠ INDICATIVE, NOT RIGOROUS, AND MEASURED ON AN UNREPRESENTATIVE MODEL.**
 They come from a single short chat request in `bench/two-node-smoke.sh`
 (33 prompt tokens, 54 generated), whereas the comparison columns are
 `llama-bench pp512`/`tg128`. Different workload, far fewer tokens, no repeats.
 **A proper `llama-bench` run over the RPC devices is still owed**, and must be
 done on an idle link — measuring it while a 65 GB transfer saturates the network
 would be meaningless.
+
+**The model was 2.4 GB, and that biases the result — probably pessimistically.**
+Qwen3-4B needs no sharding whatsoever (it fits one node ~50 times over). Splitting
+it exists only to exercise the #26500 gate, whose trigger is worker COUNT, not
+model size (F22). But a tiny model **maximises the relative weight of RPC's fixed
+per-layer overhead**, because there is almost no per-layer compute to amortise the
+round trip against. On a large MoE, per-layer compute is far larger against the
+same round trip, so the relative penalty should be **smaller**. Treat −49% as a
+**pessimistic bound for large models, not an estimate.**
 
 **What is nonetheless clear:** generation across two real machines is roughly
 **half** the single-node rate, against the −5.2% localhost floor. The difference
