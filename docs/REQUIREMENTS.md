@@ -154,3 +154,51 @@ certainly yes, and unmeasured.
 | Notification on completion | in progress |
 | Watchdog moved off-cluster | **not started — needs hardware** |
 | Chunk-size / quant-format measurement | **not started** (`DESIGN-NOTES.md` H) |
+
+---
+
+## 2026-08-17 — a hardening pass is needed for CLAUDE-CODE interaction, not just the product
+
+> *"that slip was messed up[.] include a note somewhere that we need to do a hardening
+> pass for Claude code interaction because while you will not be involved during the
+> functioning of the end product a Claude skill will be the canonical setup phase for
+> non technical people. a bash script would be good for normal people."*
+
+**The slip:** a `git add -A` swept three agent worktrees into a commit as embedded git
+repos, and pushed it. Caught and reverted within a minute. But the operator's point is
+not about that one mistake — **it is about who runs the setup.**
+
+**The argument, and it is the strongest case yet for determinism in the setup path:**
+no assistant is present while the cluster does its job, so agent mistakes there are
+survivable. But **the Claude Skill is intended to BE the setup phase for organisations
+with no specialist**, and at that moment an agent slip lands on someone who cannot
+see it, cannot diagnose it, and has no git history to reason about.
+
+**The evidence is this session's own error log.** Every one of these was mine, in one
+evening, on a machine with a competent operator watching:
+
+| Slip | What saved it |
+|---|---|
+| `git add -A` committed worktree gitlinks and pushed | I noticed the warning text |
+| `pkill -f` matched its own command line — **three times**, killing my shell | obvious immediate failure |
+| f-string with escaped quotes — invalid Python — **twice** | traceback |
+| `substr(document,1,5)='%PDF'` off-by-one; matched 0 rows | I checked `rowcount` |
+| Wrong form field names guessed instead of read (`text`, `uploads`, `files`) | HTTP 422/405 |
+
+**Every one was caught only because a human or a loud error surfaced it.** Put the
+same sequence in front of a non-technical user during setup and several fail silently.
+
+**Requirement:**
+
+1. **The setup path must be deterministic bash scripts, not agent improvisation.** The
+   agent's job is to *choose* the configuration (which model, what `-t`, what `-c`,
+   how many nodes) — the measured judgement it is genuinely good at — and then **run
+   an audited script**. `provisioning/setup.sh` and `distribute.sh` are already this
+   shape. Keep everything in that shape.
+2. **A hardening pass over agent-facing operations**, to be scheduled: never `git add
+   -A` (enumerate paths); never `pkill -f` with a pattern that can match the caller
+   (or the whole class — use pidfiles/systemd units instead); assert row counts on
+   destructive SQL; read an API before calling it. Several of these belong as
+   conventions in `CLAUDE.md`.
+3. **Scripts must be re-runnable and must verify their own effect** — the discipline
+   `setup.sh` already follows, and the reason the five N=2 bugs (F30) were survivable.

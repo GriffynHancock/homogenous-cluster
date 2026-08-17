@@ -664,3 +664,56 @@ core product), Unsloth Desktop (GUI), Dynamic NVFP4 (needs Blackwell-class GPU
 tensor cores), and the GGUF export/tokeniser-patch pipeline (fires only when
 exporting a fine-tune). No merged Unsloth PRs into `ggml-org/llama.cpp` core were
 found.
+
+---
+
+## J. Prompt compilation: an org's report specs, compiled into a task profile by an LLM
+
+**Raised by the operator 2026-08-17**, following from the per-workflow instruction
+boxes: free text like *"make it a board report"* is not enough to make the model
+write the right *kind* of report.
+
+> *"which implies needing an inference step to guide the model (which itself needs a
+> prompt and a hook for debug logging) so that it is writing the right kind of
+> report. an org would probably can have an offline set of specs for reports figured
+> out and formatted by an LLM."*
+
+**The idea, and it is a good one:** an organisation already has report conventions —
+templates, headings, required sections, house style, statutory fields. Rather than
+expecting an operator to re-type that into a text box each time, **capture it once,
+offline, and compile it into a task profile.**
+
+Three stages, and the middle one is new:
+
+1. **Spec capture (offline, one-off, per organisation).** An LLM reads the org's
+   existing report examples and produces a structured spec: required sections,
+   ordering, tone, what must never be inferred. Cheap because it happens once and
+   nobody is waiting.
+2. **Prompt compilation (the new inference step).** Spec + the operator's free-text
+   instruction → the actual map and reduce prompts for this job. **This step needs
+   its own prompt**, and it is a *meta*-prompt: a prompt that writes prompts.
+3. **Execution** — the existing map-reduce, unchanged.
+
+**Why this fits the architecture rather than fighting it.** `CLAUDE.md` already
+requires prompts, chunking and evaluation to stay separable from the queue, because
+that seam becomes the skill's task-profile interface. **This is that seam being used
+for what it was reserved for.** `worker.PROMPTS` / `REDUCE_PROMPTS` are already data;
+compilation just means generating those entries instead of hand-writing them.
+
+**The operator's two requirements on it are correct and non-obvious:**
+
+- **It needs its own prompt**, versioned and reviewable like any other. A
+  prompt-writing prompt that nobody can inspect is the least debuggable component
+  imaginable.
+- **It needs a debug-logging hook.** When a report comes out wrong, the first
+  question is "what prompt actually ran?" — and with compilation in the path, that is
+  no longer visible in the source. **Log the compiled prompt against the job**, the
+  same way `chunk_summaries` now records what each map step actually produced. Cheap
+  now; near-impossible to retrofit once compilation is live.
+
+**Cost note:** compilation is one short inference per job (or per spec change if
+cached), against a document workload of minutes to hours. Negligible — and it can run
+on the small appliance model rather than the big one.
+
+**Not built. Do not start it until the merge lands** — but reserve the log field when
+touching the schema next, because that is the expensive part to add later.
