@@ -26,23 +26,39 @@ On-premises infrastructure is often prohibitively expensive to operate, with ong
 
 ## The cluster — the immediate deliverable
 
-Seven surplus desktops, ~128 GB DDR4 ECC each, pooled to hold a model far
-larger than any one of them could, fronted by **Missing Link**: an async job
-runner where slowness stops being a defect. Submit documents, collect results
-later.
+Surplus desktops — the reference fleet is seven, ~128 GB DDR4 ECC each, but
+nothing in the design assumes that number — fronted by **Missing Link**: an
+async job runner where slowness stops being a defect. Submit documents, collect
+results later.
 
 This is the actual build, not a demo of a future product. It should do real
 work on real documents. The skill comes out of what it teaches.
 
-Two technical facts do most of the work:
+Three technical facts do most of the work. All three are now measured:
 
-1. **Active parameters set speed; total parameters set capability.** Bytes read
+1. **Active parameters set speed; total parameters set capacity.** Bytes read
    per token ≈ active params × bits-per-weight; everything else is storage.
    A sparse MoE model with 32B active parameters is tractable on system RAM
-   even at 550 GB total. A 70B dense model is not.
-2. **Pooling buys capacity, not speed.** For a single request the nodes run in
-   sequence, so seven machines behave like one machine with seven times the
-   RAM. The cluster exists to hold what one machine cannot.
+   even at 550 GB total. A 70B dense model is not. This is why *newer and
+   bigger* can be actively worse: a 2.8T model with 104B active is ~3× slower
+   than a 1T model with 32B active.
+2. **Sharding buys capacity, not speed.** Split one model across `S` machines
+   and they run in sequence per request — utilisation is 1/S, and `S` machines
+   behave like one machine with `S`× the RAM. Sharding exists to hold what one
+   machine cannot, and for nothing else.
+3. **Replication buys speed, linearly — and it is the bigger win.** If a model
+   fits on one machine, run an independent copy on each and the fleet scales
+   with `N`. Document summarisation is map-reduce over independent chunks, so
+   it parallelises perfectly. Measured against the alternatives: replication
+   ≈ N×, batching 1.79×, sharding 1×.
+
+So the two numbers that describe any fleet are **S** (machines per copy,
+`ceil(model_size / usable_RAM_per_node)`) and **R** (independent copies,
+`floor(N / S)`). **Aggregate throughput ≈ R × single-node throughput.**
+
+The practical corollary: **prefer the largest model with S = 1.** The size at
+which S goes from 1 to 2 is the most consequential number in model selection,
+because crossing it costs a factor of N.
 
 ## Running the cluster
 
