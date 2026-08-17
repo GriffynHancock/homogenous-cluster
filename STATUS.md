@@ -3,7 +3,7 @@
 **Updated:** 2026-08-17 (evening — node 2 session)
 **Phase:** **N=2. Node 2 joined, provisioned, characterised and serving.** Both
 engines distributed fleet-wide. **Upstream bug #26500 gate PASSED across real
-machines.** Missing Link built through Task 12 (41 tests passing).
+machines.** Missing Link **run end-to-end for the first time** and hardened (75 tests).
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
 
 **THE REPLICATION MEASUREMENT IS DONE, AND IT PASSES.** Aggregate throughput
@@ -24,7 +24,7 @@ real hardware.** Full detail and caveats in `docs/measurements.md`.
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **36 findings** from running this on real
+1. **Read `docs/FINDINGS.md`.** **37 findings** from running this on real
    hardware. Several correct the plan or the spec — **and F28 corrects this file
    and F23.** Do not trust the original plan's numbers over these.
 2. `docs/measurements.md` is the only place performance numbers may be quoted
@@ -429,7 +429,7 @@ second replica, `10.10.0.39`)** — both provisioned, both serving.
 | llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` | **same, exec-verified** |
 | ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` | **same, shipped 2026-08-17** |
 | `rpc-server@50052` | **active, `-t 4`, user `cluster`, 0 restarts** | **active, `-t 4`, 0 restarts** |
-| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB) | **gpt-oss-120b copying** |
+| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB); **Qwen3-Next-80B UD-Q8_K_XL 87 GB downloading, 26%** | **gpt-oss-120b, md5-verified** |
 | SSH | password auth still ON (no key installed until this session) | **key-only, hardened** |
 | Disk free | 367 GB | 437 GB |
 | Missing Link | job store + worker + web API, **50 tests**; **first real end-to-end run done 2026-08-17** (F34) | n/a (coordinator only) |

@@ -1534,3 +1534,88 @@ reason the *liveness* half still wants an outside observer.
 **Generalisation for the skill:** any health check that only asks "is the process
 running?" will report green through this failure. **Probe the API, with a timeout,
 from outside the process.**
+
+---
+
+## F37. How this project's concepts changed on 2026-08-17. Read this before trusting older docs.
+
+**Not a bug — a record of conceptual drift.** Several things the repo asserts
+confidently were reframed in one session. Anything written before this date should
+be read with these in mind.
+
+### 1. "Sharding vs replication" became "S decides, and S is a model-selection input"
+
+The repo already had `S` (nodes per copy) and `R` (copies). What changed is that
+**S is now understood as a property of the MODEL CHOICE, not of the cluster** — and
+crossing S = 1 → 2 costs a factor of R. At N = 2:
+
+| Model | S | R | Result |
+|---|---:|---:|---|
+| gpt-oss-120b (65 GB) | 1 | 2 | ~1.8× measured |
+| GLM-4.6 (189 GB) | 2 | 1 | no replication, plus RPC over 100 Mb |
+| DeepSeek-V3.2 (363 GB) | 4 | 0 | does not run |
+
+**So a faithfulness-led model choice has a throughput price tag that only appears
+when you divide by node count.** F25 compared candidates on faithfulness, disk and
+active params and never crossed any of it against N. The Qwen3-Next-80B download
+in flight is `UD-Q8_K_XL` at **87 GB — S = 1 with ~12 GB spare**, which is why it
+is a good choice and a larger quant would not be.
+
+### 2. Fan-out is two things, not one
+
+Job-level (whole documents) buys **throughput**; chunk-level (one document's
+chunks) buys **latency only**, because it is the same work spread wider. Queue
+depth selects the mode. `DESIGN-NOTES.md` G.
+
+### 3. "Popular self-hosted tool" is a repeated trap, now twice identified
+
+- RAG-QA tools were nearly adopted for a **summarisation** problem (`DESIGN-NOTES`
+  E).
+- Open WebUI sits in `CLAUDE.md` as *settled* and is a **chat** frontend for an
+  explicitly **asynchronous batch** workload (`DESIGN-NOTES` F).
+
+**Both are the same error: adopting the shape everyone else built, for a different
+job.** Treat "X is the standard choice" as a prompt to check whether X's users have
+our problem.
+
+### 4. Provenance moved from nicety to prerequisite
+
+Three independent lines demanded the same change — the design argument (E3), the
+metrics literature (`EVALUATION.md`: metrics are unreliable at whole-document
+scope, better against a correctly-scoped evidence window, especially for legal
+text), and the UI question of why a reader should trust output (F). **When three
+unrelated paths demand one change, that is the strongest available signal.** Built
+the same day; it also turns out to be the substrate for **resumability**.
+
+### 5. Evaluation stopped trying to reproduce the leaderboard
+
+Ranking models locally needs ~260 documents per model to separate 9.5% from 17.9%
+hallucination. **Use the published leaderboard for ranking**; spend cluster nights
+on the question it cannot answer — whether **map-reduce amplifies fabrication** —
+which is *paired*, so a few dozen documents suffice. `EVALUATION.md`.
+
+### 6. Setup is no longer "provision N identical nodes"
+
+What actually happened to node 2, and what the setup process must therefore include:
+
+- **Characterise before assuming.** Node 2 turned out to be a twin — but that was a
+  *measured result* (F29), and the file that claimed node 1's RAM was wrong.
+- **The 1 → 2 transition is where the bugs are, and there were five** (F30), none
+  exotic: a service account nothing created, the coordinator unable to SSH to
+  itself, host-key regeneration breaking `known_hosts`, `machine-id` regeneration
+  orphaning the journal, a 14-hour timezone divergence.
+- **Measure the network, do not read it off a switch label.** It was 100 Mb, not
+  gigabit (F28), which inverted a decision.
+- **Services, not processes.** Everything must survive a reboot, because the
+  operator is an hour away behind three locked doors.
+- **Something outside the cluster must judge liveness** (F36 + `REQUIREMENTS.md`).
+
+**So the setup deliverable is not an image or a script run — it is: characterise,
+measure, provision idempotently, distribute, gate at N=2, then verify by output.**
+
+### 7. "Tests passing" stopped being evidence of working software
+
+41 tests passed against a pipeline that had **never processed a document** (F34).
+Every defect since — the claim race, empty completions, truncation, PDF mojibake,
+the wedged backend — lived in the seam between our code and something real. **Report
+what was exercised, not how many assertions ran.**

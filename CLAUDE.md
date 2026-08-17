@@ -21,6 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `docs/MODEL-SELECTION.md` | Which model to run and why; criteria derived from measurement | current |
 | `docs/DESIGN-NOTES.md` | Analysed-but-not-built ideas, with numbers (expert parallelism, speculative decoding, replication, why-not-RAG) | current |
 | `docs/EVALUATION.md` | Which datasets and faithfulness metrics to use, and why NOT to reproduce the hallucination leaderboard | current |
+| `docs/REQUIREMENTS.md` | **What the operator actually asked for, in their words.** Outranks older "settled" decisions | current |
 | `docs/UPSTREAM-PATCHES.md` | Corrections still to fold back into the plan and spec | current |
 | `provisioning/` | `join-node.sh`, `setup.sh`, `distribute.sh`, `harden-ssh.sh`, `build-*.sh`, `nodes.env`, `preseed.cfg` | — |
 | `cluster/` | `models.json` + `models.sh` (model index), `install-services.sh`, `rpc-server@.service` | — |
@@ -238,7 +239,12 @@ cluster:
    appliance**: a single out-of-band machine that watches the cluster, keeps it
    patched, resumes failed jobs, and reports on whether it is actually working.
    The appliance is separate hardware by design — a monitor that shares the
-   cluster's failure modes is not a monitor.
+   cluster's failure modes is not a monitor. **Confirmed the hard way on
+   2026-08-17 (F36):** llama-server hung *alive* — accepting TCP, answering
+   nothing, invisible to `Restart=always`. As the operator put it, the alternative
+   is "the whole cluster just locking itself out of the inference that it needs to
+   recover itself." An 8 GB laptop running `curl` is sufficient and sufficient is
+   the point. **Triage and batching may live on-node; LIVENESS may not.**
 
 Extensible in two directions, because neither the hardware nor the work is
 uniform:
@@ -314,6 +320,14 @@ Standing constraints when writing anything that touches the cluster:
   quietly drops the start of the document.
 - **Never pass `--advertise-routes`** to Tailscale — it would pull the RPC hot
   path onto WireGuard. RPC runs on raw LAN IPs.
+- **The LAN is 100 Mb/s, not gigabit** (measured 93.8 Mbit/s, F28). Both NICs are
+  gigabit-capable; the switch is the cap. This **inverts** F23's peer-over-internet
+  model pull, and it means model distribution costs ~97 min per 65 GB per node.
+- **Set `-c` so ONE CHUNK PLUS ITS OUTPUT FITS IN A SLOT.** `-c` is divided by
+  `--parallel`, so `-c 16384 --parallel 4` gives **4096 tokens per slot** — less
+  than `CHUNK_TOKENS` (4096) plus the wrapper plus `MAP_MAX_TOKENS` (1024). Now
+  `-c 32768` for 8192/slot. A short test document never reveals this; a real one
+  overflows.
 
 ## Verification
 
@@ -325,7 +339,11 @@ seen its output.
 change must be paired with a coherence check on real output before adoption.
 
 Missing Link does have tests: `cd missing-link && .venv/bin/python -m pytest tests/ -v`
-(41 tests currently passing).
+(75 tests as of 2026-08-17). **But a test count is not evidence of working
+software:** 41 tests passed against a pipeline that had never processed a single
+document (F34). Every defect since lived in the seam between our code and something
+real — SQLite locking, the model's output shape, `finish_reason`, PDF bytes, a
+wedged server. **Report what was exercised, not how many assertions ran.**
 
 ## Key decisions
 
@@ -354,7 +372,11 @@ Settled:
   builds across a shard group.
 - **Debian 12 headless**, scripted provisioning (not `dd` cloning — disks vary).
 - **Tailscale for SSH and the web GUI only.** RPC mesh runs on raw LAN IPs.
-- **Open WebUI** as the chat frontend, lightly skinned.
+- ~~**Open WebUI** as the chat frontend~~ — **NO LONGER SETTLED.** It is a *chat*
+  frontend and this workload is explicitly asynchronous ("nobody is waiting at a
+  prompt"), which is the same category error as adopting RAG-QA tools for
+  summarisation. Missing Link's own job console is what is actually running. See
+  `docs/DESIGN-NOTES.md` F and `docs/REQUIREMENTS.md`.
 - **Map-reduce for long documents**, ~4K chunks with 10% overlap — decided on
   evidence. A larger context window does not fix "lost in the middle".
 
