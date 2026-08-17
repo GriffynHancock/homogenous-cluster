@@ -535,6 +535,83 @@ Implications, none of which are optional now:
 
 ---
 
+## F18. Raising `-ub` does not help CPU prefill. The spec's expectation was wrong.
+
+**CONFIRMED by measurement.** `STATUS.md` states: *"`-ub` (default 512) is worth
+raising for CPU prefill — a larger ubatch amortises weight loading across more
+tokens, targeting TTFT directly."* Measured on node 1, pp2048, `-t 4`:
+
+| `-ub` | pp2048 (t/s) |
+|---:|---:|
+| 512 (default) | 27.18 ± 0.12 |
+| 1024 | 26.60 ± 0.77 |
+| 2048 | 27.61 ± 0.07 |
+
+**All three within noise of each other.** No gain.
+
+**Why the reasoning failed, and it is diagnostic.** Amortising weight loading
+only helps if weight loading is the bottleneck. It is not: prefill is
+**compute**-bound, and this CPU has 4 cores and no AVX-512, so the GEMM itself
+is the limit. There is no idle memory bandwidth for a bigger ubatch to exploit —
+generation already proves the bus is saturated at 28.2 GB/s by 4 cores (F12),
+and prefill uses less bandwidth than generation, not more.
+
+**Consequence: there is no software lever left for TTFT on this hardware.**
+`-t` is saturated at 4 (F10), `-ub` does nothing, AVX-512 is absent, and the
+Quadro P600's 2 GB cannot hold enough layers of a 93 GB model to matter. The
+only remaining levers are *architectural* — smaller chunks, or accepting the
+latency. Which leads directly to F19.
+
+---
+
+## F19. The 90 s TTFT threshold is the wrong gate for this project's actual workload
+
+**Analysis, following from measured numbers.** Worth resolving explicitly
+because F17 makes it look like the project is in trouble when it may not be.
+
+The plan says: *"If TTFT at ~2000 tokens exceeds 90 seconds, note it prominently
+and raise it with the user"*, with GPUs as the remedy. Node 1 measured **89 s on
+a 4B model** — apparently right at the wall.
+
+**But that threshold is an interactive-chat instinct, and this project is
+explicitly not interactive.** `CLAUDE.md` is unambiguous: *"submit overnight,
+read in the morning"*, *"slow is fine; nobody is waiting at a prompt"*, and
+Missing Link exists precisely to convert *"too slow to be useful"* into *"fast
+enough for this class of work"*.
+
+For an async batch workload, **TTFT per chunk is not a user-facing metric at
+all.** The user-facing metric is **wall-clock time for a whole document**, and
+that is dominated by total prefill throughput, not by the latency of any one
+chunk.
+
+Worked example, node 1, Qwen3-4B, a ~50,000-token document, map-reduce at 4K
+chunks with 10% overlap (≈14 chunks) — all inputs measured, the arithmetic is
+composition, not extrapolation:
+
+| Stage | Rate | Time |
+|---|---|---|
+| Prefill, 4K tokens × 14 chunks | 24.8 t/s | ~38 min |
+| Generation, ~500 tok summary × 14 | 11.2 t/s | ~10 min |
+| Reduce step | — | ~2 min |
+| **Total** | | **~50 min** |
+
+**Fifty minutes for a 50,000-token document, unattended, is a perfectly good
+result for the stated use case.** Nobody is watching.
+
+**Recommendation: replace the TTFT gate with a throughput gate.** Something like
+*"a 50K-token document must complete within one overnight window (≈10 h)"* is
+the decision-relevant question. Keep measuring TTFT — it is diagnostic, and
+`CLAUDE.md` is right that it must be reported separately — but **stop treating
+90 s as a stop-the-line threshold**, because it will fire on every model in the
+project while the actual workload remains comfortably viable.
+
+**This also settles the GPU question for now.** The Quadro P600 has 2 GB and
+cannot hold meaningful layers of any target model, so "GPUs for prefill" is not
+executable with the hardware on hand regardless. Revisit only if the throughput
+gate fails.
+
+---
+
 ## F9. Operational notes for the bring-up scripts
 
 **CONFIRMED by direct observation on node 1.**

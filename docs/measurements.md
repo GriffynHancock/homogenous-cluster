@@ -356,6 +356,63 @@ Disk — not RAM — is the binding constraint (F16). A drive is being added
 2026-08-17 week. Interim single-node target: **Qwen3-Next-80B-A3B UD-Q8_K_XL,
 93 GB, 3B active.**
 
+## Power and clock state — all levers already maxed
+
+**Date:** 2026-08-17. Read from MSRs under load, so these are the values that
+actually apply during inference:
+
+| Register | Value | Meaning |
+|---|---|---|
+| `UNCORE_RATIO_LIMIT` (0x620) max | 0x1c = 28 | 2800 MHz ceiling |
+| `UNCORE_PERF_STATUS` (0x621) current | 0x1c = 28 | **2800 MHz — at the ceiling** |
+| `IA32_ENERGY_PERF_BIAS` (0x1B0) | 0 | **maximum performance** |
+| Core frequency under load | 3592 MHz | turbo active, `max_perf_pct` 100 |
+
+The uncore contains the memory controller, so a throttled uncore is the usual
+explanation for low bandwidth on Xeon E5 v4. **It is not throttled here.**
+`intel_pstate` has already driven every knob to maximum regardless of the BIOS
+profile, so changing BIOS from Balanced to Performance should not be expected to
+help. **28.2 GB/s is the chip's genuine ceiling.**
+
+---
+
+## Predicted generation speed — now a usable planning tool
+
+Because generation measures at **~99% of achievable bandwidth** (F11), the
+relation below is predictive rather than a datasheet estimate:
+
+```
+tok/s  ≈  bandwidth / (active_params × bytes_per_weight)
+       ≈  28.2 GB/s / bytes_read_per_token
+```
+
+Per node, and — because RPC nodes compute sequentially, so the cluster reads the
+same total bytes per token — **the same for the 7-node cluster**:
+
+| Model | Active | Bytes/token | **Predicted tok/s** |
+|---|---:|---:|---:|
+| Qwen3-4B Q4_K_M (dense, **measured**) | 4.0 B | 2.49 GB | **11.2 measured / 11.3 predicted** |
+| gpt-oss-120b MXFP4 | 5.1 B | ~2.7 GB | ~10.4 |
+| Qwen3-Next-80B-A3B Q8 | 3.0 B | ~3.2 GB | ~8.8 |
+| Kimi K2 IQ4_XS (7 nodes) | 32 B | ~16 GB | **~1.8** |
+| Kimi K2 UD-IQ2_M (7 nodes) | 32 B | ~10 GB | ~2.8 |
+
+**Caveat, and it is the point of the next two measurements.** The 99% figure
+was measured on a **dense** model, where every weight is read in one contiguous
+sweep. A sparse MoE reads scattered experts with far worse locality, so
+achieved bandwidth may fall short. **gpt-oss-120b and Qwen3-Next are the first
+MoE models on this node and will show directly how much sparsity costs.** If
+they hit their predicted rates, the table above is trustworthy and Kimi K2 can
+be sized without downloading it. If they fall short, the shortfall is the MoE
+locality penalty and every MoE prediction needs that correction factor.
+
+**~1.8 tok/s for Kimi K2 is slow but not disqualifying** for the target
+workload — an overnight summary at 1.8 tok/s produces roughly 65,000 tokens in
+10 hours. The thesis was never "fast"; it was "possible at all". The number that
+threatens the project is TTFT (89 s on a *4B* model), not this one.
+
+---
+
 ## Model A: gpt-oss-120b, single node
 
 Pending — download in progress.
