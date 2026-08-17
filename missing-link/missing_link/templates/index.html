@@ -46,4 +46,28 @@
   </tbody>
 </table>
 </div>
+
+<h3 style="font-size:1rem;margin:2rem 0 .5rem">Inference endpoints</h3>
+<p style="color:var(--mut);font-size:.85rem">
+  One worker per endpoint, each claiming jobs independently. A node that fails
+  its health check stops claiming but is retried periodically, and rejoins on
+  its own once it answers again — it never fails the queue.
+</p>
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Endpoint</th><th>Status</th><th>Working on</th><th>Checked</th></tr></thead>
+  <tbody>
+  {% for ep in endpoints %}
+    <tr>
+      <td><code>{{ ep.url }}</code></td>
+      <td><span class="badge {{ ep.css }}">{{ ep.label }}</span></td>
+      <td>{% if ep.current_job %}<a href="/jobs/{{ ep.current_job }}"><code>{{ ep.current_job }}</code></a>{% else %}idle{% endif %}</td>
+      <td>{{ ep.last_checked[:19].replace("T"," ") if ep.last_checked else "—" }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" style="color:var(--mut)">No inference endpoints configured.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
 {% endblock %}

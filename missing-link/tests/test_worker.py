@@ -494,3 +494,79 @@ def test_client_without_a_health_probe_still_works(dbpath):
     db.create_job(dbpath, "summarise", "a document")
     assert worker.run_one(dbpath, "http://x", FakeClient()) is True
     assert db.list_jobs(dbpath)[0]["status"] == "done"
+
+
+# --- job-level fan-out: N endpoint workers, one queue --------------------------
+# app.py now runs one worker per inference endpoint concurrently, all calling
+# run_one against the SAME database. test_db.test_claim_is_atomic_under_
+# concurrency already proves the db primitive is safe in isolation; these prove
+# run_one -- what a real endpoint worker actually calls -- does not somehow
+# undo that guarantee (e.g. by doing work between the atomic claim and the
+# on_claim hook a fan-out worker relies on to know what it is doing).
+
+def test_run_one_calls_on_claim_with_the_claimed_job(dbpath):
+    """on_claim is how a fan-out worker learns which job it just picked up, to
+    show on the status page. It must fire with the real claimed job, and only
+    when a job was actually claimed."""
+    job_id = db.create_job(dbpath, "summarise", "hello world")
+    seen = []
+    assert worker.run_one(dbpath, "http://x", FakeClient(), on_claim=seen.append) is True
+    assert len(seen) == 1
+    assert seen[0]["id"] == job_id
+
+    # Queue now empty: idle return must not fire on_claim with nothing.
+    seen.clear()
+    assert worker.run_one(dbpath, "http://x", FakeClient(), on_claim=seen.append) is False
+    assert seen == []
+
+
+def test_run_one_without_on_claim_is_unaffected(dbpath):
+    """on_claim is optional and additive -- every pre-existing caller passes
+    none, and must keep working exactly as before."""
+    db.create_job(dbpath, "summarise", "hello world")
+    assert worker.run_one(dbpath, "http://x", FakeClient()) is True
+
+
+def test_concurrent_endpoint_workers_never_double_claim(dbpath):
+    """N concurrent per-endpoint workers (the shape app.py's fan-out uses) must
+    never process the same job twice, and every job must finish exactly once.
+
+    Not hypothetical: this is the reason job-level fan-out is safe to turn on
+    at all. If run_one somehow raced (e.g. by inspecting job state outside the
+    atomic claim), this would show a job double-processed or a wrong final
+    count, the same way test_claim_is_atomic_under_concurrency demonstrated for
+    the bare db primitive.
+    """
+    import threading
+
+    n_jobs = 40
+    n_endpoints = 5
+    for i in range(n_jobs):
+        db.create_job(dbpath, "summarise", f"doc {i}")
+
+    claimed_ids = []
+    lock = threading.Lock()
+
+    def record(job):
+        with lock:
+            claimed_ids.append(job["id"])
+
+    def endpoint_worker(base_url):
+        client = FakeClient()
+        while worker.run_one(dbpath, base_url, client, on_claim=record):
+            pass
+
+    endpoints = [f"http://node{i}:8080" for i in range(n_endpoints)]
+    threads = [threading.Thread(target=endpoint_worker, args=(url,)) for url in endpoints]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(claimed_ids) == n_jobs, f"expected {n_jobs} claims, got {len(claimed_ids)}"
+    assert len(set(claimed_ids)) == n_jobs, "a job was claimed by more than one endpoint worker"
+
+    jobs = db.list_jobs(dbpath)
+    assert len(jobs) == n_jobs
+    assert all(j["status"] == "done" for j in jobs), \
+        "every job must finish exactly once, not be left running or reprocessed"

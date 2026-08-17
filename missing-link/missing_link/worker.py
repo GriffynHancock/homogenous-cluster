@@ -410,13 +410,23 @@ def count_chunks(document):
     return len(chunk_document(document))
 
 
-def run_one(db_path, base_url, client=None):
-    """Process one job. Returns True if a job was handled, False if idle."""
+def run_one(db_path, base_url, client=None, on_claim=None):
+    """Process one job. Returns True if a job was handled, False if idle.
+
+    `on_claim`, if given, is called with the claimed job dict right after the
+    atomic claim succeeds. Optional and additive -- existing callers are
+    unaffected. It exists for job-level fan-out (see app.py's per-endpoint
+    worker loop): the loop needs to know which job a given endpoint is
+    currently working on for the status page, and this is cheaper and safer
+    than a second query racing against the worker that already holds the row.
+    """
     from missing_link import db
 
     job = db.claim_next_pending(db_path)
     if job is None:
         return False
+    if on_claim is not None:
+        on_claim(job)
 
     if client is None:
         client = LlamaClient(base_url)
