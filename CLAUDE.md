@@ -246,6 +246,15 @@ cluster:
    is "the whole cluster just locking itself out of the inference that it needs to
    recover itself." An 8 GB laptop running `curl` is sufficient and sufficient is
    the point. **Triage and batching may live on-node; LIVENESS may not.**
+   **Cause corrected 2026-08-18 (F40): it was not a client disconnect.** The
+   journal shows the disconnect F36 blamed happened ten minutes *after* the
+   fatal error, and the server kept serving through an earlier real disconnect.
+   It was the ik_llama.cpp abort above: `ggml_abort` forks from a multithreaded
+   process, the parent blocks in `wait4()` forever and never exits, and **the
+   forked children inherit the listening socket** — so `Restart=always` sees a
+   live process *and a port check sees an open port*. F36's symptoms and every
+   fix it produced stand; only its cause was wrong. **A liveness probe must
+   therefore test neither the process nor the port, but progress.**
 
 Extensible in two directions, because neither the hardware nor the work is
 uniform:
@@ -369,10 +378,23 @@ Settled:
 - **llama.cpp RPC** for sharding, pinned to a release tag. Exo, prima.cpp and
   distributed-llama rejected — see the spec for the reasoning, and do not
   re-propose them.
-- **`ik_llama.cpp` for the document workload.** Measured **+52% prefill, −14%
-  generation** versus mainline — a net **+22% end-to-end**, because prefill
-  dominates. Output verified coherent. Keep mainline built alongside; do not mix
-  builds across a shard group.
+- ~~**`ik_llama.cpp` for the document workload**~~ — **REVERSED 2026-08-18, see
+  F40. Run MAINLINE.** `ik_llama.cpp` **fatal-errors on the fifth request of any
+  `--parallel 4` job** — a 100% failure rate on any document longer than four
+  chunks. Its SWA flash-attention path keeps only the last 512 KV cells, which
+  is a superset of every query's window *for one sequence*; with four
+  interleaved slots those cells belong to other sequences, the mask is wholly
+  masked, and it aborts. Mainline b10369 survives the identical sequence.
+  **F27's +52%/+22% is not wrong, it is unusable**: it was measured with
+  `llama-bench`, which issues ONE sequence, while this project's own standing
+  constraint is `--parallel 4`. Re-measured through `llama-server`, ik's prefill
+  lead is **+43% decaying to +15%** as the cache fills, and F27's −14%
+  generation penalty **does not appear at all**. Keep ik built alongside — `ik`
+  at `--parallel 1`, and with flash attention explicitly off, are both untested
+  and might restore the win.
+  **The transferable lesson, and it is the sharpest in this repo: a benchmark
+  that does not reproduce the deployment's concurrency is not a benchmark of the
+  deployment.**
 - **Debian 12 headless**, scripted provisioning (not `dd` cloning — disks vary).
 - **Tailscale for SSH and the web GUI only.** RPC mesh runs on raw LAN IPs.
 - ~~**Open WebUI** as the chat frontend~~ — **NO LONGER SETTLED.** It is a *chat*
