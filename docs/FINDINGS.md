@@ -1252,3 +1252,84 @@ wrinkles handled:
   **Never mix engines within one RPC shard group** — the protocols differ. Under
   replication the nodes are independent, so holding both is safe and is exactly
   the side-by-side A/B the north star asks for.
+
+---
+
+## F33. ik_llama.cpp's `-sm graph` does NOT give cross-machine parallelism on CPU. The gate is a missing op, not a CUDA `#ifdef`.
+
+**CONFIRMED in local source, and by the upstream maintainer.** This closes a
+genuinely promising lead, and it is worth recording *why* it looked promising —
+the failure mode is instructive.
+
+`ik_llama.cpp`'s `llama-server --help` advertises a `-sm graph` split mode
+described as *"split model tensors and computation graph across GPUs"*, plus
+`-smgs` (graph scheduling), `-sas --scheduler-async` (*"async evaluation of
+compute graphs"*), `-ger --grouped-expert-routing`, `-ser`, `-muge`. Mainline
+offers `-sm {none,layer,row,tensor}`. On the face of it, one of these might give
+**intra-layer** parallelism — two nodes working the *same* layer simultaneously
+— which is exactly the 1/S utilisation waste identified in `DESIGN-NOTES.md` A,
+and would deliver it **from a flag** rather than from building an engine.
+
+**It does not, and here is the proof.**
+
+| Mechanism | Requires | Registered by | CPU / RPC? |
+|---|---|---|---|
+| ik `-sm graph` / `-sm attn` | `GGML_OP_REDUCE` compute | **CUDA only** | **NO** |
+| mainline `-sm row` | `ggml_backend_split_buffer_type` | CUDA / SYCL only | **NO** |
+| mainline `-sm tensor` | `ggml_backend_comm_init`, `..._allreduce_tensor` | CUDA / SYCL only | **NO** |
+
+Verified directly on the trees on disk:
+
+```
+# ik_llama.cpp @ 8337e4cd -- GGML_OP_REDUCE
+ggml/src/ggml-cuda.cu:3655   case GGML_OP_REDUCE:      <- the only compute path
+ggml/src/ggml-cuda.cu:4995   case GGML_OP_REDUCE:      <- supports_op
+grep GGML_OP_REDUCE ggml/src/ggml-cpu.c ggml/src/ggml-cpu/   -> ZERO matches
+grep GGML_OP_REDUCE ggml/src/ggml-rpc.cpp                    -> ZERO matches
+
+# mainline b10369
+src/llama-model.cpp:989  throw ... "device %s does not support split buffers"
+grep -rl ggml_backend_comm ggml/src/ggml-rpc.cpp ggml/src/ggml-cpu*  -> ZERO matches
+```
+
+**REPORTED, and decisive:** maintainer `ikawrakow`, in GitHub Discussion
+[#1247](https://github.com/ikawrakow/ik_llama.cpp/discussions/1247) ("New tensor
+parallel in llama.cpp", 2026-02-23): *"RPC-connected devices currently cannot be
+used for graph parallel."*
+
+### Why it looked promising, which is the transferable lesson
+
+**The dispatch code IS backend-generic and RPC devices ARE enumerated.** Device
+enumeration, `model.devices`, and the per-expert tensor-splitting code carry no
+CUDA `#ifdef`, so reading the CLI parser or the device-setup path suggests the
+feature is backend-agnostic. **The gate is one level lower: an unimplemented
+op.** `GGML_OP_REDUCE` is declared generically in `ggml.c` and has exactly one
+compute implementation, in CUDA.
+
+So this would have failed **at graph-compute time, not at argument-parse time** —
+after loading a 65 GB model across two machines. There is no friendly "unsupported
+on this backend" error to find, which is why `--help` and the parser both look
+encouraging. **An absent op fails identically to a hard guard, but is far harder
+to find by reading.**
+
+Two other flags clarified while here:
+
+- **`-ger --grouped-expert-routing` is NOT expert parallelism.** It is a
+  routing/gating change scoped to the **BailingMoeV2 architecture only**
+  (`common/common.h:428`). Not a device-distribution mechanism.
+- **`-sas --scheduler-async` is NOT the async RPC of PR #18626.** It is OMP
+  thread-barrier concurrency across multiple **CUDA** devices inside one process,
+  wired only into split-mode-graph. It does not overlap RPC round-trips, so F5's
+  "assume sequential RPC execution" stands.
+
+**Verdict: `DESIGN-NOTES.md` A's conclusion is unchanged — expert/tensor
+parallelism across machines does not exist in either engine today.** But the
+reason is now *proven* rather than assumed, and it is a sharper reason: not "no
+one has written the feature" but "the cross-device combine primitive has no CPU
+kernel." **If `GGML_OP_REDUCE` ever gains a CPU implementation, re-open this
+immediately** — the surrounding machinery is already generic, which makes that a
+much smaller change than writing a new inference engine.
+
+**Caveat:** checked against the tree on disk (`8337e4cd`) and a 2026-02-23
+maintainer comment. A newer ik_llama.cpp commit could have added a CPU path;
+re-grep `GGML_OP_REDUCE` before relying on this.

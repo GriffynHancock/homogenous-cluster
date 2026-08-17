@@ -22,7 +22,7 @@ only on the 65 GB gpt-oss-120b copy to node 2 — see "In flight" below.
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **32 findings** from running this on real
+1. **Read `docs/FINDINGS.md`.** **33 findings** from running this on real
    hardware. Several correct the plan or the spec — **and F28 corrects this file
    and F23.** Do not trust the original plan's numbers over these.
 2. `docs/measurements.md` is the only place performance numbers may be quoted
@@ -226,11 +226,67 @@ Two research gaps that would change the answer:
 - **Finix S1 32B** has the best listed hallucination rate (1.8%) but is
   uncharacterised — architecture, active params, GGUF availability all unknown.
 
-### 4. Faithfulness evaluation, earlier than planned
+### 4. Faithfulness evaluation — REFRAMED 2026-08-17. Do NOT try to reproduce the leaderboard.
 
-Task 14 in the plan, but the hallucination finding shows it should **gate model
-selection rather than validate it afterwards.** AlignScore and SummaC are
-RoBERTa-scale and run fine on CPU for a few hundred summaries.
+Task 14 in the plan, and F25 argued it should **gate model selection rather than
+validate it afterwards.** That is still right, but the *design* was wrong, and
+the reason is statistical.
+
+**We cannot measure an absolute hallucination rate here, and should not try.**
+To distinguish the two leading candidates on their reported rates — GLM-4.6 at
+9.5% vs Kimi K2 at 17.9% — a two-proportion test at 80% power needs
+**~260 documents per model**:
+
+```
+n = (1.96 + 0.84)^2 x [0.095(0.905) + 0.179(0.821)] / (0.084)^2 ~= 259
+```
+
+Separating GLM-4.6 (9.5%) from GLM-4.5-Air (9.3%) would need **tens of
+thousands**. Vectara used 7,700+. A local run over a few dozen documents cannot
+rank models, and burning cluster-nights to half-reproduce someone else's
+leaderboard is a poor trade. **Use the leaderboard for ranking. It is a better
+instrument than anything we can build.**
+
+**Measure instead the thing the leaderboard structurally CANNOT tell us.** F25
+flagged it as INFERRED and it is the project's real exposure: our pipeline is
+**map-reduce**, so a fabrication in a chunk summary becomes *source material*
+for the reduce step, where it is indistinguishable from genuine content. Errors
+do not merely persist, they get laundered.
+
+That is a **paired, within-pipeline** comparison — same documents, same model,
+single-pass vs map-reduce — which is far more statistically efficient than
+comparing absolute rates across models, because document-level variance cancels.
+**A few dozen documents can detect it**, where hundreds could not rank models.
+
+So the eval becomes two much cheaper questions:
+
+1. **Does map-reduce amplify fabrication relative to single-pass, on our own
+   documents?** Paired design, ~30–50 documents, AlignScore/SummaC (RoBERTa-scale,
+   fine on CPU). If yes, that is an architectural finding about the *pipeline*,
+   independent of model choice, and it may argue for a verification pass in the
+   reduce step.
+2. **Is the chosen model's faithfulness acceptable at all on our material?** A
+   qualitative acceptance check, not a ranking. Small n is fine.
+
+**Neither requires 260 documents, and neither competes with the leaderboard.**
+
+### 4b. Try the popular document-summary pipelines as a BASELINE
+
+Research was done on this (see "Summarisation pipelines" below) and its
+conclusion was **nothing mature exists to adopt** — private-gpt, Kotaemon and
+localGPT are RAG-QA systems that retrieve top-k chunks, the *opposite* of reading
+a whole document. So running those would mostly re-confirm a shape mismatch.
+
+**The one worth actually running is LlamaIndex `tree_summarize`**, the closest
+building block, as a **baseline to measure Missing Link against.** The project
+implicitly claims Missing Link is better than reaching for the obvious library;
+that claim is currently untested.
+
+**Set the timeouts explicitly before running it.** LlamaIndex and LangChain both
+default to a **60 s timeout with 3–6 retries**, and against a backend where one
+chunk takes minutes that is a retry storm, not a summary — it will look like the
+library "cannot handle" the cluster when in fact it was never configured for it.
+Compare on wall-clock **and** on faithfulness, using the paired design above.
 
 ### 5. Smaller, still open
 
