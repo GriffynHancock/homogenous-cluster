@@ -190,6 +190,12 @@ measured.
 | Missing Link | job store + worker + web API, **41 tests passing** |
 | Phase 0 gate | **PASSED** (RPC generation overhead 5.2%) |
 
+**No `rpc-server` is running yet, on any node — that is expected.** The systemd
+unit is *templated*, so the name is `rpc-server@50052.service`, not
+`rpc-server` — plain `systemctl status rpc-server` reports "could not be found"
+and looks like a broken install. It is installed by `cluster/install-services.sh`,
+which is step 3 of joining node 2 and has never been run.
+
 **Not done:** nodes 2+, replication measurement, Missing Link fan-out, Model B
 decision, Open WebUI, evaluation harness.
 

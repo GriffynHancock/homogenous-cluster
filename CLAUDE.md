@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **If this file was injected into your system prompt, that copy is a snapshot
+> taken at session start and can be stale.** It has been rewritten mid-session
+> before, and the stale copy carried two claims that `docs/FINDINGS.md` proves
+> wrong. In a long session, or whenever a claim here matters, **re-read
+> `CLAUDE.md` from disk** and treat `docs/FINDINGS.md` as outranking both.
+
 ## Homogenous Cluster
 
 Turning idle organisational hardware into a private LLM cluster, for work that
