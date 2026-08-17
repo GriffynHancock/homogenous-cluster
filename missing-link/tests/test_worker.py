@@ -273,3 +273,43 @@ def test_reduce_step_gets_a_bigger_budget_than_the_map_step():
     # Every map call gets the map budget; the final (reduce) call gets more.
     assert client.budgets[-1] == worker.REDUCE_MAX_TOKENS
     assert all(b == worker.MAP_MAX_TOKENS for b in client.budgets[:-1])
+
+
+# --- ttft_s: the schema reserved the column and nothing ever filled it --------
+
+def test_first_prefill_reads_the_servers_own_timings():
+    """prompt_ms is the AUTHORITATIVE TTFT (F17). Never curl's time_starttransfer."""
+    log = [{"prompt_n": 2214, "prompt_ms": 89147.95, "predicted_ms": 10147.46},
+           {"prompt_n": 100, "prompt_ms": 1000.0}]
+    # First call, not last, and converted to seconds.
+    assert worker._first_prefill_s(log) == 89.15
+
+
+def test_first_prefill_is_none_when_unavailable():
+    """NULL beats a fabricated 0.0 -- a missing measurement must look missing."""
+    assert worker._first_prefill_s(None) is None
+    assert worker._first_prefill_s([]) is None
+    assert worker._first_prefill_s([{"prompt_n": 5}]) is None
+    assert worker._first_prefill_s([{"prompt_ms": "not a number"}]) is None
+
+
+def test_run_one_records_ttft_when_the_client_reports_timings(dbpath):
+    class TimingClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.timings_log = [{"prompt_ms": 4200.0}]
+
+    db.create_job(dbpath, "summarise", "a short document")
+    assert worker.run_one(dbpath, "http://x", TimingClient()) is True
+    job = db.list_jobs(dbpath)[0]
+    assert job["status"] == "done"
+    assert job["ttft_s"] == 4.2
+
+
+def test_run_one_still_works_with_a_client_that_reports_no_timings(dbpath):
+    """FakeClient has no timings_log; the job must still complete."""
+    db.create_job(dbpath, "summarise", "a short document")
+    assert worker.run_one(dbpath, "http://x", FakeClient()) is True
+    job = db.list_jobs(dbpath)[0]
+    assert job["status"] == "done"
+    assert job["ttft_s"] is None

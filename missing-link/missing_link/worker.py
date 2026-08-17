@@ -142,6 +142,16 @@ class LlamaClient:
     def __init__(self, base_url, timeout=DEFAULT_TIMEOUT_S):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        # One entry per completion, in call order. llama-server returns a
+        # `timings` object on its OpenAI-compatible endpoint (verified in
+        # tools/server/server-task.cpp: prompt_n, prompt_ms, predicted_ms), and
+        # `prompt_ms` is the AUTHORITATIVE time-to-first-token.
+        #
+        # F17: TTFT must never be measured with curl's %{time_starttransfer} --
+        # that times the HTTP headers, which llama-server sends immediately, and
+        # under-reports by ~5800x (0.015 s reported against a real 89 s). Reading
+        # the server's own number avoids the whole trap.
+        self.timings_log = []
 
     def complete(self, prompt, max_tokens=MAP_MAX_TOKENS):
         body = json.dumps({
@@ -159,6 +169,12 @@ class LlamaClient:
             data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             payload = json.load(r)
+
+        # Record before extracting, so a truncated or empty completion still
+        # leaves evidence of how long the prefill took.
+        t = payload.get("timings")
+        if isinstance(t, dict):
+            self.timings_log.append(t)
 
         choice = payload["choices"][0]
         return extract_content(choice, max_tokens)
@@ -246,6 +262,19 @@ def extract_content(choice, max_tokens):
         f"model returned empty content (finish_reason={finish!r}).")
 
 
+def _first_prefill_s(timings_log):
+    """Seconds of prefill on the FIRST completion, from the server's own timings.
+
+    Returns None when unavailable (a client that reports no timings, or a job
+    that failed before any call succeeded) so the column stays NULL rather than
+    recording a fabricated 0.0.
+    """
+    if not timings_log:
+        return None
+    ms = timings_log[0].get("prompt_ms")
+    return round(ms / 1000.0, 2) if isinstance(ms, (int, float)) else None
+
+
 def _strip_think(text):
     """Remove <think>...</think>, including an unclosed trailing block."""
     out, i, low = [], 0, text.lower()
@@ -305,6 +334,12 @@ def run_one(db_path, base_url, client=None):
             "total_s": round(time.monotonic() - started, 2),
             "chunks": n_chunks,
             "tokens": len(result.split()),
+            # ttft_s: the FIRST call's prefill, per the server's own timings.
+            # The schema has reserved this column since the beginning and nothing
+            # ever filled it, which mattered because prefill is ~79% of document
+            # wall-clock on this hardware -- the metric most worth tracking.
+            # getattr keeps FakeClient (and any other injected client) working.
+            "ttft_s": _first_prefill_s(getattr(client, "timings_log", None)),
         })
     except Exception as exc:  # noqa: BLE001 -- a failed job must not kill the worker
         # Record and move on. One bad document must not stall every job behind
