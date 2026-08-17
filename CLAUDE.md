@@ -75,7 +75,7 @@ makes a network safe. Point at the requirement and move on.
 
 **Faithfulness is a security property here.** These are legally sensitive
 documents; a fabricated fact in a summary is a failure of the same order as a
-leak. Model selection must weight measured hallucination rate above general
+leak. Model selection must weight reported hallucination rate above general
 capability leaderboards. See `docs/MODEL-SELECTION.md`.
 
 ## Why old hardware works at all
@@ -297,7 +297,8 @@ Settled:
 
 **Model selection is open and is now driven by faithfulness.** The previously
 settled "Model B = Kimi K2" is **under review**: K2-Instruct has the worst
-measured hallucination rate (17.9%) of any model checked, against GLM-4.6 at
+REPORTED hallucination rate (17.9%) of any model checked — Vectara
+leaderboard, not verified here — against GLM-4.6 at
 9.5% with identical active params and one third the disk. See
 `docs/MODEL-SELECTION.md` and F25.
 

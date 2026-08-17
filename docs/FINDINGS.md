@@ -404,7 +404,10 @@ On node 1:
 /dev/nvme0n1p2  467G  13G  431G  3%  /
 ```
 
-**431 GB free.** Model B as specified — Kimi K2 Q4 — is **547 GB** (IQ4_XS,
+**431 GB free when first measured on 2026-08-12 — now 368 GB**, because
+gpt-oss-120b (61 GB) has since landed. **Re-run `df -h /` before choosing a
+quant**; the table below is against the original 431 GB and two rows have
+already fallen over the line. Model B as specified — Kimi K2 Q4 — is **547 GB** (IQ4_XS,
 12 files). The master must hold the entire GGUF locally: `llama-server` loads it
 and pushes tensors to the workers, so there is no version of this where the
 master gets away with a partial copy.
@@ -417,10 +420,10 @@ Measured quant ladder (`unsloth/Kimi-K2-Instruct-GGUF`, sizes summed per quant):
 | **IQ4_XS** (the plan's "Q4") | **547 GB** | **no** | no |
 | Q3_K_M | 489 GB | no | no |
 | UD-Q3_K_XL | 452 GB | no | no |
-| Q3_K_S | 442 GB | marginal | no |
-| UD-IQ3_XXS | 417 GB | yes, 14 GB spare | no |
-| UD-Q2_K_XL | 382 GB | yes | no |
-| UD-IQ2_M | 347 GB | yes | yes |
+| Q3_K_S | 442 GB | no | no |
+| UD-IQ3_XXS | 417 GB | **no — was "yes" at 431 GB free** | no |
+| UD-Q2_K_XL | 382 GB | **no — was "yes" at 431 GB free** | no |
+| UD-IQ2_M | 347 GB | yes, ~21 GB spare | yes |
 | UD-IQ1_S | 280 GB | yes | yes |
 | UD-TQ1_0 | 244 GB | yes | yes |
 

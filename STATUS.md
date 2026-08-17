@@ -39,25 +39,31 @@ Once it is reachable:
 
 ```bash
 # 1. Characterise it -- do NOT assume it matches node 1
-ssh node2 'lscpu -p=Core,Socket | grep -v "^#" | sort -u | wc -l; free -m; lsblk -d'
+ssh <node2-ip> 'lscpu -p=Core,Socket | grep -v "^#" | sort -u | wc -l; free -m; lsblk -d'
 #    and run the STREAM triad -- core count is a BANDWIDTH spec (F12)
 
-# 2. Provision, distribute, verify
+# 2. Add node 2 to provisioning/nodes.env with MEASURED values FIRST.
+#    Both distribute.sh and install-services.sh read their target list from it;
+#    with only node1 present, distribute.sh exits 0 with "nothing to distribute"
+#    -- a silent no-op that looks like success, and step 3 then fails.
+$EDITOR provisioning/nodes.env      # "node2 <ip> <ram_mb> <physical_cores>"
+
+# 3. Provision, distribute, verify
 sudo ./provisioning/setup.sh node2
 ./provisioning/distribute.sh        # asserts version, libc AND ISA
 ./cluster/install-services.sh
 
-# 3. Two-node RPC smoke test (gate for upstream bug #26500, F2/F22)
+# 4. Two-node RPC smoke test (gate for upstream bug #26500, F2/F22)
 ./bench/two-node-smoke.sh <node2-ip>
 
-# 4. THE measurement that matters: replication, not sharding.
+# 5. THE measurement that matters: replication, not sharding.
 #    Run an independent llama-server on each node, measure AGGREGATE throughput
 #    on 2 nodes. Expect ~2x. This validates the R x single-node scaling model
 #    the whole architecture now rests on.
 ```
 
-**Add node 2 to `provisioning/nodes.env` with MEASURED values** (LAN IP, RAM MB,
-physical cores). Do not leave placeholders.
+**`nodes.env` values must be MEASURED, not assumed** — LAN IP, RAM MB and
+**physical** cores. Do not leave placeholders, and do not copy node 1's values.
 
 ### 2. Missing Link fan-out across R endpoints
 
@@ -85,7 +91,8 @@ Concretely:
 ### 3. Resolve the Model B decision
 
 **Do not fetch Kimi K2 until this is settled.** K2-Instruct has the worst
-measured hallucination rate of any model checked (17.9%), against a project
+REPORTED hallucination rate of any model checked (17.9%, Vectara
+leaderboard — not verified here), against a project
 requirement of faithfulness over style. GLM-4.6 has identical active params
 (same speed), 9.5% hallucination, MIT licence, and needs 189 GB instead of
 546 GB — **which removes the coordinator-disk blocker entirely.** See F25 and
@@ -122,6 +129,10 @@ RoBERTa-scale and run fine on CPU for a few hundred summaries.
 but the systemd unit, `scp`/`rsync` targets and every `ssh` in the scripts all
 assume it. A different username means editing all of them.
 
+**Generate these with `./provisioning/join-node.sh` on the coordinator** rather
+than copying from here — it substitutes the real key and LAN IP, so it cannot go
+stale. The listing below is what it prints today.
+
 On the new machine:
 
 ```bash
@@ -151,6 +162,18 @@ ip -br addr | grep -v LOOPBACK
 
 Coordinator is `10.10.0.34/24`, gateway `10.10.0.254`. Everything after this the
 coordinator can do over SSH.
+
+**Then harden it — key-only, once keys are confirmed working:**
+
+```bash
+./provisioning/harden-ssh.sh <node-ip>
+```
+
+It verifies key auth from the coordinator **before** disabling password auth,
+validates the sshd config with `sshd -t` before restarting, and re-checks
+reachability afterwards. If any check fails it reverts and changes nothing —
+locking yourself out of a headless box in a locked cupboard is the failure mode
+this exists to prevent.
 
 ---
 
@@ -189,7 +212,7 @@ decision, Open WebUI, evaluation harness.
 | ISA | AVX2, FMA, F16C. **No AVX-512** |
 | RAM | **131.8 GB** — 4 × 32 GB DDR4-2400, **all four channels at rated speed** |
 | **Achievable bandwidth** | **28.2 GB/s** (STREAM) — only 37% of quad-channel theoretical |
-| Disk | NVMe 477 GB (431 free) |
+| Disk | NVMe 477 GB — **368 GB free as of 2026-08-17**, re-check with `df -h /` |
 | Network | Gigabit, `10.10.0.34/24` on `eno1` |
 
 **The bandwidth gap is the CPU, not the memory.** Four cores cannot generate
@@ -362,7 +385,7 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
 - **2026-08-17** — **Batching answered**: 1.79× at batch 4, collapse at 8.
   Replication beats it ~4× and beats sharding by a factor of N.
   **The architecture is now replication-first and N-agnostic.**
-- **2026-08-17** — **Kimi K2 has the worst measured hallucination rate of any
+- **2026-08-17** — **Kimi K2 has the worst REPORTED hallucination rate of any
   model checked** (17.9%), against a project requirement of faithfulness.
   Model B re-opened; GLM-4.6 leads (F25).
 - **2026-08-17** — **ik_llama.cpp A/B: +52% prefill, −14% generation, net +22%**

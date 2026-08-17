@@ -3,7 +3,8 @@
 **Turning the old computers an organisation already owns into a private LLM
 cluster — for the work it legally cannot send offsite.**
 
-**Now:** build an N-node cluster that does real work on real sensitive documents.
+**Now:** connect seven unused office machines into a single cluster that does
+real work on real sensitive documents.
 
 **Later:** package what that teaches into a Claude Skill, so an organisation
 without a specialist can do the same thing with whatever hardware it has.
@@ -26,39 +27,46 @@ On-premises infrastructure is often prohibitively expensive to operate, with ong
 
 ## The cluster — the immediate deliverable
 
-Surplus desktops — the reference fleet is seven, ~128 GB DDR4 ECC each, but
-nothing in the design assumes that number — fronted by **Missing Link**: an
-async job runner where slowness stops being a defect. Submit documents, collect
-results later.
+**Seven surplus desktops — ~128 GB DDR4 ECC each, roughly 900 GB of pooled
+RAM — wired into one machine that can run models no single one of them could
+touch.** Fronted by **Missing Link**: an async job runner where slowness stops
+being a defect. Submit documents, collect results later.
+
+Every one of those machines was sitting in a store room. Acquisition cost:
+zero. They are already inventoried, already depreciated, already inside the
+building.
 
 This is the actual build, not a demo of a future product. It should do real
 work on real documents. The skill comes out of what it teaches.
 
-Three technical facts do most of the work. All three are now measured:
+Three technical facts do most of the work. All three are now **measured on the
+hardware**, not taken from datasheets:
 
 1. **Active parameters set speed; total parameters set capacity.** Bytes read
    per token ≈ active params × bits-per-weight; everything else is storage.
    A sparse MoE model with 32B active parameters is tractable on system RAM
-   even at 550 GB total. A 70B dense model is not. This is why *newer and
-   bigger* can be actively worse: a 2.8T model with 104B active is ~3× slower
-   than a 1T model with 32B active.
-2. **Sharding buys capacity, not speed.** Split one model across `S` machines
-   and they run in sequence per request — utilisation is 1/S, and `S` machines
-   behave like one machine with `S`× the RAM. Sharding exists to hold what one
-   machine cannot, and for nothing else.
-3. **Replication buys speed, linearly — and it is the bigger win.** If a model
-   fits on one machine, run an independent copy on each and the fleet scales
-   with `N`. Document summarisation is map-reduce over independent chunks, so
-   it parallelises perfectly. Measured against the alternatives: replication
-   ≈ N×, batching 1.79×, sharding 1×.
+   even at 550 GB total. A 70B dense model is not. This is also why *newer and
+   bigger* can be actively worse — a 2.8T model with 104B active runs ~3×
+   slower than a 1T model with 32B active.
+2. **Pooling buys capacity, not speed.** Split one model across the fleet and
+   the machines run in sequence per request. Seven machines behave like one
+   machine with seven times the RAM. That is the point: **it exists to hold
+   what one machine cannot.**
+3. **But running the same model on every machine buys speed, linearly.** When a
+   model does fit on one box, seven independent copies serve seven jobs at once
+   — and summarising a long document is dozens of independent chunk summaries,
+   so it parallelises perfectly. Measured: replication ≈ 7×, batching 1.79×,
+   pooling 1×.
 
-So the two numbers that describe any fleet are **S** (machines per copy,
-`ceil(model_size / usable_RAM_per_node)`) and **R** (independent copies,
-`floor(N / S)`). **Aggregate throughput ≈ R × single-node throughput.**
+So the fleet has **two gears**. Pool the machines to reach a model nothing else
+in the building could run; replicate across them to chew through volume. Which
+gear you are in depends on one number — whether the model fits on a single node.
 
-The practical corollary: **prefer the largest model with S = 1.** The size at
-which S goes from 1 to 2 is the most consequential number in model selection,
-because crossing it costs a factor of N.
+**The design does not assume seven.** Two values describe any fleet: `S`
+machines per copy (`ceil(model_size / usable_RAM_per_node)`) and `R` independent
+copies (`floor(N / S)`), giving aggregate throughput ≈ `R ×` single-node. Seven
+is what this organisation had in the cupboard. The same build works with three,
+or twelve.
 
 ## Running the cluster
 

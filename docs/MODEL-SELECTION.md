@@ -13,7 +13,7 @@ disk, and loads one at a time into RAM.**
 
 | Budget | Per node | What it limits |
 |---|---:|---|
-| **Disk** | 431 GB free (477 total) | how many models you can KEEP |
+| **Disk** | **368 GB free** (477 total, 2026-08-17) | how many models you can KEEP |
 | **RAM** | 125 GB (~98 GB at the 75% margin) | how big the model you can RUN is |
 
 **Disk holds many; RAM runs one.** A node can store gpt-oss-120b *and*
@@ -56,8 +56,8 @@ every token.
 | Total size | Topology | Consequence |
 |---|---|---|
 | **≤ 98 GB** | **replicate on every node** | 7 independent servers, ~7× aggregate throughput, no RPC overhead |
-| 98–431 GB | shard across nodes, fits every node's disk | RPC overhead, 1/7 utilisation |
-| > 431 GB | shard; coordinator needs a bigger disk | Model B today (F16) |
+| 98 GB–free disk | shard across nodes | RPC overhead, 1/S utilisation |
+| > free disk | shard; coordinator needs a bigger disk | Model B today (F16) |
 
 **The ≤98 GB threshold is the single most consequential number in selection**,
 because crossing it costs ~7× throughput (see `DESIGN-NOTES.md` section C).
@@ -114,8 +114,9 @@ reputation.
 | **Draft** (optional) | ≤2 GB | — | with the workhorse | speculative decoding |
 
 Disk cost per node for Triage + Workhorse + Draft is well under 200 GB of the
-431 available, leaving room to hold two candidate workhorses and A/B them
-without re-downloading.
+**368 GB currently free**, leaving room to hold two candidate workhorses and
+A/B them without re-downloading. **Re-check `df -h /` before each fetch** — the
+budget moves every time a model lands.
 
 ## Benchmark research (2026-08-17) — the shortlist, with faithfulness first
 
