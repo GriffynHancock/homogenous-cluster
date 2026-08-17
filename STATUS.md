@@ -1,15 +1,29 @@
 # Status
 
-**Updated:** 2026-08-12
-**Phase:** **Task 1 in progress on node 1.** Hardware facts recorded; llama.cpp
-b10369 building. Node 2 being installed by hand in parallel.
+**Updated:** 2026-08-17
+**Phase:** **Phase 0 complete on node 1** (Tasks 1–3, bar the large-model
+numbers). **Phase 3 Tasks 10–11 built ahead of schedule** (26 tests passing).
+Models downloading. Node 2 install in progress.
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
 
-> **Read `docs/FINDINGS.md` before trusting the constraints below.** Research on
-> 2026-08-12 disproved the citation behind the per-node 75% RAM rule (F1) and
-> found an **open, unmerged upstream bug that breaks clusters with 2+ RPC
-> workers** (F2). The latter changes the task order: smoke-test two nodes
-> before committing to seven.
+> **Read `docs/FINDINGS.md` first.** Twenty findings, several of which correct
+> the plan or the spec. The four that change decisions:
+>
+> - **F16 — Model B does not fit on disk.** 547 GB model, 431 GB free. Disk,
+>   not RAM, is the binding constraint. A drive is being fitted week of
+>   2026-08-17; interim target is Qwen3-Next-80B at 93 GB.
+> - **F17 — the plan's TTFT measurement is wrong**, reporting 0.015 s where the
+>   truth was 89 s. The same bug is in Task 8, which measures the project's
+>   central "seats vs speed" claim.
+> - **F2 — an open, unmerged upstream bug breaks clusters with 2+ RPC
+>   workers.** Fixed in no released tag. Smoke-test two nodes before committing
+>   to seven.
+> - **F20 — the plan's job-claim logic races** and runs jobs twice. Reproduced,
+>   fixed, regression test added.
+>
+> **F1 also retracts the per-node 75% RAM rule's citation**, and **F12 retracts
+> an earlier hypothesis in this repo** that the DIMMs were half-populated —
+> `dmidecode` disproved it.
 
 Implementation plan: `docs/superpowers/plans/2026-08-10-cluster-bringup.md`
 (14 tasks). Design spec:
@@ -36,9 +50,18 @@ Never report a step done without having seen its output.
 
 ## Where things stand
 
-Design and plan are settled and committed. **No hardware provisioned, nothing
-measured.** Every performance number in the spec is arithmetic on datasheets and
-is marked as such.
+**Node 1 is provisioned, built and measured.** llama.cpp b10369 at
+`/opt/llama.cpp/bin`, Phase 0 complete, every number in `docs/measurements.md`
+taken from this hardware. Missing Link's job store and worker are built and
+tested (26 passing) ahead of schedule.
+
+**The spec's performance numbers are still datasheet arithmetic and are now
+known to be optimistic** — generation matches prediction closely, but prefill
+does not, and the spec has no figure for it at all.
+
+Not yet done: nodes 2–7, the large-model measurements (downloading), the
+two-node RPC smoke test, Open WebUI, Missing Link's web layer, and the quality
+harness.
 
 **Deliverables, in order:**
 
@@ -101,19 +124,33 @@ argument: run what no single machine could hold, at any speed.
 
 ## Open questions
 
-**Blocked on hardware — answer these first:**
+**Answered on hardware (2026-08-12 to 08-17):**
 
-- [ ] CPU model, socket count, core count, **NUMA nodes**, AVX-512 presence.
-      If NUMA nodes > 1 this is dual-socket and needs thread pinning the plan
-      does not cover — **stop and raise it.**
-- [ ] Memory channel count (infer from DIMM `Locator` labels). Quad-channel
-      DDR4-2400 ≈ 76.8 GB/s; hex-channel ≈ 115 GB/s. This drives tokens/sec
-      more than anything else.
-- [ ] Confirm all 7 nodes have 128 GB.
-- [ ] **Real RPC protocol overhead** — Task 2's localhost test. Has an explicit
-      stop-and-escalate threshold at 30%.
-- [ ] Effective memory bandwidth, derived from measured tok/s in Task 3. This
-      recalculates every estimate in the spec.
+- [x] **CPU: Xeon E5-1620 v4, 1 socket, 4 cores / 8 threads, 1 NUMA node,
+      AVX2 but NO AVX-512.** Single socket, so no thread pinning needed.
+- [x] **Memory: 4 × 32 GB DDR4-2400, all four channels, full rated speed.**
+      Theoretical 76.8 GB/s; **measured 28.2 GB/s (STREAM)**. The gap is the
+      4-core CPU, which cannot saturate quad-channel — not a misconfiguration
+      (F12). Uncore and EPB confirmed already at maximum, so no BIOS lever.
+- [x] **RPC overhead: generation −5.2% (gate PASSES), prefill −39.4%** (F14).
+- [x] **Effective bandwidth: generation runs at ~99% of STREAM** (F11), so
+      `tok/s ≈ bandwidth / bytes_per_token` is now predictive. Table in
+      `docs/measurements.md`.
+- [x] **Optimal `-t` is 4 (physical cores)**, not `nproc`=8, which is 26%
+      slower on generation (F10).
+- [x] **`-ub` does nothing for prefill** — refutes the spec's expectation (F18).
+
+**Still open:**
+
+- [ ] **Does the ~99% bandwidth efficiency hold for sparse MoE?** Measured on a
+      dense 4B model. MoE reads scattered experts with worse locality.
+      gpt-oss-120b and Qwen3-Next are downloading and will answer this
+      directly. **Every Kimi K2 estimate depends on it.**
+- [ ] Confirm nodes 2–7 hardware. **If any have more cores they will be faster
+      at generation despite identical RAM**, and `--tensor-split` should then
+      weight by measured bandwidth rather than RAM (F12).
+- [ ] Real per-node RAM ceiling, now that the 75% rule's citation is disproven
+      (F1). At 85% the pooled budget would be ~784 GB.
 
 **Batching — researched 2026-08-11, one item now the top measurement priority:**
 
@@ -347,3 +384,36 @@ API, end-to-end.
   Claude Skill (assess → generate → operate) extensible by hardware profile and
   task profile, including an out-of-band agent appliance. Security is
   explicitly out of scope — state the requirement, do not advise.
+
+- **2026-08-12** — **Node 1 bring-up. Phase 0 executed on real hardware.**
+  Built llama.cpp b10369 (the `b8492` warning was stale — the #21006 fix landed
+  in March). RPC overhead gate **passed** on generation (−5.2%) but prefill cost
+  −39.4%. Measured the thread sweep, the memory bandwidth, and the TTFT.
+  Discovered `rpc-server` was renamed `ggml-rpc-server` upstream and that the
+  default RPATH made the binaries non-relocatable — both would have failed only
+  on the workers.
+- **2026-08-12** — **Two constraints in the plan turned out to be wrong.** The
+  per-node 75% RAM rule cites an issue that was actually a fixed syscall-size
+  bug (F1). And Model B does not fit the master's **disk** — 547 GB against
+  431 GB free — making disk, not RAM, the binding constraint on model choice
+  (F16).
+- **2026-08-12** — **The plan's TTFT measurement was measuring nothing.**
+  `curl -w %{time_starttransfer}` reported 0.015 s for a request whose real
+  time-to-first-token was 89 s; it times HTTP headers. Runs 2 and 3 additionally
+  hit the prompt cache. Rewrote the benchmark; the same bug is in Task 8, which
+  measures the project's central claim (F17).
+- **2026-08-17** — **Memory question settled, and an earlier guess retracted.**
+  `dmidecode` shows 4 × 32 GB across all four channels at full 2400 MT/s, so the
+  half-population hypothesis in this repo was wrong. The 28.2 GB/s ceiling is
+  the 4-core CPU failing to saturate its own bus; MSRs confirm uncore and
+  energy-perf-bias already at maximum, so there is no BIOS lever either (F12).
+- **2026-08-17** — **Reframed the TTFT gate.** 89 s at 2000 tokens breaches the
+  plan's 90 s threshold on a *4B* model, but that threshold is an interactive
+  instinct and this project is explicitly async. Composed from measured rates, a
+  50K-token document map-reduces in ~50 min on one node. Recommends a
+  document-throughput gate instead (F19). `-ub` tuning was tested and does
+  nothing, so no software lever for prefill remains (F18).
+- **2026-08-17** — **Missing Link Tasks 10–11 built early** while models
+  downloaded. Found and fixed a real race in the plan's job store: it claims the
+  same job twice, reproducibly, and every test in the plan's suite is
+  single-threaded so none catch it (F20). 26 tests passing.
