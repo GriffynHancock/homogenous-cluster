@@ -27,7 +27,6 @@
     "tok/s ~= bandwidth / (active_params * bytes_per_weight). See",
     "docs/measurements.md."
   ],
-
   "models": [
     {
       "id": "qwen3-4b-q4km",
@@ -35,12 +34,16 @@
       "repo": "unsloth/Qwen3-4B-GGUF",
       "path": "/opt/models",
       "entrypoint": "qwen3-4b-q4km.gguf",
-      "files": ["qwen3-4b-q4km.gguf"],
+      "files": [
+        "qwen3-4b-q4km.gguf"
+      ],
       "bytes": 2497281312,
-      "active_params": 4.02e9,
+      "active_params": 4020000000.0,
       "bytes_per_weight": 0.62,
       "reasoning_model": true,
-      "held_by": ["node1"],
+      "held_by": [
+        "node1"
+      ],
       "notes": "Smoke-test model. Reasoning model -- budget max_tokens for thinking or it returns empty content (FINDINGS F21)."
     },
     {
@@ -49,12 +52,16 @@
       "repo": "unsloth/gpt-oss-120b-GGUF",
       "path": "/opt/models/gpt-oss-120b",
       "entrypoint": "gpt-oss-120b-F16.gguf",
-      "files": ["gpt-oss-120b-F16.gguf"],
-      "bytes": 65000000000,
-      "active_params": 5.1e9,
+      "files": [
+        "gpt-oss-120b-F16.gguf"
+      ],
+      "bytes": 65369017728,
+      "active_params": 5100000000.0,
       "bytes_per_weight": 0.53,
       "reasoning_model": true,
-      "held_by": ["node1"],
+      "held_by": [
+        "node1"
+      ],
       "notes": "Model A -- single-node speed reference. Native MXFP4; the F16 GGUF keeps MXFP4 MoE weights."
     },
     {
@@ -68,10 +75,10 @@
         "Qwen3-Next-80B-A3B-Instruct-UD-Q8_K_XL-00002-of-00002.gguf"
       ],
       "bytes": 93000000000,
-      "active_params": 3.0e9,
+      "active_params": 3000000000.0,
       "bytes_per_weight": 1.06,
       "reasoning_model": false,
-      "held_by": ["node1"],
+      "held_by": [],
       "notes": "Interim large model while the coordinator disk is too small for Model B. Only 3B active, so the fastest large model this hardware can run."
     },
     {
@@ -82,8 +89,8 @@
       "entrypoint": "PENDING-confirm-at-fetch-time",
       "files": [],
       "bytes": 547000000000,
-      "active_params": 32e9,
-      "bytes_per_weight": 0.50,
+      "active_params": 32000000000.0,
+      "bytes_per_weight": 0.5,
       "reasoning_model": false,
       "held_by": [],
       "notes": "Model B -- the thesis. NOT YET FETCHED: needs 547 GB and the coordinator has 431 GB free (FINDINGS F16). Run the coordinator on whichever node gets the big disk."
