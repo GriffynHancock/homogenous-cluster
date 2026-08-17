@@ -1,0 +1,92 @@
+{
+  "_comment": [
+    "Model manifest -- the fleet's shared index of large model files.",
+    "",
+    "WHY THIS EXISTS, and what it deliberately is NOT.",
+    "",
+    "It is NOT shared storage for inference. Workers never read model files:",
+    "ggml-rpc-server contains no GGUF loading code at all. The coordinator",
+    "reads the GGUF and pushes tensors over TCP; workers only keep a local",
+    "content-hashed tensor cache (rpc-server -c), measured at ~76% of their",
+    "share of the model. So only ONE machine ever needs the full file.",
+    "",
+    "It exists because re-fetching a large model is the slowest thing in this",
+    "project. Measured 21 MB/s from HuggingFace -- 7.2 hours for 547 GB. The",
+    "same file over gigabit LAN is ~1.4 hours. So: record which node holds",
+    "which model, and pull from a peer instead of the internet.",
+    "",
+    "The manifest lives in git rather than on a fileserver. That is the",
+    "'shared storage without a NAS' part -- the INDEX is replicated to every",
+    "node by the repo, while the BYTES stay on whichever node has the disk.",
+    "",
+    "'entrypoint' is the file to pass to -m. llama.cpp finds sibling parts of",
+    "a split GGUF automatically, so it is always part 00001.",
+    "",
+    "'active_params' and 'bytes_per_weight' let cluster/models.sh predict",
+    "tok/s from measured bandwidth -- generation runs at ~99% of STREAM, so",
+    "tok/s ~= bandwidth / (active_params * bytes_per_weight). See",
+    "docs/measurements.md."
+  ],
+
+  "models": [
+    {
+      "id": "qwen3-4b-q4km",
+      "role": "test",
+      "repo": "unsloth/Qwen3-4B-GGUF",
+      "path": "/opt/models",
+      "entrypoint": "qwen3-4b-q4km.gguf",
+      "files": ["qwen3-4b-q4km.gguf"],
+      "bytes": 2497281312,
+      "active_params": 4.02e9,
+      "bytes_per_weight": 0.62,
+      "reasoning_model": true,
+      "held_by": ["node1"],
+      "notes": "Smoke-test model. Reasoning model -- budget max_tokens for thinking or it returns empty content (FINDINGS F21)."
+    },
+    {
+      "id": "gpt-oss-120b-f16",
+      "role": "model-a",
+      "repo": "unsloth/gpt-oss-120b-GGUF",
+      "path": "/opt/models/gpt-oss-120b",
+      "entrypoint": "gpt-oss-120b-F16.gguf",
+      "files": ["gpt-oss-120b-F16.gguf"],
+      "bytes": 65000000000,
+      "active_params": 5.1e9,
+      "bytes_per_weight": 0.53,
+      "reasoning_model": true,
+      "held_by": ["node1"],
+      "notes": "Model A -- single-node speed reference. Native MXFP4; the F16 GGUF keeps MXFP4 MoE weights."
+    },
+    {
+      "id": "qwen3-next-80b-q8",
+      "role": "interim-large",
+      "repo": "unsloth/Qwen3-Next-80B-A3B-Instruct-GGUF",
+      "path": "/opt/models/qwen3-next-80b",
+      "entrypoint": "Qwen3-Next-80B-A3B-Instruct-UD-Q8_K_XL-00001-of-00002.gguf",
+      "files": [
+        "Qwen3-Next-80B-A3B-Instruct-UD-Q8_K_XL-00001-of-00002.gguf",
+        "Qwen3-Next-80B-A3B-Instruct-UD-Q8_K_XL-00002-of-00002.gguf"
+      ],
+      "bytes": 93000000000,
+      "active_params": 3.0e9,
+      "bytes_per_weight": 1.06,
+      "reasoning_model": false,
+      "held_by": ["node1"],
+      "notes": "Interim large model while the coordinator disk is too small for Model B. Only 3B active, so the fastest large model this hardware can run."
+    },
+    {
+      "id": "kimi-k2-iq4xs",
+      "role": "model-b",
+      "repo": "unsloth/Kimi-K2-Instruct-GGUF",
+      "path": "/opt/models/kimi-k2",
+      "entrypoint": "PENDING-confirm-at-fetch-time",
+      "files": [],
+      "bytes": 547000000000,
+      "active_params": 32e9,
+      "bytes_per_weight": 0.50,
+      "reasoning_model": false,
+      "held_by": [],
+      "notes": "Model B -- the thesis. NOT YET FETCHED: needs 547 GB and the coordinator has 431 GB free (FINDINGS F16). Run the coordinator on whichever node gets the big disk."
+    }
+  ]
+}

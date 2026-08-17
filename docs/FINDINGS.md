@@ -751,6 +751,57 @@ run was a correctness test, not a performance one.
 
 ---
 
+## F23. Workers never read model files. Only the coordinator needs the GGUF.
+
+**CONFIRMED from source and measurement.** This substantially simplifies the
+fleet's storage design, and it is not obvious from the plan.
+
+`tools/rpc/rpc-server.cpp` contains **zero** references to GGUF loading,
+`llama_model_load`, or any model file. Per `tools/rpc/README.md`, the RPC server
+"allows exposing `ggml` devices on a remote host" — the coordinator reads the
+model and pushes **tensors** over TCP.
+
+What each role actually needs on disk:
+
+| Role | Needs | Kimi K2 (547 GB, 7 nodes) |
+|---|---|---|
+| **Coordinator** (`llama-server`) | the entire GGUF | **547 GB** |
+| **Each worker** (`rpc-server -c`) | tensor cache only | **~59 GB** |
+
+The worker figure comes from measurement, not theory. Running two
+`rpc-server -c` instances against the 2.49 GB Qwen3-4B produced a
+**1.9 GB** cache (109 files) — **~76%** of the model, since `-c` caches tensors
+≥10 MiB. So per worker ≈ `0.76 × model_size / n_nodes`.
+
+**Consequences for the storage question:**
+
+1. **No shared storage is needed for inference.** Workers already have 477 GB
+   disks against a ~59 GB requirement.
+2. **The coordinator role should follow the disk, not the other way round.**
+   Whichever node gets the large drive should run `llama-server`. Shipping
+   547 GB to a fixed coordinator solves a problem that does not exist.
+3. **A NAS/NFS mount for the model is a poor trade.** The coordinator would read
+   547 GB over gigabit (~73 min at best) on every cold start, on top of a load
+   path that is already single-core serialised (F3), and `mmap` over NFS is
+   fragile. Local disk on the coordinator is strictly better.
+4. **Workers still need their cache checked.** `-c` writes to `$LLAMA_CACHE` or
+   `~/.cache/llama.cpp/rpc`, which is on `/` by default. A node with a small
+   root filesystem will fill it silently during first load.
+
+**What a manifest is actually good for** — not shared storage, but avoiding
+re-downloads. Measured 21 MB/s from HuggingFace vs ~110 MB/s on gigabit LAN:
+for a 547 GB model that is **7.2 hours against 1.4**. So `cluster/models.json`
+records which node holds which model, and `cluster/models.sh pull` prefers a
+peer over the internet. The **index** replicates to every node via git; the
+**bytes** stay wherever the disk is. That is "shared storage without a NAS", and
+it is the part that pays for itself.
+
+`cluster/models.sh` also exposes `plan <id>`, which converts the manifest's
+`active_params` and `bytes_per_weight` into predicted tok/s and per-node disk,
+using measured bandwidth (F11).
+
+---
+
 ## F9. Operational notes for the bring-up scripts
 
 **CONFIRMED by direct observation on node 1.**
