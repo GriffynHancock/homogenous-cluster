@@ -87,6 +87,17 @@ WORDS_PER_TOKEN = 0.70
 # against a multi-minute backend that is a retry storm, not a summary.
 DEFAULT_TIMEOUT_S = 3600
 
+# Token budgets. The old single default of 512 was too small and failed SILENTLY:
+# the first real end-to-end run (2026-08-17, Qwen3-4B, a 2057-char document)
+# generated exactly 512 tokens, was cut off mid-sentence at "Recommendations
+# include implementing automated archival for clinical", and was stored with
+# status='done'. See TruncatedCompletion below.
+#
+# The reduce step gets a larger budget than the map step: it must cover every
+# chunk summary, so its output is legitimately longer than any single one.
+MAP_MAX_TOKENS = 1024
+REDUCE_MAX_TOKENS = 2048
+
 
 def chunk_document(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
     """Split text into overlapping chunks, measured in whitespace words."""
@@ -132,11 +143,16 @@ class LlamaClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
-    def complete(self, prompt, max_tokens=512):
+    def complete(self, prompt, max_tokens=MAP_MAX_TOKENS):
         body = json.dumps({
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "stream": False,
+            # Spend the budget on the ANSWER, not the chain of thought. For
+            # map-reduce the reasoning trace is pure cost: it is discarded, and
+            # on this hardware every token costs ~110 ms. Requires the server to
+            # run with --jinja; harmlessly ignored otherwise.
+            "chat_template_kwargs": {"enable_thinking": False},
         }).encode()
         req = urllib.request.Request(
             f"{self.base_url}/v1/chat/completions",
@@ -150,6 +166,27 @@ class LlamaClient:
 
 class EmptyCompletion(RuntimeError):
     """The model returned no usable text."""
+
+
+class TruncatedCompletion(RuntimeError):
+    """The model ran out of tokens mid-answer, so the text is incomplete.
+
+    Found by the FIRST real end-to-end run, 2026-08-17. The 41 unit tests all
+    use a FakeClient, so this path had never executed against a live server.
+
+    Qwen3-4B, a 2057-char document, max_tokens=512. The server reported
+    `eval time = 512 tokens` -- exactly the ceiling -- and the stored summary
+    ended mid-sentence on "Recommendations include implementing automated
+    archival for clinical". The job was marked **done**.
+
+    This is the same family as EmptyCompletion (F21) and dangerous for the same
+    reason: a successful-looking job carrying degraded output, discovered the
+    morning after an overnight run. It is arguably worse, because an empty
+    summary is obviously wrong while a truncated one looks fine until you check
+    the last sentence -- and under map-reduce a truncated CHUNK summary becomes
+    source material for the reduce step, where its missing content is
+    indistinguishable from content the document never had.
+    """
 
 
 def extract_content(choice, max_tokens):
@@ -171,11 +208,29 @@ def extract_content(choice, max_tokens):
     """
     message = choice.get("message", {})
     content = (message.get("content") or "").strip()
-    if content:
-        return content
-
     reasoning = (message.get("reasoning_content") or "").strip()
     finish = choice.get("finish_reason")
+
+    if content:
+        # Non-empty but CUT OFF. Refuse it: an incomplete summary presented as
+        # complete is a faithfulness failure, not a formatting one.
+        if finish == "length":
+            raise TruncatedCompletion(
+                f"model hit max_tokens ({max_tokens}) mid-answer -- the text is "
+                f"incomplete ({len(content)} chars, ending {content[-60:]!r}). "
+                "Raise max_tokens for this kind, or shorten the chunk.")
+        # Some servers emit the chain of thought INLINE in content rather than in
+        # reasoning_content. Strip it and re-check that an answer remains.
+        if "<think>" in content.lower():
+            answer = _strip_think(content)
+            if not answer:
+                raise EmptyCompletion(
+                    f"content was ONLY a <think> block ({len(content)} chars), no "
+                    f"answer. Disable thinking (enable_thinking=false needs the "
+                    f"server started with --jinja) or raise max_tokens "
+                    f"({max_tokens}).")
+            return answer
+        return content
 
     if reasoning and finish == "length":
         raise EmptyCompletion(
@@ -191,7 +246,23 @@ def extract_content(choice, max_tokens):
         f"model returned empty content (finish_reason={finish!r}).")
 
 
-def summarise(kind, document, base_url, client, max_tokens=512):
+def _strip_think(text):
+    """Remove <think>...</think>, including an unclosed trailing block."""
+    out, i, low = [], 0, text.lower()
+    while True:
+        start = low.find("<think>", i)
+        if start == -1:
+            out.append(text[i:])
+            return "".join(out).strip()
+        out.append(text[i:start])
+        end = low.find("</think>", start)
+        if end == -1:
+            return "".join(out).strip()
+        i = end + 8
+
+
+def summarise(kind, document, base_url, client,
+              max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS):
     """Map-reduce over the document. Returns the final text."""
     chunks = chunk_document(document)
 
@@ -204,8 +275,11 @@ def summarise(kind, document, base_url, client, max_tokens=512):
         client.complete(build_prompt(kind, c), max_tokens=max_tokens)
         for c in chunks
     ]
+    # The reduce step must cover every chunk summary, so it legitimately needs a
+    # bigger budget than any single map step. Using the same value is how you
+    # get a truncated final answer on a long document.
     return client.complete(
-        build_reduce_prompt(kind, partials), max_tokens=max_tokens)
+        build_reduce_prompt(kind, partials), max_tokens=reduce_max_tokens)
 
 
 def count_chunks(document):

@@ -22,12 +22,17 @@ class FakeClient:
 
     def __init__(self, replies=None, fail_with=None):
         self.prompts = []
+        # Token budget per call. Needed to assert that the reduce step gets a
+        # larger budget than the map step -- using one value for both is how a
+        # long document ends in a truncated final answer.
+        self.budgets = []
         self.replies = replies
         self.fail_with = fail_with
         self.calls = 0
 
     def complete(self, prompt, max_tokens=512):
         self.prompts.append(prompt)
+        self.budgets.append(max_tokens)
         self.calls += 1
         if self.fail_with:
             raise self.fail_with
@@ -198,3 +203,73 @@ def test_empty_completion_fails_the_job_not_the_worker(dbpath):
     assert job["status"] == "failed"
     assert job["result"] is None
     assert "exhausted max_tokens" in job["error"]
+
+
+# --- Truncation: found by the FIRST real end-to-end run, 2026-08-17 -----------
+# Every test above uses FakeClient, so extract_content had never seen a live
+# server's finish_reason. A 512-token request to Qwen3-4B came back cut off
+# mid-sentence and was stored with status='done'.
+
+def test_truncated_content_is_rejected_not_returned():
+    """finish_reason='length' with non-empty text must NOT be a success.
+
+    This is the regression that matters: before the fix this returned the
+    truncated string and the job was marked done.
+    """
+    choice = {
+        "message": {"content": "Recommendations include implementing automated"},
+        "finish_reason": "length",
+    }
+    with pytest.raises(worker.TruncatedCompletion) as e:
+        worker.extract_content(choice, 512)
+    # The message must name the budget and show where it stopped, or an operator
+    # reading an overnight failure cannot act on it.
+    assert "512" in str(e.value)
+    assert "automated" in str(e.value)
+
+
+def test_complete_content_with_stop_is_still_returned():
+    """The guard must not reject normal completions."""
+    choice = {"message": {"content": "a whole summary."}, "finish_reason": "stop"}
+    assert worker.extract_content(choice, 1024) == "a whole summary."
+
+
+def test_inline_think_block_is_stripped():
+    """Some servers put the chain of thought in content, not reasoning_content."""
+    choice = {
+        "message": {"content": "<think>Let me consider the document.</think>The answer."},
+        "finish_reason": "stop",
+    }
+    assert worker.extract_content(choice, 1024) == "The answer."
+
+
+def test_content_that_is_only_thinking_is_rejected():
+    """A response containing nothing but thought has no answer in it.
+
+    This one slips past the F21 empty-content guard, because content is not
+    empty -- it is just entirely useless.
+    """
+    choice = {
+        "message": {"content": "<think>Still thinking about it"},
+        "finish_reason": "stop",
+    }
+    with pytest.raises(worker.EmptyCompletion) as e:
+        worker.extract_content(choice, 1024)
+    assert "think" in str(e.value).lower()
+
+
+def test_reduce_step_gets_a_bigger_budget_than_the_map_step():
+    """The reduce output covers every chunk summary, so it is legitimately longer.
+
+    Using one budget for both is how a long document ends with a truncated final
+    answer even though every chunk succeeded.
+    """
+    assert worker.REDUCE_MAX_TOKENS > worker.MAP_MAX_TOKENS
+
+    client = FakeClient()
+    doc = "word " * 20000                      # forces multiple chunks
+    worker.summarise("summarise", doc, "http://x", client)
+    assert client.calls > 1, "expected a map phase plus a reduce"
+    # Every map call gets the map budget; the final (reduce) call gets more.
+    assert client.budgets[-1] == worker.REDUCE_MAX_TOKENS
+    assert all(b == worker.MAP_MAX_TOKENS for b in client.budgets[:-1])

@@ -1,6 +1,15 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
+# Pins refreshed 2026-08-17. The previous set (fastapi 0.115.6, uvicorn 0.34.0,
+# jinja2 3.1.5, python-multipart 0.0.20, pytest 8.3.4) dated from Dec 2024/Jan
+# 2025 and had never been reviewed -- they came from the original plan, which was
+# written against whatever versions its author knew about, not against what was
+# current. GitHub Dependabot flagged 9 advisories (3 high) on the default branch.
+#
+# This is the web-facing component of a machine that will hold sensitive
+# documents, so stale pins here are not cosmetic. Re-check them whenever
+# Dependabot fires, and re-run `python -m pytest tests/ -v` after any bump.
+fastapi==0.141.1
+uvicorn[standard]==0.52.3
 httpx==0.28.1
-jinja2==3.1.5
-pytest==8.3.4
-python-multipart==0.0.20
+jinja2==3.1.6
+pytest==9.1.1
+python-multipart==0.0.32
