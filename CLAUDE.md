@@ -7,8 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Turning idle organisational hardware into a private LLM cluster, for work that
 legally cannot leave the building.
 
-**Immediate deliverable: the cluster.** A 7-node CPU-only llama.cpp RPC cluster
-doing real work on real sensitive documents.
+**Immediate deliverable: the cluster.** An **N-node** CPU-only llama.cpp cluster
+doing real work on real sensitive documents. N is whatever the organisation has;
+the reference fleet is 7, but **nothing in the design may assume 7.**
 
 **Long-term deliverable: a Claude Skill** that lets an organisation without a
 specialist do the same with whatever hardware it has. The cluster comes first
@@ -72,30 +73,74 @@ about exactly one thing — **a fast, low-latency connection between machines.**
 Do not write security guidance into this project. Do not imply the tooling
 makes a network safe. Point at the requirement and move on.
 
+**Faithfulness is a security property here.** These are legally sensitive
+documents; a fabricated fact in a summary is a failure of the same order as a
+leak. Model selection must weight measured hallucination rate above general
+capability leaderboards. See `docs/MODEL-SELECTION.md`.
+
 ## Why old hardware works at all
 
-Two technical facts carry the whole argument:
+Two technical facts carry the argument, both now measured on real hardware:
 
 1. **Active params, not total params, determine speed.** Bytes read per token
-   ≈ active params × bits-per-weight. Everything else is storage. A 1T-param
+   ≈ active params × bits-per-weight. Everything else is capacity. A 1T-param
    model with 32B active is tractable on system RAM; a 70B dense model is not.
    **This is why sparse MoE models are the enabling technology here** — they
    decouple capability (what you store) from speed (what you read).
-2. **Pooling buys capacity, not speed.** For one request, nodes run
-   sequentially — 7 nodes ≈ 1 node with 7× the RAM. The cluster exists to hold
-   a model no single machine could, not to run it faster.
+2. **Generation is bandwidth-bound, prefill is compute-bound, and they behave
+   completely differently.** Generation runs at ~99% of achievable memory
+   bandwidth for dense models and **~61% for sparse MoE** (scattered expert
+   gathers defeat prefetch). Prefill is limited by cores and ISA. On the
+   reference hardware **prefill is ~79% of document wall-clock**, so it is the
+   thing to optimise.
 
-The honest pitch is therefore not "slow chatbot" but **"a few seats, each slow,
-running something the organisation could not otherwise touch at all."**
+## Scaling: what actually changes as N grows
 
-**Unresolved — do not assert the "few seats" half until measured.** It assumed
-concurrent requests are cheap, which holds for dense models (measured ~5.75×
-throughput from batch 1→32 on CPU) but **probably not for a very sparse MoE.**
-Each token routes to its own experts, so batch B touches ≈ `min(B × top_k,
-n_experts)` experts — bytes read grow roughly in step with tokens produced, and
-throughput stays flat. The sparsity that makes a 550 GB model tractable at batch
-1 is what stops batching helping. Run `llama-batched-bench` at `-np 1,2,4,8`
-before claiming multiple seats anywhere.
+**Do not think in terms of "7 nodes". Think in terms of two numbers.**
+
+- **S — shard group size.** How many nodes are needed to hold one copy of the
+  model: `ceil(model_size / usable_RAM_per_node)`.
+- **R — replication factor.** How many independent copies you can run:
+  `floor(N / S)`.
+
+**Aggregate throughput ≈ R × single-node throughput.** That is the whole
+scaling story, and it makes the design N-agnostic.
+
+| S | What you get | Notes |
+|---|---|---|
+| **S = 1** (model fits one node) | **R = N — linear scaling** | no RPC, no coordination, a node failure costs 1/N |
+| 1 < S < N | R = floor(N/S) copies | RPC within each group; groups independent |
+| **S = N** (model needs everything) | **R = 1 — no parallelism** | the frontier case; capacity, not speed |
+
+**Consequences, measured:**
+
+- **Sharding buys capacity, never speed.** Within a shard group nodes run
+  sequentially, so utilisation is 1/S and RPC adds **−39% prefill / −5%
+  generation**. `S` nodes ≈ 1 node with `S`× the RAM.
+- **Replication buys speed, linearly.** Independent nodes, no RPC overhead, and
+  the document workload is embarrassingly parallel (map-reduce chunks are
+  independent).
+- **So prefer the largest model with S = 1**, and reserve S > 1 for the single
+  frontier model that genuinely cannot fit. **The size threshold at which S goes
+  from 1 to 2 is the most consequential number in model selection** — crossing
+  it costs a factor of N.
+- **Batching is the weak third option.** On sparse MoE it gives only **1.79× at
+  batch 4**, and **collapses at batch 8** (prefill −56%, total throughput below
+  batch 1). Use `--parallel 4`; never 8.
+
+### The 1 → 2 transition is where the risk lives
+
+Almost everything that can go wrong appears when the second node arrives, and
+nothing new appears at the tenth:
+
+- RPC protocol enters the picture at all
+- **Version, libc and ISA lockstep** start to matter (a mismatch is silent until
+  it SIGILLs mid-graph)
+- Upstream bugs triggered by **2+ RPC workers** become possible
+- Duplicate `machine-id` / SSH host keys collide
+
+**Test every one of these at N=2 before growing.** They are cheap to find with
+two machines and expensive to find with ten.
 
 ## Missing Link
 
@@ -107,6 +152,9 @@ It is the centrepiece, not a nice-to-have: it converts "too slow to be useful"
 into "fast enough for this class of work." It is also the prototype for the
 skill's task-profile mechanism — each workload type is a plug-in with its own
 prompts, chunking and evaluation.
+
+**It must fan out across R endpoints, not one.** Under replication the queue's
+job is to keep R independent servers busy. This is the main outstanding change.
 
 **Cloud is not part of the story.** Do not frame local inference as a
 preprocessing step that makes cloud safe, and do not propose hybrid
@@ -141,6 +189,13 @@ uniform:
 `docs/measurements.md`.** A skill that confidently dispenses datasheet
 arithmetic to a non-technical user is worse than no skill.
 
+**The assessment must measure, not ask.** Three numbers decide everything and
+none can be read off a spec sheet:
+
+- **physical cores** (not `nproc` — SMT siblings hurt)
+- **achievable memory bandwidth** (STREAM, not `channels × MT/s × 8`)
+- **free disk on the coordinator** (salvaged machines are RAM-rich, disk-poor)
+
 Direction recorded in `docs/superpowers/specs/2026-08-11-skill-direction.md`.
 **Do not begin implementing it.** One thing to carry into Missing Link now,
 though: keep prompts, chunking and evaluation separable from the queue and
@@ -149,37 +204,51 @@ cheaper to preserve than to retrofit.
 
 ## Where you are running
 
-**You are most likely running on node 1, the cluster master**, with real
-hardware under you and root via sudo. You are the operator, not an advisor —
-run the commands, read the output, record the numbers.
+**You are most likely running on node 1, the coordinator**, with real hardware
+under you and root via sudo. You are the operator, not an advisor — run the
+commands, read the output, record the numbers.
 
-**Read `STATUS.md` first.** It records the current phase, decisions made, open
-questions, and what is in flight. Keep it updated as work proceeds — it is the
-handoff document between sessions, and the next session may be a cold start.
-
-Then follow `docs/superpowers/plans/2026-08-10-cluster-bringup.md` task by task.
-
-Read the spec before proposing any implementation — it records not just what to
-build but which architectures were rejected and why (GPU sharding, Exo,
-prima.cpp, distributed-llama, `dd` cloning). Re-proposing them wastes a cycle.
+**Read `STATUS.md` first, then `docs/FINDINGS.md`.** STATUS records the current
+phase and what is in flight. FINDINGS records what was learned by running this
+on hardware, **including several things the plan and spec got wrong.** Keep both
+updated — they are the handoff between sessions, and the next session may be a
+cold start.
 
 ## Working on this repo
 
-Work happens **on the master node**. Workers are reached over plain SSH on LAN
-IPs. llama.cpp is built once on the master and its binaries distributed
+Work happens **on the coordinator**. Other nodes are reached over plain SSH on
+LAN IPs. llama.cpp is built once on the coordinator and its binaries distributed
 fleet-wide.
 
 Standing constraints when writing anything that touches the cluster:
 
 - **llama.cpp versions must match exactly across all nodes** or the RPC protocol
   mismatches. Never build per-node. Pin to a release tag; do not track `master`.
+- **Never build with `GGML_NATIVE=ON` for a fleet.** It bakes in `-march=native`;
+  an older-CPU node passes the version handshake, loads the model, then SIGILLs
+  mid-graph. Build for a common ISA baseline and assert it in `distribute.sh`.
+- **Binaries must be relocatable.** ggml builds shared libraries and
+  `llama-server` is a stub; the default RPATH points into the build tree. Build
+  with `CMAKE_INSTALL_RPATH='$ORIGIN'`, ship `*.so*`, and assert no binary
+  references the source tree.
+- **The RPC binary is `ggml-rpc-server`**, renamed upstream. Keep a `rpc-server`
+  symlink.
 - **Node provisioning must be idempotent.** Disks vary in size and type across
   the fleet, so the setup path is a Debian preseed plus a re-runnable
   `setup.sh`, not a disk image.
-- **Two memory constraints, both must hold.** Pooled `(RAM − 1 GB/node) × 0.85`,
-  and a hard **per-node ≤75% of physical RAM** (llama.cpp #15055, unfixed —
-  exceeding it aborts at runtime). At 128 GB/node the per-node rule binds first.
-- **`rpc-server -t` defaults to half the cores.** Always set it from `nproc`.
+- **Memory sizing.** Pooled `(RAM − 1 GB/node) × 0.85`, and a per-node working
+  limit of **≤75% of physical RAM**. The 75% figure is a **chosen safety
+  margin**, not a hard limit — it covers page cache, KV growth and llama.cpp's
+  overcommit OOM history (#22629). It is **not** traceable to #15055, which was
+  a syscall-size bug and is fixed. Measure the real ceiling before treating it
+  as binding.
+- **`rpc-server -t` must be set to PHYSICAL cores, not `nproc`.** Measured:
+  `-t 8` is 26% slower than `-t 4` on a 4c/8t CPU. Derive it with
+  `lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l`.
+- **Set `--parallel` explicitly to 4.** Leaving it unset silently means 4 slots;
+  8 is worse than 1.
+- **Keep `--ctx-shift` off** (the default). On, it silently evicts KV and
+  quietly drops the start of the document.
 - **Never pass `--advertise-routes`** to Tailscale — it would pull the RPC hot
   path onto WireGuard. RPC runs on raw LAN IPs.
 
@@ -189,39 +258,48 @@ There is no test suite for the cluster itself — verification is running the
 command and reading the output. Do not report a step as done without having
 seen its output.
 
-Missing Link does have tests: `cd missing-link && python -m pytest tests/ -v`
-(28 tests once Task 12 is complete).
+**A faster build or config that changes output is not a win.** Any performance
+change must be paired with a coherence check on real output before adoption.
 
-## Key decisions already made
+Missing Link does have tests: `cd missing-link && .venv/bin/python -m pytest tests/ -v`
+(41 tests currently passing).
 
-**Hardware: 128 GB DDR4-2400 ECC per node, ~896 GB pooled.** Usable budget is
-**~672 GB**, bound by the per-node 75% rule rather than pooled headroom.
+## Key decisions
 
-**A single node holds 96 GB**, so the cluster is only justified above that. Two
-models, and their comparison is the deliverable:
+**Hardware (node 1, measured 2026-08-17):** Xeon E5-1620 v4, **4 cores / 8
+threads**, no AVX-512, **131.8 GB RAM** (4 × 32 GB DDR4-2400, all four channels
+at rated speed), 477 GB NVMe. **Achievable memory bandwidth 28.2 GB/s** — only
+37% of the quad-channel theoretical maximum, because **4 cores cannot saturate
+their own memory bus.** Not a misconfiguration; uncore and energy-perf-bias are
+already at maximum, so there is no BIOS lever.
 
-- **Model A — gpt-oss-120b (~63 GB, 5.1B active) on ONE node.** The speed
-  reference: what one salvaged desktop does alone.
-- **Model B — Kimi K2 Q4 (~550 GB, 32B active) across SEVEN.** The thesis: a
-  model class the organisation could not otherwise touch.
+Other nodes are **not yet characterised.** Do not assume they match. If a node
+has more cores it will be faster at generation despite identical RAM, and
+`--tensor-split` should then weight by **measured bandwidth**, not RAM.
 
-Other settled decisions:
+Settled:
 
 - **CPU + system RAM only.** GPUs are present for display and unused for
-  compute. Revisit only if measured time-to-first-token proves unbearable, and
-  then for prefill only — prefill is compute-bound, generation is not.
-- **llama.cpp RPC.** Exo rejected on evidence: MLX is now its only engine,
-  Linux CPU is "Planned" tier, zero CPU optimisation commits in 2,353, and no
-  GGUF support. prima.cpp (no MoE) and distributed-llama (all-reduce per layer
-  per token over gigabit) also rejected. See the spec for full reasoning.
+  compute. The Quadro P600's 2 GB cannot hold meaningful layers of any target
+  model, so "GPU for prefill" is not executable with the hardware on hand.
+- **llama.cpp RPC** for sharding, pinned to a release tag. Exo, prima.cpp and
+  distributed-llama rejected — see the spec for the reasoning, and do not
+  re-propose them.
+- **`ik_llama.cpp` for the document workload.** Measured **+52% prefill, −14%
+  generation** versus mainline — a net **+22% end-to-end**, because prefill
+  dominates. Output verified coherent. Keep mainline built alongside; do not mix
+  builds across a shard group.
 - **Debian 12 headless**, scripted provisioning (not `dd` cloning — disks vary).
-- **Tailscale for SSH and the web GUI only.** RPC mesh runs on raw LAN IPs;
-  encryption on the per-token hot path is pure loss, and upstream explicitly
-  warns against exposing RPC to any network.
+- **Tailscale for SSH and the web GUI only.** RPC mesh runs on raw LAN IPs.
 - **Open WebUI** as the chat frontend, lightly skinned.
 - **Map-reduce for long documents**, ~4K chunks with 10% overlap — decided on
-  evidence, not preference. A larger context window does not fix "lost in the
-  middle", and CPU prefill degrades ~58% from 512 to 32K context.
+  evidence. A larger context window does not fix "lost in the middle".
+
+**Model selection is open and is now driven by faithfulness.** The previously
+settled "Model B = Kimi K2" is **under review**: K2-Instruct has the worst
+measured hallucination rate (17.9%) of any model checked, against GLM-4.6 at
+9.5% with identical active params and one third the disk. See
+`docs/MODEL-SELECTION.md` and F25.
 
 ## Conventions
 
@@ -229,19 +307,21 @@ Other settled decisions:
   flag, or configuration, search for how others solved the same problem — GitHub
   issues, forum threads, writeups from people who built the same thing. The
   goal is to find the *specific* fixes and known failure modes, not general
-  background. Much of this work is re-treading paths others have already walked
-  painfully; the point is to not repeat their debugging.
+  background.
 - **Delegate research to Sonnet subagents** rather than running searches inline.
   Ask for conclusions plus source URLs, with CONFIRMED / REPORTED / INFERRED
-  distinguished. Point them at specific repos, issues and files — vague briefs
-  come back with general background instead of the actual fix.
+  distinguished. Point them at specific repos, issues and files.
 - **Run at most ONE Sonnet agent at a time** (up to two Haiku agents are fine).
   Do not fan out unless explicitly asked. Do your own work — spec edits, doc
   updates — while an agent runs, rather than launching another.
 - Leave **15% memory headroom** in all model-fit calculations. Do not spec
   configurations that fit only marginally.
-- Performance claims must come from measurement on the hardware, not
-  arithmetic on datasheets.
+- **Performance claims must come from measurement on the hardware.** If a number
+  is not in `docs/measurements.md`, it may not be quoted. When a cited source is
+  load-bearing, re-read it — two "settled" constraints in this project turned
+  out to be misread issues.
 - **Time-to-first-token is a separate metric from tokens/sec** and matters more
-  for document workloads. Prefill is compute-bound; generation is
-  bandwidth-bound. Always report both.
+  for document workloads. **Do not measure TTFT with `curl -w
+  %{time_starttransfer}`** — it times HTTP headers and under-reports by orders
+  of magnitude. Parse the SSE stream, or read `prompt eval time` from the server
+  log. Vary the prompt between runs or you measure the prompt cache.
