@@ -217,8 +217,18 @@ def summarise(tag, endpoints, wall, results):
     print(f"    prompt tokens       : {prom}")
     print(f"    completion tokens   : {comp}")
     if wall > 0:
-        print(f"    AGGREGATE generation: {comp / wall:.2f} tok/s")
-        print(f"    AGGREGATE prefill   : {prom / wall:.2f} tok/s")
+        # BOTH figures are per TOTAL WALL CLOCK, so each is diluted by the other:
+        # the "generation" rate is divided by a wall time that is mostly prefill,
+        # and vice versa. They are end-to-end fleet throughput numbers and are
+        # NOT comparable to llama-bench's tg128 / pp2048, which isolate one phase
+        # at batch 1. Quoting them as if they were is exactly the class of error
+        # F17 and F28 were caused by.
+        #
+        # What they ARE valid for is the Phase A / Phase B ratio, because both
+        # phases use identical methodology -- and that ratio is the whole point.
+        print(f"    completion tok/s (per total wall clock): {comp / wall:.2f}")
+        print(f"    prompt     tok/s (per total wall clock): {prom / wall:.2f}")
+        print(f"    combined   tok/s (prompt + completion) : {(comp + prom) / wall:.2f}")
     if ok:
         lat = [r.latency for r in ok]
         print(f"    per-request latency : min {min(lat):.1f}s  "
@@ -283,18 +293,27 @@ def main():
         phases.append(summarise(f"PHASE B - {len(endpoints)} endpoints (replicated)",
                                 endpoints, wall, res))
 
-    print("\n=== SCALING ===")
+    print("\n=== SCALING -- the number the architecture rests on ===")
+    print("  Aggregate ~= R x single-node is the claim. Both phases put the SAME")
+    print("  load on each endpoint, so if replication is linear the wall time is")
+    print("  unchanged while the work done doubles.")
     base = phases[0]
     for p in phases[1:]:
+        ideal = p["endpoints"] / base["endpoints"]
+        print(f"\n  {p['endpoints']} endpoints vs {base['endpoints']} "
+              f"(ideal {ideal:.2f}x):")
         if base["gen_tok_s"] > 0:
-            factor = p["gen_tok_s"] / base["gen_tok_s"]
-            ideal = p["endpoints"] / base["endpoints"]
-            print(f"  {p['endpoints']} endpoints vs {base['endpoints']}: "
-                  f"{factor:.2f}x generation (ideal {ideal:.2f}x, "
-                  f"{100 * factor / ideal:.0f}% of linear)")
-            if base["prefill_tok_s"] > 0:
-                pf = p["prefill_tok_s"] / base["prefill_tok_s"]
-                print(f"  {' ' * 18}{pf:.2f}x prefill")
+            f = p["gen_tok_s"] / base["gen_tok_s"]
+            print(f"    completion throughput : {f:.2f}x  "
+                  f"({100 * f / ideal:.0f}% of linear)")
+        if base["prefill_tok_s"] > 0:
+            f = p["prefill_tok_s"] / base["prefill_tok_s"]
+            print(f"    prompt throughput     : {f:.2f}x  "
+                  f"({100 * f / ideal:.0f}% of linear)")
+        if base["wall"] > 0:
+            print(f"    wall time             : {base['wall']:.1f}s -> "
+                  f"{p['wall']:.1f}s  ({p['wall'] / base['wall']:.2f}x "
+                  f"for {ideal:.0f}x the work)")
 
     if sample:
         print("\n=== COHERENCE CHECK (a real completion, verbatim) ===")
