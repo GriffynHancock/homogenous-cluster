@@ -505,3 +505,106 @@ requirements list.
 **Keep the current console.** It is genuinely useful for the operator — submitting
 test jobs, watching the queue, reading results — and that is a different user from
 the eventual end user. **Do not skin it and call it the product.**
+
+---
+
+## G. Fan-out has two granularities, and different tasks want different ones
+
+**Raised by the operator 2026-08-17, and it is the right decomposition.** "I
+imagine you want the whole cluster working on intermediate parts of a summary...
+so some tasks parallelize differently."
+
+There are **two** independent fan-out axes, and the project had been treating
+fan-out as one thing:
+
+| | **Job-level** | **Chunk-level** |
+|---|---|---|
+| Unit distributed | whole documents | one document's chunks |
+| What it buys | **throughput** (docs/night) | **latency** (one doc sooner) |
+| Coordination | none — embarrassingly parallel | a barrier before reduce |
+| Aggregate throughput | **R×** | **1×** (same total work) |
+| Right when | queue depth >= R | queue depth == 1 |
+
+**The key asymmetry: chunk-level fan-out does NOT increase aggregate throughput.**
+It is the same total work spread wider, so it only reduces the wall-clock of one
+document. Job-level fan-out is what multiplies throughput.
+
+So the rule follows from queue depth, not preference:
+
+- **Queue depth >= R** -> job-level. Simplest, no coordination, full R× throughput.
+  This is the overnight-batch case and the common one.
+- **Queue depth == 1** -> chunk-level, or R−1 nodes sit idle. This is the "I threw
+  in one huge PDF and want it tonight" case, which is a real user need and is
+  exactly what happens with a single 40-chunk document today.
+- **Mixed** -> job-level first, then chunk-split whatever is left when nodes go
+  idle. Work-stealing rather than a static plan.
+
+`STATUS.md` task 2 already anticipated half of this ("chunks within one document
+should fan out across endpoints too, not just whole jobs"), but not that the two
+modes optimise **different metrics** and should be selected by queue state.
+
+**The optimisation the operator suspected does exist**, in the reduce step. With
+chunk-level fan-out the reduce is a barrier: it waits for the slowest map. Options,
+none measured here: a **tree reduce** (combine pairs of chunk summaries in
+parallel, log depth instead of one big join) which also sidesteps the reduce
+prompt growing with chunk count; or **streaming reduce**, folding each map result
+in as it lands. Tree reduce is the more interesting one because a 40-chunk reduce
+prompt is itself a long-context prefill, and long-context prefill is what this
+hardware is worst at.
+
+**Do not build either yet.** Job-level fan-out is strictly simpler, delivers the R×
+that the measurement validated, and is what the current queue already almost
+supports (`INFERENCE_ENDPOINTS` exists; `run_forever` needs to become R workers).
+Chunk-level is the second step, and the tree reduce is a third.
+
+---
+
+## H. Does quantisation format change speed on THIS CPU? Almost certainly, and it is unmeasured.
+
+**Asked by the operator 2026-08-17: "maybe different quantisations of a model will
+run better or worse because of this CPU architecture and instruction set?"**
+**Yes — and this is a genuine gap, not a settled question.**
+
+Why it is not simply "smaller = faster":
+
+- **Generation is bandwidth-bound**, so fewer bytes per weight really is faster,
+  roughly linearly. That part is settled (F11, F24).
+- **Prefill is compute-bound**, and quant formats differ enormously in how
+  expensive they are to *dequantise* per weight. Legacy formats (`Q4_0`), K-quants
+  (`Q4_K_M`) and i-quants (`IQ4_XS`) use different unpacking and codebook lookups.
+  **i-quants are widely reported slower on CPU** for exactly this reason.
+- **This CPU has AVX2 and NO AVX-512** (F7). Several quant kernels are tuned
+  hardest for AVX-512, so the ranking on this hardware need not match published
+  benchmarks from newer chips.
+- **`ik_llama.cpp` exists largely to optimise quantised CPU matmuls**, and offers
+  `-rtr` (run-time tensor repacking) plus interleaved layouts. Its +52% prefill
+  (F27) is evidence that the quant/kernel path is where CPU headroom lives — which
+  makes it very likely that quant *choice* also matters, and by a similar order.
+
+**So the two effects can pull in opposite directions:** a smaller quant reads
+fewer bytes (faster generation) but may dequantise more expensively (slower
+prefill). Since **prefill is ~79% of document wall-clock**, a quant that wins on
+generation could still lose overall. Nobody has measured this here.
+
+**The experiment, and it is cheap.** Qwen3-4B is 2.4 GB, so several quants cost
+minutes to fetch and one `llama-bench` run each:
+
+```bash
+# same model, same -t 4, same -p/-n, one row per quant
+llama-bench -m qwen3-4b-Q4_0.gguf   -t 4 -p 512,2048 -n 128 -r 2
+llama-bench -m qwen3-4b-Q4_K_M.gguf -t 4 -p 512,2048 -n 128 -r 2   # have this
+llama-bench -m qwen3-4b-IQ4_XS.gguf -t 4 -p 512,2048 -n 128 -r 2
+llama-bench -m qwen3-4b-Q8_0.gguf   -t 4 -p 512,2048 -n 128 -r 2
+# then repeat the winner under ik_llama.cpp, and with -rtr
+```
+
+**Report pp and tg separately** — a single "tok/s" number would hide the whole
+effect. If the ranking differs between mainline and ik_llama, that is itself the
+finding.
+
+**Operator's stated position, recorded:** *Q8 is the maximum worth holding;
+anything larger is for show.* That is defensible — Q8 is near-lossless on
+published KLD comparisons — and it happens to match what a previous session
+already chose: the in-flight Qwen3-Next-80B download is **UD-Q8_K_XL**. Note it
+also interacts with the S=1 threshold: at Q8 that model is **87 GB**, which fits
+one node with ~12 GB spare. At any larger quant it would not.
