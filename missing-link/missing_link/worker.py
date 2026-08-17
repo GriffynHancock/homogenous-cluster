@@ -28,7 +28,15 @@ WHY MAP-REDUCE, decided on evidence rather than preference:
 import re
 import time
 import json
+import http.client
+import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
+
+# Sibling module, no heavy imports at its top level (pypdf is imported lazily
+# inside its own functions). Named here so classify_failure can treat an
+# unreadable upload as a PERMANENT failure by intent rather than by default.
+from missing_link.extract import ExtractionError
 
 # --- Task profile -----------------------------------------------------------
 # Each kind is a (map prompt, reduce prompt) pair. This dict IS the extension
@@ -444,6 +452,186 @@ class TruncatedCompletion(RuntimeError):
     """
 
 
+# --- Retry policy: transient vs permanent ------------------------------------
+# THE PROBLEM THIS SOLVES. Until now every exception escaping the pipeline took
+# the same exit: run_one's broad `except` -> db.fail_job -> terminal. So the
+# overnight sequence was "the backend dies at 02:00, the watchdog restarts it at
+# 02:05, and nothing happens until morning" -- with, since chunk summaries are
+# now persisted as they complete, a pile of finished work sitting unused in the
+# database. That happened twice in two days (F39, and ik_llama.cpp fatal-erroring
+# in its flash-attention kernel on node 2).
+#
+# THE DANGER OF THE OBVIOUS FIX. A blanket retry is worse than no retry. A
+# document that cannot be chunked, a guidance note that is too long, a 400 from
+# the server: retrying those reproduces them exactly, forever, on a queue nobody
+# is watching. So failures are classified, and ONLY the transient class is
+# retried.
+#
+# TRANSIENT means "the infrastructure moved under a document that was fine":
+# the backend died mid-request, refused the connection, or never answered.
+# PERMANENT means "the input or the request is wrong", and no number of retries
+# will change that.
+#
+# AN UNRECOGNISED EXCEPTION IS PERMANENT. This is the same discipline as
+# reasoning_kwargs_for returning {} for a model it does not know rather than
+# guessing a knob: a mystery error retried all night is worse than one that
+# stops and is visible in the morning. Widening the transient class is a
+# deliberate act, done by naming a type here.
+
+_TRANSIENT_EXCEPTIONS = (
+    # Our own pre-flight probe (F36). The backend is up as a process and
+    # answering TCP, but not answering /health -- wedged, restarting, or
+    # reloading 65 GB of model.
+    BackendUnavailable,
+    # ConnectionResetError / ConnectionRefusedError / ConnectionAbortedError /
+    # BrokenPipeError. http.client.RemoteDisconnected is a ConnectionResetError
+    # too, so this is the class that catches "the server went away mid-request"
+    # -- exactly what destroyed job 06af2911d7fc when the watchdog restarted the
+    # unit under it.
+    ConnectionError,
+    # RemoteDisconnected (again, via BadStatusLine), IncompleteRead,
+    # CannotSendRequest and friends. Every member of this hierarchy is a
+    # transport-level failure of the HTTP conversation, never a statement about
+    # the document.
+    http.client.HTTPException,
+    # socket.timeout is an alias for the builtin TimeoutError on 3.10+. The
+    # request outlived DEFAULT_TIMEOUT_S against a server that may well come
+    # back -- and on this hardware "slow" and "dead" are genuinely hard to tell
+    # apart from the client side (F39), so the benefit of the doubt goes to
+    # retrying, bounded.
+    TimeoutError,
+    # urllib wraps socket-level errors (refused, DNS, unreachable) in URLError.
+    # NOTE: HTTPError is a SUBCLASS of URLError and is decided by status code
+    # in classify_failure BEFORE this tuple is consulted.
+    urllib.error.URLError,
+)
+
+_PERMANENT_EXCEPTIONS = (
+    # F21 and F34. Both are TOKEN-BUDGET failures, and this is the one
+    # classification worth arguing for explicitly, because at first glance they
+    # look retryable -- generation is stochastic, so surely another roll of the
+    # dice might fit?
+    #
+    # No, for three reasons:
+    #   1. A retry re-sends the identical prompt with the identical max_tokens
+    #      to the identical model. The overwhelmingly likely outcome is the
+    #      identical failure, bought at the price of a full prefill -- ~79% of
+    #      document wall-clock on this hardware. Repeating identical work
+    #      identically and hoping is the definition of waste.
+    #   2. The circumstance in which a retry WOULD help is a model change --
+    #      and that is precisely the circumstance in which the persisted chunk
+    #      summaries are discarded (run_one's model check), so the "retry" is a
+    #      full restart of the document anyway. An operator resubmitting after
+    #      changing the model gets that, with full visibility.
+    #   3. These guards exist to make a specific class of silent degradation
+    #      VISIBLE (F21/F34/F38: a plausible-looking result that is worthless).
+    #      Automatically retrying them buries the signal in a retry loop, which
+    #      is the opposite of what they are for.
+    EmptyCompletion,
+    TruncatedCompletion,
+    # Guidance that does not fit alongside a chunk in one slot. Deterministic in
+    # the input; the operator must shorten it.
+    GuidanceTooLong,
+    # "document contains no words" (summarise_traced), and the chunking config
+    # guard in chunk_spans. Both are statements about the input.
+    ValueError,
+    # An upload that could not be turned into text. Normally raised at submit
+    # time, before a job exists, but named here so that if it ever reaches the
+    # worker it is classified by intent rather than by the default.
+    ExtractionError,
+)
+
+# Total STARTS allowed per job, counted by db.claim_next_pending. 4 means the
+# original attempt plus three retries. The bound matters more than its exact
+# value: it is what stops a permanently-broken backend turning the queue into a
+# log-filling retry loop, and what guarantees the operator eventually sees a
+# terminal state with an explanation rather than a job that has been "about to
+# work" all night.
+MAX_ATTEMPTS = 4
+
+# Backoff between retries, doubling and capped: 60s, 120s, 240s. Deliberately
+# not longer, because the PRIMARY defence against spinning is elsewhere and is
+# stronger -- app._worker_loop probes /health before claiming anything, so
+# while the backend is actually down no attempt is consumed at all; the job
+# simply is not claimed. This backoff covers the nastier case the health probe
+# cannot see: a server that answers /health and then fails every completion.
+RETRY_BACKOFF_BASE_S = 60
+RETRY_BACKOFF_CAP_S = 600
+
+
+def classify_failure(exc):
+    """"transient" (worth retrying) or "permanent" (never). Unknown -> permanent."""
+    if isinstance(exc, urllib.error.HTTPError):
+        # 5xx is the server failing at its job; 429 is it asking us to wait.
+        # Everything else in the 4xx range -- a 400 from a malformed request, a
+        # 404 from a wrong path -- is our request being wrong, and will be
+        # exactly as wrong next time.
+        return "transient" if (exc.code >= 500 or exc.code == 429) else "permanent"
+    if isinstance(exc, _PERMANENT_EXCEPTIONS):
+        return "permanent"
+    if isinstance(exc, _TRANSIENT_EXCEPTIONS):
+        return "transient"
+    return "permanent"
+
+
+def is_recognised_failure(exc):
+    """True when classify_failure matched a NAMED type rather than defaulting.
+
+    Kept separate from the classification itself so the operator-facing message
+    can distinguish "we know what this is and it is not worth retrying" from
+    "we have never seen this before, so we stopped rather than looping on it".
+    Those are different things to read at 8am and they warrant different next
+    steps.
+    """
+    return isinstance(exc, (urllib.error.HTTPError,)
+                      + _PERMANENT_EXCEPTIONS + _TRANSIENT_EXCEPTIONS)
+
+
+def retry_delay_seconds(attempts_so_far):
+    """Seconds to wait before attempt `attempts_so_far` + 1. Doubling, capped."""
+    n = max(1, int(attempts_so_far))
+    return min(RETRY_BACKOFF_CAP_S, RETRY_BACKOFF_BASE_S * (2 ** (n - 1)))
+
+
+def retry_error_message(exc, attempts, delay_s, chunks_done):
+    """What the job page shows while a job is waiting to be retried."""
+    kept = (f" The {chunks_done} chunk summar"
+            f"{'y' if chunks_done == 1 else 'ies'} already completed are kept "
+            f"and will be reused, so the retry resumes rather than restarts."
+            if chunks_done else "")
+    return (f"attempt {attempts} of {MAX_ATTEMPTS} failed and will be retried in "
+            f"{delay_s}s. The inference backend went away -- this is not a problem "
+            f"with the document.{kept} Last error: {type(exc).__name__}: {exc}")
+
+
+def final_error_message(exc, attempts, chunks_done, endpoint, retried):
+    """What the job page shows once a job has failed FOR GOOD.
+
+    The distinction this has to carry, at 8am, to somebody who was asleep for
+    all of it: "your document is bad" versus "the cluster was broken all
+    night". Those need different actions from the operator, and a bare
+    "TypeError: ..." tells them neither.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    kept = (f" The {chunks_done} chunk summar"
+            f"{'y' if chunks_done == 1 else 'ies'} completed before the last "
+            f"failure are kept on disk and would be reused by a further attempt."
+            if chunks_done else "")
+    if retried:
+        return (f"FAILED AFTER {attempts} ATTEMPTS. Every attempt ended with the "
+                f"inference backend unreachable or dying mid-document, so this is "
+                f"a CLUSTER problem, not a problem with this document -- check "
+                f"llama-server on {endpoint or 'the endpoint that ran it'} before "
+                f"resubmitting.{kept} Last error: {detail}")
+    if is_recognised_failure(exc):
+        return (f"{detail} -- NOT RETRIED: this is a problem with the document or "
+                f"the request, and retrying it would reproduce it exactly.{kept}")
+    return (f"{detail} -- NOT RETRIED: this failure is not one Missing Link "
+            f"recognises, so it was stopped rather than looped on. An unknown "
+            f"error retried all night is worse than one that stops and is "
+            f"visible.{kept}")
+
+
 def extract_content(choice, max_tokens):
     """Pull the answer out of a chat completion, refusing to return nothing.
 
@@ -599,6 +787,15 @@ def run_one(db_path, base_url, client=None, on_claim=None):
     resumes from them instead of redoing that work -- safe because map outputs
     are independent (chunk N's summary does not depend on chunk M's), PROVIDED
     the same model produced them (see the model check below).
+
+    RETRIES. Resumability only pays off if something actually resumes. Nothing
+    did: every failure went to db.fail_job and stayed there, so a backend that
+    died at 02:00 left a terminal job and a pile of completed chunk summaries
+    that no watchdog restart could ever pick up. A TRANSIENT failure (see
+    classify_failure) now returns the job to 'pending' with a backoff, up to
+    MAX_ATTEMPTS starts in total; a PERMANENT one still fails immediately. A
+    retried job then takes the resume path above, so the retry costs only the
+    chunks that were still outstanding.
     """
     from missing_link import db
 
@@ -692,6 +889,14 @@ def run_one(db_path, base_url, client=None, on_claim=None):
             else:
                 db.delete_chunk_summaries(db_path, job["id"])
 
+        # Recorded EXPLICITLY every attempt, including as 0, so the job page can
+        # state whether this attempt resumed or restarted rather than inferring
+        # it from the presence of chunk rows -- which would be wrong exactly
+        # when it matters, since the branch above DELETES those rows when the
+        # resume is rejected. This is the number that says whether retrying was
+        # worth doing at all.
+        db.record_resume(db_path, job["id"], len(resume_records or ()))
+
         if _should_stop():
             raise JobCancelled("stop requested before any work began")
 
@@ -735,13 +940,46 @@ def run_one(db_path, base_url, client=None, on_claim=None):
     except Exception as exc:  # noqa: BLE001 -- a failed job must not kill the worker
         # Record and move on. One bad document must not stall every job behind
         # it in a queue whose jobs take hours.
-        db.fail_job(db_path, job["id"], f"{type(exc).__name__}: {exc}")
+        #
+        # BUT: "record and move on" used to mean TERMINAL, for every failure
+        # equally -- so a backend that died at 02:00 and was restarted by the
+        # watchdog at 02:05 left a failed job and a pile of completed chunk
+        # summaries that nothing would ever pick up again. Transient failures
+        # are now returned to the queue, bounded and backed off; permanent ones
+        # still fail immediately, because retrying them is pure waste and, on an
+        # unattended queue, an infinite loop. See classify_failure.
+        attempts = int(job.get("attempts") or 1)
+        done_chunks = completed_chunks[0]
+        if classify_failure(exc) == "transient" and attempts < MAX_ATTEMPTS:
+            delay = retry_delay_seconds(attempts)
+            db.schedule_retry(
+                db_path, job["id"],
+                retry_error_message(exc, attempts, delay, done_chunks),
+                _retry_at(delay))
+            # No notify_completion: this job has NOT reached a terminal state,
+            # and notify_completion's contract (see its docstring) is that it
+            # fires once, on done/failed/cancelled. Firing it here would email
+            # the operator about a job that is about to run again.
+            return True
+        db.fail_job(db_path, job["id"], final_error_message(
+            exc, attempts, done_chunks, job.get("endpoint") or base_url,
+            retried=attempts > 1))
 
     # Part 3: documented hook point for a future notification integration.
     # Deliberately fired here, after the terminal status is committed, so a
     # future webhook/email body can be built from the job's final state.
     notify_completion(db.get_job(db_path, job["id"]))
     return True
+
+
+def _retry_at(delay_s):
+    """ISO-8601 UTC timestamp `delay_s` in the future, for db.schedule_retry.
+
+    Same format as db._now() writes, because claim_next_pending compares the
+    two as STRINGS -- which is sound only while both are UTC-aware isoformat
+    output (identical width, identical '+00:00' suffix).
+    """
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay_s)).isoformat()
 
 
 def notify_completion(job):

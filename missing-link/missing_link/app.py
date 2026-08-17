@@ -382,6 +382,22 @@ def _progress_payload(job, chunks_done=None):
         "endpoint": job.get("endpoint"),
         "error": job.get("error"),
         "cancel_requested": bool(job.get("cancel_requested")),
+        # RETRY STATE. A retried job must be visibly a retried job: "attempt 3
+        # of 4, resumed from 22 of 26 chunks" is the difference between an
+        # operator seeing a queue that healed itself overnight and one seeing a
+        # job that mysteriously took three times as long. `attempts` counts
+        # STARTS (db.claim_next_pending), so it is 0 for a job that has never
+        # been claimed and 1 during an ordinary first run.
+        "attempts": int(job.get("attempts") or 0),
+        "max_attempts": worker.MAX_ATTEMPTS,
+        # Set only while a job is waiting out its backoff; also the flag that
+        # says "this pending job is a retry, not a fresh submission".
+        "retry_after": job.get("retry_after"),
+        # How many chunk summaries THIS attempt reused rather than recomputed.
+        # Deliberately not inferred from chunks_done: the resume is rejected
+        # (and the rows deleted) when the model or the instruction changed, so
+        # only the worker knows, and it records it. See db.record_resume.
+        "resumed_chunks": int(job.get("resumed_chunks") or 0),
     }
 
 

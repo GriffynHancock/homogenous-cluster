@@ -28,6 +28,20 @@
       (<span id="lp-chunks">{{ progress.chunks_done }}</span> done)
       {%- if progress.endpoint %} — running on <code>{{ progress.endpoint }}</code>{% endif %}
     </p>
+    {% if progress.attempts > 1 %}
+    <p style="margin:.1rem 0;font-size:.85rem">
+      <strong>Attempt {{ progress.attempts }} of {{ progress.max_attempts }}.</strong>
+      {%- if progress.resumed_chunks %} Resumed — {{ progress.resumed_chunks }} of
+      {{ progress.chunks_expected }} chunk{{ "s" if progress.chunks_expected != 1 }}
+      were already summarised by an earlier attempt and are being reused, so only the
+      remaining {{ progress.chunks_expected - progress.resumed_chunks }} are being sent
+      to the model.
+      {%- else %} Restarted from the beginning: the earlier attempt's chunk summaries
+      could not be reused (the model or the guidance changed since they were written),
+      and mixing summaries from two different models is not safe.
+      {%- endif %}
+    </p>
+    {% endif %}
     <p style="margin:.1rem 0;color:var(--mut);font-size:.85rem">
       Elapsed: <span id="lp-elapsed">{{ "%.0fs"|format(progress.elapsed_s) if progress.elapsed_s is not none else "—" }}</span>
       {%- if progress.eta_human %} · ETA: <span id="lp-eta">{{ progress.eta_human }}</span>
@@ -46,8 +60,30 @@
     <p style="margin:.3rem 0 0;font-size:.78rem"><a href="/jobs/{{ job.id }}/progress">progress as JSON</a></p>
   </div>
   {% elif job.status == "pending" %}
+  {% if progress.retry_after %}
+  <!-- A pending job that has already been started at least once. Without this
+       box the most alarming state in the system -- the inference backend died
+       mid-document -- would look exactly like a job that has simply never run. -->
+  <div style="border:1px solid var(--line);border-radius:8px;padding:.8rem 1rem;
+       margin:.6rem 0 1.1rem">
+    <p style="margin:.1rem 0"><strong>Waiting to retry —
+      attempt {{ progress.attempts }} of {{ progress.max_attempts }} failed.</strong></p>
+    <p style="margin:.2rem 0;color:var(--mut);font-size:.85rem">
+      The next attempt starts after {{ progress.retry_after[:19].replace("T"," ") }} UTC,
+      as soon as an inference endpoint is answering. Nothing is lost in the meantime:
+      {% if progress.chunks_done %}the {{ progress.chunks_done }} chunk
+      summar{{ "y" if progress.chunks_done == 1 else "ies" }} already completed
+      {{ "is" if progress.chunks_done == 1 else "are" }} kept, and the retry will
+      resume from {{ "it" if progress.chunks_done == 1 else "them" }} rather than
+      restarting the document.{% else %}no chunks had completed yet, so the retry
+      starts from the beginning.{% endif %}
+    </p>
+    <pre style="margin:.4rem 0 0;font-size:.8rem">{{ job.error }}</pre>
+  </div>
+  {% else %}
   <p style="color:var(--mut);font-size:.85rem">Queued — will split into about
   {{ progress.chunks_expected }} chunk{{ "s" if progress.chunks_expected != 1 }} once it starts.</p>
+  {% endif %}
   {% endif %}
 
   {% if estimate %}
@@ -94,7 +130,8 @@
 {% if job.status == "failed" %}
   <div style="border:1px solid #c0392b;border-radius:8px;padding:.9rem 1.1rem;
        margin:.6rem 0 1.2rem;background:color-mix(in srgb, #c0392b 8%, transparent)">
-    <h3 style="margin:.1rem 0;color:#c0392b">This job failed</h3>
+    <h3 style="margin:.1rem 0;color:#c0392b">This job failed{% if progress.attempts > 1 %}
+      after {{ progress.attempts }} attempts{% endif %}</h3>
     <p style="margin:.2rem 0;color:var(--mut);font-size:.85rem">
       Got through {{ progress.chunks_done }} of {{ progress.chunks_expected }}
       chunk{{ "s" if progress.chunks_expected != 1 }} before failing
