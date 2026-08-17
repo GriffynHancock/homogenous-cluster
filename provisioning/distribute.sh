@@ -13,8 +13,29 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 source provisioning/nodes.env
 
-SRC=/opt/llama.cpp
-VERSION=$(cat "$SRC/VERSION")
+# Which engine prefix to ship. Both /opt/llama.cpp (mainline) and
+# /opt/ik_llama.cpp (the fork, +52% prefill per F27) are built side by side and
+# must BOTH reach every node under the replicated topology -- the fork was on the
+# coordinator only until 2026-08-17, so a "distributed" fleet could not actually
+# run the build the document workload is supposed to use.
+#
+#   ./provisioning/distribute.sh                     # mainline (default)
+#   ./provisioning/distribute.sh /opt/ik_llama.cpp   # the fork
+#
+# NEVER mix engines within one RPC shard group -- the protocols differ. Under
+# replication the nodes are independent, so having both installed is safe.
+SRC="${1:-/opt/llama.cpp}"
+[ -d "$SRC/bin" ] || { echo "FATAL: no such engine prefix: $SRC/bin" >&2; exit 1; }
+
+# ik_llama.cpp is a fork with no upstream b-tag, so it ships a COMMIT but no
+# VERSION. Synthesise one rather than failing: the assertion that matters is
+# that master and worker agree, not that the string looks like a release tag.
+if [ -f "$SRC/VERSION" ]; then
+  VERSION=$(cat "$SRC/VERSION")
+else
+  VERSION="$(basename "$SRC")-$(cut -d' ' -f1 "$SRC/COMMIT" 2>/dev/null || echo unknown)"
+  echo "  no VERSION in $SRC -- using derived '$VERSION'"
+fi
 COMMIT=$(cat "$SRC/COMMIT" 2>/dev/null || echo unknown)
 MASTER_LIBC=$(apt-cache policy libc6 | awk '/Installed:/{print $2}')
 
@@ -64,7 +85,10 @@ for entry in "${NODES[@]:1}"; do
   # compatibility symlink.
   ssh "$IP" "mkdir -p $SRC/bin"
   rsync -az --delete "$SRC/bin/" "$IP:$SRC/bin/"
-  scp -q "$SRC/VERSION" "$SRC/COMMIT" "$IP:$SRC/"
+  # Write VERSION from the (possibly derived) value rather than copying a file
+  # that may not exist. COMMIT is copied when present.
+  ssh "$IP" "printf '%s\n' '$VERSION' | sudo -n tee $SRC/VERSION >/dev/null 2>&1 || printf '%s\n' '$VERSION' > $SRC/VERSION"
+  [ -f "$SRC/COMMIT" ] && scp -q "$SRC/COMMIT" "$IP:$SRC/"
 
   REMOTE_VERSION=$(ssh "$IP" "cat $SRC/VERSION")
   if [ "$REMOTE_VERSION" != "$VERSION" ]; then

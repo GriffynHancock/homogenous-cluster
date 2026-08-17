@@ -36,10 +36,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Starting local rpc-server (node 1) on 127.0.0.1:$RPC_PORT ==="
-"$BIN/rpc-server" -H 127.0.0.1 -p "$RPC_PORT" -t "$CORES" -c \
-  >/tmp/smoke-local-rpc.log 2>&1 &
-LOCAL_RPC=$!
+# This script predates cluster/install-services.sh, which now runs
+# rpc-server@50052 under systemd on EVERY node including the coordinator.
+# Starting a second one here would fail to bind (systemd holds 0.0.0.0:50052,
+# which already covers 127.0.0.1) and the test would then silently proceed
+# against the systemd instance anyway -- passing for reasons other than the ones
+# printed. Detect and reuse instead.
+if timeout 3 bash -c "cat < /dev/null > /dev/tcp/127.0.0.1/$RPC_PORT" 2>/dev/null; then
+  echo "=== Reusing the rpc-server already listening on 127.0.0.1:$RPC_PORT ==="
+  echo "    (systemd rpc-server@$RPC_PORT -- not starting a second instance)"
+  : > /tmp/smoke-local-rpc.log
+else
+  echo "=== Starting local rpc-server (node 1) on 127.0.0.1:$RPC_PORT ==="
+  "$BIN/rpc-server" -H 127.0.0.1 -p "$RPC_PORT" -t "$CORES" -c \
+    >/tmp/smoke-local-rpc.log 2>&1 &
+  LOCAL_RPC=$!
+fi
 
 echo "=== Checking worker $WORKER_IP:$RPC_PORT ==="
 if ! timeout 5 bash -c "cat < /dev/null > /dev/tcp/$WORKER_IP/$RPC_PORT" 2>/dev/null; then
@@ -104,14 +116,46 @@ grep -iE 'assigned|RPC\[|buffer size|offloaded' "$LOG" | head -20
 
 echo
 echo "=== Generating (the real test -- graph compute across both nodes) ==="
-REPLY=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
+# Two F21 defences, both learned the hard way -- this test reported FAIL on
+# 2026-08-17 while the cluster was working perfectly:
+#   1. enable_thinking=false. Qwen3 and relatives emit chain-of-thought into a
+#      SEPARATE reasoning_content field. With thinking on, a modest max_tokens is
+#      spent thinking and "content" comes back as an EMPTY STRING on a 200 OK.
+#   2. A generous max_tokens, so a model that ignores (1) still reaches an answer.
+RESP=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"In two sentences, explain why an organisation with sensitive records might run an AI model on its own hardware."}],"max_tokens":150}' \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])' 2>/dev/null)
+  -d '{"messages":[{"role":"user","content":"In two sentences, explain why an organisation with sensitive records might run an AI model on its own hardware."}],
+       "max_tokens":400,
+       "chat_template_kwargs":{"enable_thinking":false}}')
+
+# Distinguish "the cluster is broken" from "the model answered into a different
+# field". Conflating them makes a PASSING cluster look like a FAILING one.
+REPLY=$(printf '%s' "$RESP" | python3 -c '
+import json, sys
+try:
+    m = json.load(sys.stdin)["choices"][0]["message"]
+except Exception:
+    sys.exit(0)
+c = (m.get("content") or "").strip()
+if c:
+    print(c)
+elif (m.get("reasoning_content") or "").strip():
+    sys.stderr.write("EMPTY content but reasoning_content IS populated -- F21.\n"
+                     "The cluster generated fine; the token budget was spent thinking.\n")
+' 2>/tmp/smoke-extract.err)
 
 if [ -z "$REPLY" ]; then
   echo "FAIL: no usable response."
-  grep -iE 'invalid data ptr|error|abort|crash' "$LOG" | tail -20
+  [ -s /tmp/smoke-extract.err ] && { echo "--- extraction diagnostic ---"; cat /tmp/smoke-extract.err; }
+  # Only a graph-compute abort indicts the CLUSTER. Say which it was.
+  if grep -qiE 'invalid data ptr|abort|SIGILL|malformed' "$LOG"; then
+    echo "--- cluster-level error found in the server log ---"
+    grep -iE 'invalid data ptr|abort|SIGILL|malformed' "$LOG" | tail -20
+  else
+    echo "--- NO cluster-level error in the server log. Generation itself: ---"
+    grep -E 'prompt eval time|eval time|n_decoded' "$LOG" | tail -3
+    echo "    => RPC sharding worked; this is a response-parsing failure, not #26500."
+  fi
   exit 1
 fi
 

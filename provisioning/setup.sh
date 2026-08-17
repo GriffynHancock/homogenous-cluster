@@ -22,6 +22,18 @@ if ! grep -q "^127.0.1.1[[:space:]]*$NEW_HOSTNAME\$" /etc/hosts; then
   echo "127.0.1.1 $NEW_HOSTNAME" >> /etc/hosts
 fi
 
+log "Timezone"
+# Node 2 arrived on US/Eastern while node 1 was on Australia/Melbourne. The
+# CLOCKS agreed (both NTP-synced, identical UTC) but journalctl on the two nodes
+# read 14 hours apart, which makes cross-node log correlation actively
+# misleading during a failure. Align to the coordinator's zone; override with
+# CLUSTER_TZ if the fleet is elsewhere.
+CLUSTER_TZ="${CLUSTER_TZ:-Australia/Melbourne}"
+if [ "$(timedatectl show -p Timezone --value)" != "$CLUSTER_TZ" ]; then
+  timedatectl set-timezone "$CLUSTER_TZ"
+fi
+echo "    $(timedatectl show -p Timezone --value), NTP $(timedatectl show -p NTPSynchronized --value)"
+
 log "Identity hygiene"
 # machine-id: systemd-networkd derives its DHCP client-ID from this. Duplicates
 # across the fleet make nodes collide on a single lease, which presents as
@@ -40,7 +52,38 @@ if [ ! -f /etc/ssh/.hostkeys.provisioned ]; then
   ssh-keygen -A
   systemctl restart ssh
   touch /etc/ssh/.hostkeys.provisioned
+  # This INVALIDATES the coordinator's known_hosts entry for this node. Every
+  # later script (distribute.sh, install-services.sh, two-node-smoke.sh) uses
+  # plain ssh, so the next one to run aborts with "REMOTE HOST IDENTIFICATION
+  # HAS CHANGED" -- which reads as an attack, not as a provisioning step.
+  # Observed on node 2, 2026-08-17.
+  cat <<'WARN'
+
+    !! HOST KEYS REGENERATED. On the COORDINATOR, run:
+    !!     ssh-keygen -R <this-node-ip>
+    !!     ssh -o StrictHostKeyChecking=accept-new <user>@<this-node-ip> true
+    !! Otherwise the next script fails with a host-key mismatch warning.
+
+WARN
 fi
+
+log "Service account"
+# The rpc-server unit declares User=cluster. Nothing created it until
+# 2026-08-17, so install-services.sh would 'enable --now' a unit that dies
+# instantly with status=217/USER -- and the failure is on the WORKER, i.e.
+# found only after committing the hardware. A system account: no login shell,
+# no password, separate from the admin/SSH account.
+if ! id cluster >/dev/null 2>&1; then
+  useradd --system --create-home --home-dir /var/lib/cluster \
+          --shell /usr/sbin/nologin cluster
+fi
+# rpc-server -c writes tensors >=10 MiB here. Set it EXPLICITLY rather than
+# letting it default to $HOME/.cache: on a large MoE this approaches the node's
+# full layer share (F23), and a silent fill of / is the failure mode.
+mkdir -p /var/lib/cluster/.cache/llama.cpp/rpc
+chown -R cluster:cluster /var/lib/cluster
+echo "    cluster uid $(id -u cluster), cache /var/lib/cluster/.cache/llama.cpp/rpc"
+echo "    free on that filesystem: $(df -h --output=avail /var/lib/cluster | tail -1 | tr -d ' ')"
 
 log "Packages"
 apt-get update -qq
@@ -90,9 +133,25 @@ echo "    RAM MB         : $(free -m | awk '/^Mem:/{print $2}')"
 echo "    NUMA nodes     : $(lscpu | awk -F: '/NUMA node\(s\)/{gsub(/ /,"",$2);print $2}')"
 echo "    ISA            : $(grep -oE 'avx512[a-z_]*|avx2|fma|f16c' /proc/cpuinfo | sort -u | tr '\n' ' ')"
 echo "    populated DIMM slots:"
-dmidecode -t memory 2>/dev/null \
-  | awk '/Locator:/{loc=$0} /^\tSize:.*[0-9]+ *[MG]B/{print "      " loc " -> " $2 $3}' \
-  | grep -v 'Bank' || echo "      (dmidecode unavailable)"
+# dmidecode prints Size BEFORE Locator within each Memory Device block, so the
+# obvious one-liner (stash Locator, print on Size) reports the PREVIOUS block's
+# label -- and "Bank Locator" matches /Locator:/ too, so filtering 'Bank'
+# afterwards discarded all but one row. The result was a single line with an
+# empty label: the exact fact F12 says decides generation speed, silently blank.
+# Print once per block, keyed off Configured Memory Speed (the last field of
+# interest), so locator, size and ACTUAL clocked speed line up.
+dmidecode -t memory 2>/dev/null | awk '
+  /^[[:space:]]*Size:/                    { size = $2 " " $3 }
+  /^[[:space:]]*Locator:/ && !/Bank/      { loc  = $2 }
+  /^[[:space:]]*Configured Memory Speed:/ {
+      if (loc != "" && size !~ /No/) {
+        printf "      %-10s %-8s @ %s %s\n", loc, size, $4, $5
+        n++
+      }
+      loc = ""; size = ""
+  }
+  END { if (n == 0) print "      (no populated DIMMs parsed -- check dmidecode)" }
+' || echo "      (dmidecode unavailable)"
 cat <<EOF
     NOTE: memory CHANNELS, not capacity, set generation speed. Half-populated
     boards silently halve throughput. If the Locator labels show DIMMs in only
