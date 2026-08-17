@@ -44,10 +44,16 @@ fi
 
 log "Packages"
 apt-get update -qq
+# openssh-server: the preseed installs it, but a HAND-INSTALLED node may not
+# have it -- that is how node 2 arrived with no sshd. Assert it here so the
+# path is the same however the node was built. (Chicken-and-egg noted: if you
+# are running this over SSH it is obviously already up; this covers the local
+# and re-run cases, and makes the service state explicit.)
 # dmidecode is NOT in the Debian 12 base install and is required to read DIMM
 # layout -- which is what actually determines generation speed (F12).
-apt-get install -y -qq curl rsync git jq python3 python3-venv ca-certificates \
-                      dmidecode pciutils lm-sensors
+apt-get install -y -qq openssh-server curl rsync git jq python3 python3-venv \
+                      ca-certificates dmidecode pciutils lm-sensors
+systemctl enable --now ssh
 
 log "Disable swap"
 # Models are sized to fit RAM. Any overshoot into swap collapses throughput;

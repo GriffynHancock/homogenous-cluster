@@ -8,3 +8,8 @@ eval/dataset.json
 eval/results.json
 provisioning/*.key
 provisioning/tskey*
+
+# Site-specific deployment detail: IPs, hostnames, physical layout.
+# Operationally necessary on the coordinator, but not part of the published
+# project. Every agent should READ it; nobody should commit it.
+network.md

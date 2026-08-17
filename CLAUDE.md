@@ -8,6 +8,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 > wrong. In a long session, or whenever a claim here matters, **re-read
 > `CLAUDE.md` from disk** and treat `docs/FINDINGS.md` as outranking both.
 
+
+## File index — read in this order
+
+| File | What it is | Authority |
+|---|---|---|
+| `STATUS.md` | **Start here.** Current state, next tasks in order, blockers | current |
+| `docs/FINDINGS.md` | What running this on hardware taught us, incl. what the plan got **wrong** | **outranks everything below** |
+| `docs/measurements.md` | Every measured number. **No performance claim may be quoted from anywhere else** | authoritative for numbers |
+| `network.md` | **Gitignored, site-specific.** IPs, node roles, ports, access. Read it; never commit it | current |
+| `CLAUDE.md` | This file — the argument, conventions, standing constraints | see staleness note above |
+| `docs/MODEL-SELECTION.md` | Which model to run and why; criteria derived from measurement | current |
+| `docs/DESIGN-NOTES.md` | Analysed-but-not-built ideas, with numbers (expert parallelism, speculative decoding, replication) | current |
+| `docs/UPSTREAM-PATCHES.md` | Corrections still to fold back into the plan and spec | current |
+| `provisioning/` | `join-node.sh`, `setup.sh`, `distribute.sh`, `harden-ssh.sh`, `build-*.sh`, `nodes.env`, `preseed.cfg` | — |
+| `cluster/` | `models.json` + `models.sh` (model index), `install-services.sh`, `rpc-server@.service` | — |
+| `bench/` | `overhead-test.sh`, `node-bench.sh`, `two-node-smoke.sh` | — |
+| `missing-link/` | The async job runner. Tests: `.venv/bin/python -m pytest tests/ -v` | — |
+| `docs/superpowers/specs/` | Original design; which alternatives were rejected and why | **partly stale** |
+| `docs/superpowers/plans/` | Original task-by-task plan | **stale — superseded by FINDINGS** |
+
+
 ## Homogenous Cluster
 
 Turning idle organisational hardware into a private LLM cluster, for work that
@@ -21,6 +42,41 @@ the reference fleet is 7, but **nothing in the design may assume 7.**
 specialist do the same with whatever hardware it has. The cluster comes first
 because the skill must dispense *measured* advice, not arithmetic. Do not start
 building the skill until the cluster has produced numbers.
+
+
+## North star: find the optimum first, then standardise backwards
+
+**This fleet is a test environment, not a production deployment.** The goal is
+not to stand up a cluster quickly — it is to **find the configuration that
+actually works best on hardware like this, and only then work backwards into a
+consistent, repeatable setup.**
+
+That ordering has consequences for how work is done here:
+
+- **Measure before standardising.** A setting that is merely plausible does not
+  go into `setup.sh`. It goes into a benchmark first. Half the "settled"
+  decisions in the original plan turned out to be wrong precisely because they
+  were standardised before they were measured.
+- **Expect to throw configurations away.** Building both `llama.cpp` and
+  `ik_llama.cpp`, or holding two candidate models on disk, is not waste — it is
+  the experiment. Keep alternatives installed side by side and A/B them on the
+  same hardware.
+- **Prefer reversible changes.** Separate prefixes, drop-in config files,
+  additive manifests. If a change cannot be undone by deleting one file, ask
+  whether it belongs yet.
+- **Nodes may legitimately differ during this phase.** Divergence is a
+  measurement opportunity — a node with more cores tells us something about how
+  bandwidth scales. **Consistency is the deliverable at the end, not a
+  constraint at the start.** The one exception is llama.cpp build version and
+  ISA, which must match within any RPC shard group or it fails obscurely.
+- **The output of this phase is a justified configuration**, where every setting
+  traces to a measurement. That is what the skill later generates for other
+  people's hardware, and it is why unmeasured advice would make the skill worse
+  than nothing.
+
+So: when a choice is open, **run the experiment rather than picking a default**,
+and record the result in `docs/measurements.md`.
+
 
 ## The argument
 

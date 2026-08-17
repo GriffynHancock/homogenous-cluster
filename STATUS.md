@@ -16,7 +16,10 @@ Missing Link built through Task 12 (41 tests passing). **Node 2 not yet joined.*
    from.
 3. `docs/UPSTREAM-PATCHES.md` lists the concrete corrections still to fold back
    into the plan and spec.
-4. **You are the operator.** Run the commands, read the output, record the
+4. **`network.md`** (gitignored) has the IPs, node roles and ports for THIS
+   deployment. Read it; never commit it. `CLAUDE.md` opens with a full file
+   index.
+5. **You are the operator.** Run the commands, read the output, record the
    numbers. Never report a step done without having seen its output.
 
 **Everything is built and working on node 1.** llama.cpp b10369 at
@@ -32,10 +35,12 @@ Missing Link built through Task 12 (41 tests passing). **Node 2 not yet joined.*
 **The 1 → 2 transition is where all the risk lives.** Everything that can go
 wrong across a fleet appears at N=2 and nothing new appears at N=10.
 
-Node 2 has Debian installed and is being put on the switch. What it needs is in
-"Joining a node" below.
+**Node 2 is at `10.10.0.39`** (see `network.md` — gitignored, site-specific).
+Debian and `sshd` are up. It has the same admin password as node 1; install the
+coordinator's key, then harden to key-only.
 
-Once it is reachable:
+Note an earlier ARP sweep saw `10.10.0.35` answering — **that is something else
+on the DMZ, not node 2.**
 
 ```bash
 # 1. Characterise it -- do NOT assume it matches node 1
