@@ -356,6 +356,52 @@ Disk — not RAM — is the binding constraint (F16). A drive is being added
 2026-08-17 week. Interim single-node target: **Qwen3-Next-80B-A3B UD-Q8_K_XL,
 93 GB, 3B active.**
 
+## Batching on sparse MoE — the "few seats" question, answered
+
+**Date:** 2026-08-17 | **Node:** node1 | **Model:** gpt-oss-120b F16 | `-t 4`
+`llama-batched-bench -npp 512 -ntg 128 -npl 1,2,4,8 -c 16384`
+
+| Batch | Prefill t/s | Generation t/s | Gen speedup |
+|---:|---:|---:|---:|
+| 1 | 15.96 | 5.43 | 1.00× |
+| 2 | 16.63 | 7.99 | 1.47× |
+| 4 | 16.58 | 9.73 | **1.79×** |
+
+**Verdict: batching helps, but far less than on a dense model.** The reference
+dense CPU measurement (Intel Ultra 9 285K, discussion #18030) scaled **5.75×**
+from batch 1→32. Here batch 1→4 yields **1.79×**, where a dense model would give
+roughly 3×.
+
+This is the predicted MoE effect, and it is real but not total: batch B touches
+≈ `min(B × top_k, n_experts)` experts, so routed-expert reads grow with B, while
+attention and shared-expert weights *are* reused across the batch. The result
+sits between "neutral" and "linear", as anticipated — closer to neutral.
+
+**Prefill is completely flat** (15.96 → 16.63 → 16.58, +4% then −0.3%),
+confirming it is compute-saturated and independently corroborating the `-ub`
+result (F18). **No batching strategy will improve prefill on this hardware.**
+
+### The strategic consequence
+
+**The "a few seats" claim in `CLAUDE.md` survives — but weakly, and it is now
+the *inferior* way to get concurrency.**
+
+| Route to concurrency | Speedup | Cost |
+|---|---:|---|
+| Batching on one node (`--parallel 4`) | **1.79×** | free, but MoE-limited |
+| **Replicating the model on 7 nodes** | **~7×** | needs a node-sized model |
+
+Replication dominates batching by ~4×, and the two compose. For a workload made
+of independent chunk summaries, **replication is the primary concurrency
+mechanism and batching is a secondary bonus** — the reverse of what the plan
+assumed. See `DESIGN-NOTES.md` section C.
+
+Note also F4: the server prompt cache is reported to assert with `-np > 1`
+against the **RPC** backend. This measurement is single-node with no RPC, so it
+sidesteps that — another argument for the replicated topology.
+
+---
+
 ## Power and clock state — all levers already maxed
 
 **Date:** 2026-08-17. Read from MSRs under load, so these are the values that

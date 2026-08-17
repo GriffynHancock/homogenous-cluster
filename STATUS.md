@@ -166,12 +166,13 @@ argument: run what no single machine could hold, at any speed.
       never enable it for document work.
 - [x] **Batching works over RPC** (exercised in #14893), but see the build pin
       warning below.
-- [ ] **⚠️ Does MoE destroy the batching win?** Batch B touches
-      ≈ `min(B × top_k, n_experts)` experts, so bytes read may grow in step with
-      tokens produced — flat throughput. Dense CPU scales ~5.75× from batch
-      1→32; sparse MoE may scale ~1×. **No public measurement exists.** Run
-      `llama-batched-bench -np 1,2,4,8` on the real model. This decides whether
-      the "a few seats" claim survives at all.
+- [x] **ANSWERED: it damages it badly but does not destroy it.** Measured on
+      gpt-oss-120b: generation 5.43 → 7.99 → 9.73 t/s at batch 1/2/4, i.e.
+      **1.79× at batch 4** where dense would give ~3×. Prefill is completely
+      flat (15.96 → 16.58), so no batching helps prefill at all.
+      **The "few seats" claim survives but is now the INFERIOR route to
+      concurrency:** replicating a node-sized model across 7 nodes gives ~7×
+      against batching's 1.79×. See `docs/DESIGN-NOTES.md` section C.
 - [ ] **Cross-talk test before enabling `--parallel`.** Trigger for #14893 was
       **FA off + multi-slot + RPC**; `-fa auto` may resolve to off on CPU, which
       matches this architecture exactly. Fix has no build tag — test explicitly
