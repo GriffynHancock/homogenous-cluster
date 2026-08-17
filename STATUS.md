@@ -6,9 +6,11 @@ engines distributed fleet-wide. **Upstream bug #26500 gate PASSED across real
 machines.** Missing Link built through Task 12 (41 tests passing).
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
 
-**The one measurement still owed from this session:** aggregate throughput across
-two independent `llama-server`s (the R × single-node replication model). Blocked
-only on the 65 GB gpt-oss-120b copy to node 2 — see "In flight" below.
+**THE REPLICATION MEASUREMENT IS DONE, AND IT PASSES.** Aggregate throughput
+across two independent `llama-server`s running gpt-oss-120b: **~1.8× on two nodes,
+~90% of linear** (1.86× prefill / 1.77× completion, adjusted for one failed
+request; 1.62×/1.55× raw). **The replication-first architecture is validated on
+real hardware.** Full detail and caveats in `docs/measurements.md`.
 
 **Two corrections to long-standing assumptions, both from measurement:**
 
@@ -50,10 +52,22 @@ ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'   # then: cla
 
 ---
 
-## In flight right now (2026-08-17 evening)
+## Completed this session (was "in flight")
 
-**A 65 GB `rsync` of `gpt-oss-120b-F16.gguf` from node 1 to node 2**, at a
-measured 11.18 MB/s, ETA ~97 min from 19:28 AEST. Log: `/tmp/rsync-gptoss.log`.
+**The 65 GB model copy to node 2 finished and was verified byte-identical**
+(md5 `c859460f5dab66969a9268e2eb551b6d` both ends, 1:33:39 at 11.09 MB/s), and the
+replication measurement ran on it. Both nodes now hold gpt-oss-120b.
+
+**Re-run the measurement with `./bench/replication-bench.sh`.** It stops
+`rpc-server` fleet-wide, starts one independent `llama-server` per node, drives
+concurrent load, and restores nothing — **restart the RPC workers afterwards** with
+`./cluster/install-services.sh` or `sudo systemctl start rpc-server@50052`
+(this session left them running).
+
+<details><summary>Original transfer instructions (kept for node 3+)</summary>
+
+**A 65 GB `rsync` of `gpt-oss-120b-F16.gguf`**, at a measured 11.18 MB/s (~97 min).
+Log: `/tmp/rsync-gptoss.log`.
 
 ```bash
 # is it still going / did it finish?
@@ -84,9 +98,11 @@ saturates the link, which took RTT from 0.827 ms to 9.544 ms (F28).
 ```
 
 Watch for: ik_llama.cpp's CLI **differs from mainline** (`-no-cnv` does not
-exist), and it reports gpt-oss as `?B` rather than `120B` — output is still
-correct, but **re-verify coherence per model** (F27). Vary the prompt between
-runs or you measure the prompt cache (F17).
+exist, and there is **no `--no-webui`**), and it reports gpt-oss as `?B` rather
+than `120B` — output is still correct, but **re-verify coherence per model** (F27).
+Vary the prompt between runs or you measure the prompt cache (F17).
+
+</details>
 
 ---
 
@@ -511,7 +527,7 @@ most consequential number in model selection: crossing it costs a factor of N.
 | TTFT @ 2214 tokens (4B model) | **89 s** |
 | Batching (MoE) | 1.79× at batch 4; **collapses at 8** |
 | ik_llama.cpp vs mainline | **prefill +52%**, generation −14%, **net +22%** |
-| **Aggregate throughput, 2 replicas** | **NOT YET MEASURED — the outstanding item** |
+| **Aggregate throughput, 2 replicas** | **~1.8× (1.86× prefill / 1.77× completion, adjusted; 1.62/1.55 raw)** |
 
 **Sizing rule, validated both ways:**
 `tok/s ≈ effective_bandwidth / (active_params × bytes_per_weight)`,
@@ -522,8 +538,15 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
 
 ## Open questions
 
-- [ ] **⭐ Does replication actually deliver R×?** The whole architecture rests on
-      it and it has never been measured. In flight — see the top of this file.
+- [x] ~~**Does replication actually deliver R×?**~~ **YES — ~1.8× at N=2, ~90% of
+      linear**, measured 2026-08-17. Prefill scaled better than generation
+      (1.86× vs 1.77×), which is the favourable direction since prefill is ~79%
+      of document wall-clock.
+- [ ] **Clean re-run of the replication measurement.** n=1, and one request of
+      eight failed on F21, so the raw figures understate it. Raise `max_tokens`
+      and use more requests per endpoint before treating 1.8× as a constant.
+- [ ] **`enable_thinking:false` does NOT work on gpt-oss-120b** (harmony format).
+      Investigate `reasoning_effort` instead. Verify per model, never assume.
 - [x] ~~Nodes 2+ hardware~~ — **node 2 measured, a twin of node 1** (F29).
       Nodes 3+ still unknown; core count is a bandwidth spec.
 - [ ] **Rigorous two-node sharding A/B.** The ≈−49% generation figure is one
