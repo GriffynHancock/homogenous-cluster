@@ -67,18 +67,18 @@ REDUCE_PROMPTS = {
         "Below are summaries of consecutive sections of one document. Combine "
         "them into a single coherent summary. Remove repetition caused by "
         "overlapping sections. Do not add anything not present in the "
-        "sections.{instruction}\n\n---\n{summaries}\n---\n\nCombined summary:"
+        "sections.{instruction}{citation}\n\n---\n{summaries}\n---\n\nCombined summary:"
     ),
     "report": (
         "Below are drafted sections of one report, in order. Combine them into "
         "a single coherent report, removing repetition introduced by "
-        "overlapping sections. Do not add new material.{instruction}\n\n"
+        "overlapping sections. Do not add new material.{instruction}{citation}\n\n"
         "---\n{summaries}\n---\n\nCombined report:"
     ),
     "qa": (
         "Below are fact lists extracted from consecutive sections of one "
         "document. Combine them into a single deduplicated list, preserving "
-        "figures exactly.{instruction}\n\n---\n{summaries}\n---\n\nCombined facts:"
+        "figures exactly.{instruction}{citation}\n\n---\n{summaries}\n---\n\nCombined facts:"
     ),
 }
 
@@ -151,6 +151,32 @@ def reasoning_kwargs_for(model_name):
 # chunk summary, so its output is legitimately longer than any single one.
 MAP_MAX_TOKENS = 1024
 REDUCE_MAX_TOKENS = 2048
+
+# CITATION MARKERS SPEND THIS BUDGET, AND THIS BUDGET IS NOT BEING RAISED.
+#
+# `[Section 12]` is ~5 tokens. The reduce step is asked for one marker group per
+# PARAGRAPH, not per sentence (see _CITATION_CLAUSE), so a 40-60 sentence combined
+# summary of ~10-20 paragraphs carrying 1-2 markers each costs roughly 50-200
+# output tokens -- under 10% of 2048, against a reduce output that in practice
+# lands well under its cap. docs/citation-research.md Q5 estimates 150-300 for
+# the per-sentence variant this deliberately does not ask for, so 50-200 is the
+# same arithmetic at the coarser granularity actually being requested. NOTE both
+# figures are ESTIMATES from token arithmetic, not measurements: nobody has yet
+# run a reduce call with this clause in it (the model's compliance is the one
+# thing this change cannot verify without inference).
+#
+# Raising REDUCE_MAX_TOKENS to "make room" would be the wrong move and is not
+# done here. F34 is exactly this failure: a token budget silently produced a
+# summary truncated mid-sentence and stored it `done`. The guard for that is
+# extract_content's TruncatedCompletion on finish_reason == "length", and it is
+# untouched by citations -- markers make truncation marginally MORE likely, and
+# more likely to be CAUGHT, because the guard fires before the text is ever
+# stored or parsed. A reduce output that runs out of budget therefore fails the
+# job loudly rather than arriving with its last few paragraphs' citations
+# missing, which is the outcome to want: a partly-cited summary would look
+# finished. If real jobs start failing on `length` after this change, the fix to
+# reach for first is fewer chunks or a shorter instruction, not a bigger budget.
+# The escape hatch for the whole feature is CITE_SECTIONS below.
 
 
 # --- Guidance length guard ----------------------------------------------------
@@ -283,12 +309,268 @@ def build_prompt(kind, document, instruction=None):
                                 instruction=_instruction_clause(instruction))
 
 
-def build_reduce_prompt(kind, summaries, instruction=None):
+# --- Section-level citation (Tier B) ------------------------------------------
+# docs/citation-research.md recommends exactly this and no more: ask the reduce
+# step to repeat the `[Section N]` labels IT WAS ALREADY SHOWN, then resolve
+# those labels back to stored character offsets IN CODE.
+#
+# What this deliberately is NOT:
+#
+#   * It is not "ask the model where this came from". Models score ~38% on the
+#     EASIER task of merely validating an existing citation, and 12.8 Snippet-F1
+#     generating fine spans from scratch (citation-research.md Q1). Repeating a
+#     visible label is a closed-set choice over N options, not span generation.
+#     The model never sees a character offset and is never asked for one.
+#   * It is not sentence-level. CONFIRMED (arXiv:2604.01432): forcing
+#     sentence-level citation degrades BOTH attribution quality and answer
+#     correctness by 16-276% versus paragraph-level. Finer is worse here, so
+#     the ask is per PARAGRAPH -- which also costs fewer output tokens.
+#   * It is not a faithfulness check. `[Section 3]` asserts reference, not
+#     support. Tier C (audit.py's two-model ensemble re-run against the cited
+#     chunk) is the thing that would assert support, and it is GATED on the
+#     full-chunk-size battery re-run that docs/audit-ledger.md 6 demands and
+#     that has not happened. The seam for it is parse_section_citations'
+#     return value: each resolved citation already carries the exact
+#     (index, start, end) an ensemble check would need. Do not wire it in
+#     before that measurement exists.
+#
+# APPLIED UNCONDITIONALLY to every multi-chunk reduce call, via this switch.
+# It changes model output, which CLAUDE.md says must be paired with a coherence
+# check on real output -- so this constant exists to be flipped to False in one
+# place, reverting the prompt to byte-identical-to-before, if that check fails.
+CITE_SECTIONS = True
+
+_CITATION_CLAUSE = (
+    " Each section below is labelled [Section 1], [Section 2] and so on. At the "
+    "end of each paragraph you write, repeat the label or labels of the section "
+    "or sections that paragraph drew on, exactly as shown -- for example "
+    "[Section 2], or [Section 2][Section 5] for a paragraph combining two. Use "
+    "only labels that actually appear below; never invent a section number, and "
+    "never label a paragraph with a section you did not draw on."
+)
+
+
+def _citation_clause(cite_sections):
+    """Prompt fragment asking for `[Section N]` tags, or "" for none.
+
+    Returns "" when off, so REDUCE_PROMPTS renders byte-for-byte identical to
+    what it produced before citations existed -- same property, and same
+    reason, as _instruction_clause above.
+    """
+    return _CITATION_CLAUSE if cite_sections else ""
+
+
+def _section_items(summaries):
+    """[(label, summary_text)] for the reduce prompt, LABEL BOUND TO THE CHUNK.
+
+    `summaries` may be bare strings (the untraced `summarise` path, which has no
+    chunk identity to bind to) or chunk records / DB rows carrying their own
+    chunk index under "index" or "idx".
+
+    WHY THIS IS NOT `enumerate`. The label the model is shown is the label a
+    citation resolves back through, so it has to name the CHUNK, not the chunk's
+    position in whatever list happened to reach this function. Records arriving
+    here can come from a resume path that reuses rows persisted by an earlier
+    process (F37#4), so position and identity are two different things even
+    though they coincide today. A citation that is off by one is worse than no
+    citation at all: it points confidently at the wrong span, and the reader who
+    checks it finds text that does not support the claim and cannot tell whether
+    the model lied or the plumbing did.
+    """
+    items = []
+    for pos, s in enumerate(summaries):
+        if isinstance(s, dict):
+            idx = s.get("index", s.get("idx"))
+            if idx is None:
+                raise ValueError(
+                    "chunk record reached build_reduce_prompt with no 'index' "
+                    "or 'idx'; the section label must name the chunk, not its "
+                    f"position in this list (record keys: {sorted(s)})")
+            items.append((int(idx) + 1, s["summary"]))
+        else:
+            items.append((pos + 1, s))
+    return items
+
+
+def build_reduce_prompt(kind, summaries, instruction=None,
+                        cite_sections=CITE_SECTIONS):
     joined = "\n\n".join(
-        f"[Section {i + 1}]\n{s}" for i, s in enumerate(summaries)
+        f"[Section {label}]\n{text}" for label, text in _section_items(summaries)
     )
-    return REDUCE_PROMPTS[kind].format(summaries=joined,
-                                       instruction=_instruction_clause(instruction))
+    return REDUCE_PROMPTS[kind].format(
+        summaries=joined,
+        instruction=_instruction_clause(instruction),
+        citation=_citation_clause(cite_sections))
+
+
+# A WELL-FORMED marker: literally what the prompt showed the model. Tolerant of
+# case and internal whitespace and nothing else -- this is the only pattern that
+# is allowed to become a link.
+_SECTION_MARKER_RE = re.compile(r"\[\s*Section\s+(\d+)\s*\]", re.IGNORECASE)
+# Anything marker-SHAPED, so "[Sections 1 and 4]" or "[Section four]" can be
+# counted and reported rather than passing unnoticed as ordinary prose.
+_MARKERISH_RE = re.compile(r"\[\s*Sections?\b[^\]\n]*\]", re.IGNORECASE)
+
+
+def _citation_targets(records):
+    """{label -> {"section", "index", "start", "end"}} for resolvable sections.
+
+    Accepts worker chunk records ("index"/"start"/"end") and db.get_chunk_summaries
+    rows ("idx"/"start_char"/"end_char") alike; they are the same three facts
+    under two spellings, and the job page has the DB spelling.
+    """
+    targets = {}
+    for r in records or []:
+        idx = r.get("index", r.get("idx"))
+        start = r.get("start", r.get("start_char"))
+        end = r.get("end", r.get("end_char"))
+        if idx is None or start is None or end is None:
+            continue
+        idx = int(idx)
+        targets[idx + 1] = {"section": idx + 1, "index": idx,
+                            "start": int(start), "end": int(end)}
+    return targets
+
+
+def parse_section_citations(text, records):
+    """Resolve `[Section N]` markers in a reduce output back to source spans.
+
+    Pure text + stored offsets. NO model call, no fuzzy matching, no guessing:
+    a marker either names a chunk that exists, in which case its span is that
+    chunk's PERSISTED start/end, or it does not, in which case it is refused.
+
+    Returns a dict:
+      segments        ordered render list; {"kind": "text", "text": ...} and
+                      {"kind": "cite", "section", "index", "start", "end"}.
+                      Dropped markers appear in NEITHER -- see below.
+      cited_sections  sorted distinct section numbers that resolved
+      marker_count    well-formed markers seen
+      valid_count     of those, ones that resolved
+      dropped         [{"marker", "section", "count"}] -- well-formed but
+                      unresolvable, aggregated by literal marker text
+      dropped_count   total occurrences dropped
+      unparsed        [{"marker", "count"}] -- marker-SHAPED but not
+                      well-formed, left in the prose verbatim
+      unparsed_count  total occurrences of those
+      has_citations   valid_count > 0
+
+    THREE OUTCOMES, ALL FIRST-CLASS, none of them an error:
+
+    1. Valid marker -> a citation with an exact span. Exact because it is a
+       dict lookup on a number the model was handed, not a match on content.
+
+    2. INVENTED marker -- `[Section 47]` on a 26-section document, or any label
+       with no record behind it -- is DROPPED from the rendered prose and
+       counted. It is never rendered as a link. This is the codebase's standing
+       rule (F21/F34/F36/F38: "a completion path must refuse, not degrade"):
+       a link to a span that does not exist is exactly the plausible-looking
+       worthless output those four findings are about, and it would be worse
+       than no citation because it survives a reader's spot check by pointing
+       somewhere real-looking. The count is returned so the job page can show
+       it -- a job that drops many markers is a signal about the model, not a
+       cosmetic detail to swallow.
+
+    3. NO markers at all -> has_citations False, segments is the whole text,
+       nothing is wrong. The summary is exactly as valid as it was before this
+       feature existed; it simply is not attributed. There is deliberately NO
+       fuzzy-match fallback here: docs/citation-research.md offers audit.py's
+       `best_match` content-word heuristic for this, and it would produce
+       INFERRED locations indistinguishable, once rendered, from ones the model
+       actually claimed. If it is ever added it must come back under its own
+       key and be labelled distinctly in the UI, never merged into `segments`.
+
+    Malformed-but-marker-shaped text ("[Sections 1 and 4]") is left in the prose
+    untouched and reported under `unparsed`: deleting text the model wrote is a
+    bigger sin than leaving a non-link, and it stays visible to the reader.
+    """
+    text = text or ""
+    targets = _citation_targets(records)
+
+    segments = []
+    dropped, unparsed = {}, {}
+    marker_count = valid_count = 0
+    cited = set()
+    pos = 0
+
+    def _emit_text(chunk, after_drop=False):
+        # A dropped marker leaves a hole with whitespace on both sides of it.
+        # Join them back into ONE separator, keeping whichever side carried more
+        # newlines -- so "text. [Section 47]\n\nNext para" keeps its paragraph
+        # break instead of collapsing into one run-on line, and "a [Section 47] b"
+        # does not gain a visible double space. Whitespace only: this never
+        # removes a non-whitespace character the model wrote, and never runs
+        # except immediately after a refused marker.
+        if after_drop and not segments:
+            # Dropped marker at the very start: nothing precedes it to join to.
+            chunk = chunk.lstrip()
+        elif after_drop and not chunk and segments[-1]["kind"] == "text":
+            # ...and at the very end: nothing follows, so the separator the
+            # marker was hanging off is now trailing whitespace.
+            segments[-1]["text"] = segments[-1]["text"].rstrip()
+            if not segments[-1]["text"]:
+                segments.pop()
+        elif after_drop and segments[-1]["kind"] == "text":
+            prev = segments[-1]["text"]
+            prev_body = prev.rstrip()
+            prev_ws = prev[len(prev_body):]
+            next_body = chunk.lstrip()
+            next_ws = chunk[:len(chunk) - len(next_body)]
+            if prev_ws or next_ws:
+                if prev_ws.count("\n") != next_ws.count("\n"):
+                    sep = max(prev_ws, next_ws, key=lambda w: w.count("\n"))
+                else:
+                    sep = max(prev_ws, next_ws, key=len)
+                segments[-1]["text"] = prev_body + sep
+                chunk = next_body
+        if not chunk:
+            return
+        if segments and segments[-1]["kind"] == "text":
+            segments[-1]["text"] += chunk
+        else:
+            segments.append({"kind": "text", "text": chunk})
+
+    dropped_here = False
+    for m in _MARKERISH_RE.finditer(text):
+        raw = m.group(0)
+        _emit_text(text[pos:m.start()], after_drop=dropped_here)
+        pos = m.end()
+        dropped_here = False
+
+        strict = _SECTION_MARKER_RE.fullmatch(raw)
+        if strict is None:
+            unparsed[raw] = unparsed.get(raw, 0) + 1
+            _emit_text(raw)
+            continue
+
+        marker_count += 1
+        label = int(strict.group(1))
+        target = targets.get(label)
+        if target is None:
+            dropped[raw] = dropped.get(raw, 0) + 1
+            dropped_here = True
+            continue
+
+        valid_count += 1
+        cited.add(label)
+        segments.append({"kind": "cite", **target})
+
+    _emit_text(text[pos:], after_drop=dropped_here)
+
+    return {
+        "segments": segments,
+        "cited_sections": sorted(cited),
+        "marker_count": marker_count,
+        "valid_count": valid_count,
+        "dropped": [{"marker": k,
+                     "section": (lambda mm: int(mm.group(1)) if mm else None)(
+                         _SECTION_MARKER_RE.fullmatch(k)),
+                     "count": v}
+                    for k, v in sorted(dropped.items())],
+        "dropped_count": sum(dropped.values()),
+        "unparsed": [{"marker": k, "count": v} for k, v in sorted(unparsed.items())],
+        "unparsed_count": sum(unparsed.values()),
+        "has_citations": valid_count > 0,
+    }
 
 
 class LlamaClient:
@@ -776,7 +1058,7 @@ def _strip_think(text):
 
 def summarise(kind, document, base_url, client,
               max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS,
-              instruction=None):
+              instruction=None, cite_sections=CITE_SECTIONS):
     """Map-reduce over the document. Returns the final text."""
     chunks = chunk_document(document)
 
@@ -794,7 +1076,9 @@ def summarise(kind, document, base_url, client,
     # bigger budget than any single map step. Using the same value is how you
     # get a truncated final answer on a long document.
     return client.complete(
-        build_reduce_prompt(kind, partials, instruction), max_tokens=reduce_max_tokens)
+        build_reduce_prompt(kind, partials, instruction,
+                            cite_sections=cite_sections),
+        max_tokens=reduce_max_tokens)
 
 
 def count_chunks(document):
@@ -1251,7 +1535,7 @@ def chunk_spans(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
 
 def summarise_traced(kind, document, client,
                      max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS,
-                     instruction=None,
+                     instruction=None, cite_sections=CITE_SECTIONS,
                      resume_records=None, on_chunk_done=None, should_stop=None):
     """Map-reduce that RETAINS provenance, and can RESUME a partial run.
 
@@ -1329,7 +1613,12 @@ def summarise_traced(kind, document, client,
     if should_stop is not None and should_stop():
         raise JobCancelled("stop requested before the reduce step")
 
+    # RECORDS, not [r["summary"] for r in records]. The section label the model
+    # is shown has to be derived from the chunk's own index, because that label
+    # is what a citation resolves back through -- see _section_items. The old
+    # call site threw the identity away one line before it became load-bearing.
     final = client.complete(
-        build_reduce_prompt(kind, [r["summary"] for r in records], instruction),
+        build_reduce_prompt(kind, records, instruction,
+                            cite_sections=cite_sections),
         max_tokens=reduce_max_tokens)
     return final, records
