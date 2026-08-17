@@ -249,36 +249,61 @@ Two consequences, both significant:
 
 ---
 
-## F12. The DIMMs are probably in 2 of 4 channels — a possible free 2× fleet-wide
+## F12. Bandwidth is core-limited, not channel-limited. The CPU cannot saturate its own memory.
 
-**INFERRED, pending `dmidecode`.** But the arithmetic is hard to explain away.
+**CONFIRMED by `dmidecode`.** An earlier version of this finding hypothesised a
+half-populated board. **That was wrong** — the DIMM layout is correct and
+optimal:
 
-| Configuration | Theoretical | Measured 28.2 GB/s is |
-|---|---:|---:|
-| Quad-channel DDR4-2400 | 76.8 GB/s | **37%** |
-| Dual-channel DDR4-2400 | 38.4 GB/s | **73%** |
+```
+DIMM_1..DIMM_4:  32 GB, DDR4, Rank 2
+Speed: 2400 MT/s      Configured Memory Speed: 2400 MT/s
+Board: LENOVO 30B2S2E800 (ThinkStation P510), 8 slots, 4 populated
+```
 
-Real STREAM efficiency on a healthy DDR4 system is 60–80%. **37% is not a
-plausible result for a correctly-populated quad-channel board; 73% is textbook.**
-The E5-1620 v4 supports quad-channel, so the likely explanation is that the
-board is **half-populated** — 2 × 64 GB rather than 4 × 32 GB.
+All four channels populated, running at full rated speed. So the 28.2 GB/s
+measured is **37% of the 76.8 GB/s a quad-channel DDR4-2400 bus can deliver**,
+with nothing wrong with the memory.
 
-By F11, generation speed is *exactly* proportional to memory bandwidth here. So
-if this is right, **populating all four channels roughly doubles generation
-throughput on every node, at zero hardware cost** — just moving DIMMs between
-slots, on machines that are already open.
+**The explanation is the core count.** From the STREAM thread sweep:
 
-**Action:** confirm with `sudo dmidecode -t memory` and check the `Locator`
-labels for which channels are populated. Do this on node 2 **before it is
-closed up**, and on every node before racking. Re-run the STREAM measurement
-after any rebalance.
+| Threads | GB/s | Scaling vs 1 core |
+|---:|---:|---:|
+| 1 | 13.7 | — |
+| 2 | 24.2 | 1.77× |
+| 4 | **28.2** | **2.06×** |
+| 8 | 27.3 | 1.99× |
 
-**For the skill:** this generalises into an assessment step. "How much RAM does
-it have" is the wrong question; **"how many channels is that RAM spread across"**
-is the one that determines speed. An organisation consolidating DIMMs into
-fewer machines to hit a capacity target could halve its own throughput without
-ever knowing. Measure bandwidth with STREAM, compare against
-`channels × MT/s × 8`, and flag anything under ~50%.
+A single core already reaches 13.7 GB/s; four cores add only ~2×, not 4×.
+**A core can only keep ~10–12 cache-line fills in flight, so saturating
+quad-channel DDR4 needs roughly 8–14 cores on Broadwell.** The E5-1620 v4 has
+four. It is a workstation part with server-grade memory attached, and it cannot
+generate enough memory-level parallelism to use it.
+
+**Consequences:**
+
+- **Neither DIMM rearrangement nor a memory clock change will help.** The
+  bottleneck is upstream of the DRAM.
+- **The one BIOS lever worth trying** is the power/uncore profile. On Xeon E5 v4
+  the uncore — which contains the memory controller — scales its own frequency,
+  and an "Energy Efficient" or "Balanced" profile holds it down. Set **Maximum
+  Performance**, disable **C-states**, pin **Uncore Frequency** to max if
+  exposed, and try **Home Snoop** vs **Early Snoop**. Expect ~10–20%, not 2×.
+  Re-run the STREAM measurement after any change.
+- **CPU frequency is already ruled out** — under load all cores sit at 3592 MHz
+  with turbo on and `max_perf_pct` 100.
+- **Core count is a bandwidth spec, not just a compute spec.** This is the real
+  lesson. If nodes 3–7 turn out to have higher-core Xeons (E5-2600 v4 series,
+  8–14 cores), **those nodes will be meaningfully faster at generation** despite
+  identical RAM. Heterogeneous core counts imply heterogeneous bandwidth, and
+  therefore that `--tensor-split` should weight by **measured bandwidth**, not
+  by RAM as `nodes.env` currently assumes.
+
+**For the skill:** "how much RAM" and even "how many channels" are both
+insufficient. The assessment must **measure achievable bandwidth with STREAM**
+and compare it against `channels × MT/s × 8`. A large gap means the CPU is the
+limit, and the advice is *more machines*, not *more RAM* — which is exactly the
+opposite of what a capacity-driven inventory would conclude.
 
 ---
 
@@ -311,6 +336,202 @@ verified by copying `bin/` elsewhere and running it (`RUNPATH: [$ORIGIN]`,
 resolves relative, runs standalone). `build-llama.sh` now **fails the build**
 if any binary still references the source tree, and copies `*.so*` alongside
 the executables.
+
+---
+
+## F14. RPC costs 5% on generation but 39% on prefill
+
+**CONFIRMED by measurement.** Localhost isolation test, network removed
+entirely — so this is a **floor**, not an estimate.
+
+| Metric | Local | Via RPC (localhost) | Overhead |
+|---|---:|---:|---:|
+| pp512 (prefill) | 33.18 t/s | 20.11 t/s | **−39.4%** |
+| tg128 (generation) | 11.55 t/s | 10.95 t/s | **−5.2%** |
+
+**The gate passes** — the plan's rule is on generation, under 15%. And the 5.2%
+vindicates this repo's earlier retraction of the "30–55% RPC overhead" claim:
+for bandwidth-bound CPU generation, per-token compute dwarfs a loopback
+round-trip, exactly as predicted.
+
+**But the plan only ever specified a threshold for generation, and prefill is
+where the cost actually landed.** −39.4% compounds with hardware already weak
+at prefill (4 cores, no AVX-512). Prefill is compute-bound, so a fixed
+serialisation cost is a far larger fraction of a smaller number.
+
+**Recommendation:** the decision rule in the plan should gate on **both**
+metrics, not just generation. A future run of this test on different hardware
+could pass the generation gate while prefill quietly becomes unusable — which
+is very close to what happened here.
+
+Also worth noting: `llama-bench -t` does **not** propagate to an RPC device
+(the rows report `threads = -1`). The `rpc-server`'s own `-t` governs, which is
+why F10 matters so much — a wrong `-t` in the systemd unit is invisible to
+every client-side benchmark flag.
+
+---
+
+## F15. `llama-cli` is now conversation-first with a TUI — `-no-cnv` is not enough for scripting
+
+**CONFIRMED by direct observation.** In b10369 `llama-cli` launches an
+interactive TUI (banner, `/exit`, `/regen`, `/read` commands) and **blocks
+waiting for input**, even with `-p` supplied. The plan's Task 3 Step 1 command
+hangs indefinitely — it ran past 600 s producing nothing before being killed.
+
+Use **`-st` / `--single-turn`** for any scripted invocation:
+
+```bash
+llama-cli -m MODEL -t 4 -st --no-warmup --no-display-prompt -n 120 -p "..."
+```
+
+It prints a `[ Prompt: X t/s | Generation: Y t/s ]` summary line on exit, which
+is a convenient cross-check against `llama-bench`. Verified coherent output on
+node 1 (31.2 t/s prompt, 11.3 t/s generation — consistent with the bench).
+
+Anything in Missing Link or the skill that shells out to `llama-cli` must use
+`-st`, or it will hang forever in a queue worker with no diagnostic.
+
+---
+
+## F16. Model B does not fit on the master's DISK. Disk, not RAM, is the binding constraint.
+
+**CONFIRMED by direct observation.** This blocks Task 7 as written.
+
+The plan reasons carefully about two memory constraints and never checks disk.
+On node 1:
+
+```
+/dev/nvme0n1p2  467G  13G  431G  3%  /
+```
+
+**431 GB free.** Model B as specified — Kimi K2 Q4 — is **547 GB** (IQ4_XS,
+12 files). The master must hold the entire GGUF locally: `llama-server` loads it
+and pushes tensors to the workers, so there is no version of this where the
+master gets away with a partial copy.
+
+Measured quant ladder (`unsloth/Kimi-K2-Instruct-GGUF`, sizes summed per quant):
+
+| Quant | Size | Fits in 431 GB? | Fits alongside Model A (~366 GB free)? |
+|---|---:|---|---|
+| IQ4_NL | 578 GB | no | no |
+| **IQ4_XS** (the plan's "Q4") | **547 GB** | **no** | no |
+| Q3_K_M | 489 GB | no | no |
+| UD-Q3_K_XL | 452 GB | no | no |
+| Q3_K_S | 442 GB | marginal | no |
+| UD-IQ3_XXS | 417 GB | yes, 14 GB spare | no |
+| UD-Q2_K_XL | 382 GB | yes | no |
+| UD-IQ2_M | 347 GB | yes | yes |
+| UD-IQ1_S | 280 GB | yes | yes |
+| UD-TQ1_0 | 244 GB | yes | yes |
+
+**The constraint ordering in the plan is now wrong.** It says the per-node 75%
+RAM rule binds first (~692 GB). In reality:
+
+| Constraint | Budget |
+|---|---:|
+| Pooled RAM (7 × 131.8 GB, 15% headroom) | ~747 GB |
+| Per-node 75% × 7 | ~692 GB |
+| **Master local disk** | **431 GB ← binds, by a wide margin** |
+
+**The thesis survives at every quant on this list.** Even UD-TQ1_0 at 244 GB is
+roughly double what one node's 125 GB of RAM can hold, so "run what no single
+machine could hold" still holds. What changes is *how much* headroom the
+argument has.
+
+**Two ways out, and they are genuinely different decisions:**
+
+1. **Add storage to the master.** A 2 TB SSD is cheap, removes the constraint
+   permanently, and restores the full-fat Q4 comparison. Model load is a
+   sequential read and happens once per boot (workers cache via `rpc-server -c`),
+   so even a spinning disk would serve. This is the option that keeps the
+   deliverable as designed.
+2. **Step down the quant.** UD-IQ3_XXS (417 GB) is the largest that fits today,
+   and cannot coexist with Model A. UD-IQ2_M (347 GB) leaves room for both.
+
+**For the skill, this generalises into an assessment question the plan never
+asked:** salvaged desktops are usually RAM-rich and disk-poor, because disks
+get pulled or wiped on decommission while DIMMs stay in. **The coordinator's
+free disk space is a first-class constraint and should be checked before any
+model is chosen** — it is cheap to fix, but only if you find it before
+downloading half a terabyte.
+
+---
+
+## F17. The plan's TTFT measurement is wrong and reports ~0.015 s. Real TTFT was 89 s.
+
+**CONFIRMED by measurement.** This is the most consequential methodological bug
+found so far, because it silently reports the project's most at-risk metric as
+essentially zero.
+
+The plan measures TTFT with:
+
+```bash
+curl -w "TTFT %{time_starttransfer}s" ... -d '{"stream": true, ...}'
+```
+
+Measured output on node 1:
+
+```
+run 1: TTFT 0.015462s   total 99.311079s
+run 2: TTFT 0.016888s   total 11.306179s
+run 3: TTFT 0.012565s   total 10.265632s
+```
+
+**`time_starttransfer` is when the HTTP response *headers* arrive, not when the
+first token does.** `llama-server` sends headers immediately on accepting a
+streaming request, so this measures connection setup — ~15 ms — and is
+completely insensitive to prefill.
+
+The truth is in the server's own log for the same request:
+
+```
+prompt eval time = 89147.95 ms / 2214 tokens ( 40.27 ms per token, 24.84 t/s)
+       eval time = 10147.46 ms /   64 tokens (158.55 ms per token,  6.31 t/s)
+```
+
+**Real TTFT ≈ 89 seconds** for a 2214-token prompt — a factor of ~5,800 off
+what the plan's method reported.
+
+### Two further traps in the same measurement
+
+**1. Prompt caching makes runs 2 and 3 meaningless.** They report
+`prompt eval time = ... / 1 tokens` — the server reused the cached prefix
+because the prompt was byte-identical. Only **run 1** is a real cold-cache
+measurement. Any benchmark that loops the same prompt measures the cache, not
+the model. Vary the prompt per iteration, or restart the server.
+
+**2. This affects Task 8 too.** The plan's concurrency test uses the same
+`time_starttransfer` metric and the same repeated prompt, so it would have
+produced meaningless numbers for the "seats vs speed" claim — the project's
+central thesis.
+
+### How to actually measure TTFT
+
+Either parse the SSE stream for the first chunk carrying content, or read
+`prompt eval time` from the server log (authoritative, and it also gives the
+real token count). `bench/node-bench.sh` now does both.
+
+### The number itself is bad news
+
+**89 s TTFT at 2214 tokens, on a 4-billion-parameter model.** The plan's
+GPU-revisit threshold is 90 s at ~2000 tokens. The *smallest* model in the
+project sits right on it.
+
+This confirms the F7 prediction from the hardware: with 4 cores and no AVX-512,
+**prefill is the binding problem, not generation.** Note prefill measures
+24.84 t/s here against `llama-bench`'s 28.33 t/s at pp2048 — consistent, and
+both far below what this workload needs.
+
+Implications, none of which are optional now:
+
+- **Map-reduce chunking is not merely preferable, it is required.** A 4K chunk
+  is ~160 s of prefill on this hardware. Feeding whole documents is not viable.
+- **`-ub` tuning matters** and should be measured, not assumed.
+- **The GPU-for-prefill question is live.** The spec defers it until TTFT proves
+  unbearable; on this evidence it is close to unbearable already, and the
+  cluster's own RPC layer adds a further −39.4% to prefill (F14). A single cheap
+  GPU doing prefill only, with generation staying on CPU, deserves measurement
+  rather than continued deferral.
 
 ---
 

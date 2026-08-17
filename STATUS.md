@@ -279,13 +279,25 @@ llama.cpp's exact constraint. This is a hard problem, not a llama.cpp defect.
 
 ## Next
 
-**Phase 0 — Measurement gate (Tasks 1–3).** Base install, pinned llama.cpp
-build, localhost RPC overhead test, single-node baseline with gpt-oss-120b.
-The overhead test has a stop-and-escalate threshold; **do not provision the
-fleet before it passes.**
+**Phase 0 — Measurement gate (Tasks 1–3).** Task 1 ✅, Task 2 ✅ **(gate
+PASSED — generation overhead 5.2%)**. Task 3 in progress.
+
+**Before anything touches a second machine, in this order:**
+
+1. **`sudo dmidecode -t memory` on node 1 and node 2.** Bandwidth measured at
+   28.2 GB/s, which is 73% of *dual*-channel DDR4-2400 but only 37% of
+   *quad*-channel. The board is probably half-populated. Since generation runs
+   at ~99% of memory bandwidth (F11), **rebalancing DIMMs across all four
+   channels is potentially a free ~2× on every node** — and node 2 is open
+   right now. Do this before it is closed up.
+2. **Two-node RPC smoke test** as soon as node 2 exists (F2). An open, unmerged
+   upstream bug breaks clusters with 2+ RPC workers and is fixed in no released
+   tag. Confirm before fetching 550 GB or provisioning nodes 3–7.
+3. Model A (gpt-oss-120b) single-node baseline — the speed reference.
 
 **Phase 1 — Fleet provisioning (Tasks 4–5).** `setup.sh` on all 7, binary
-distribution with version and libc assertions.
+distribution with version, libc **and ISA** assertions (the last one added
+after F8/F13).
 
 **Phase 2 — Sharded inference (Tasks 6–9).** `rpc-server` services, Kimi K2
 fetch, both memory checks, cluster launch, measurement, Open WebUI.

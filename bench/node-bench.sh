@@ -44,28 +44,70 @@ curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 \
 # version interpolated the prompt into a shell string inside a python -c inside
 # a $(...) -- any apostrophe in the prompt would break it, and the failure looks
 # like a model problem rather than a quoting problem.
-python3 - "$CTX" <<'PY' > /tmp/ttft-request.json
-import json, sys
+# DO NOT use curl's %{time_starttransfer} here. It reports when the HTTP
+# *headers* arrive, which llama-server sends immediately on accepting a
+# streaming request -- ~15 ms, totally insensitive to prefill. Measured on
+# node 1 it reported 0.015 s against a real TTFT of 89 s. See FINDINGS F17.
+#
+# Instead: read the SSE stream and stamp the first chunk that carries content.
+#
+# Each run also gets a UNIQUE prompt. Identical prompts hit llama-server's
+# prompt cache and report `prompt eval time = ... / 1 tokens` -- measuring the
+# cache rather than the model. Runs 2 and 3 of the original script were
+# meaningless for exactly this reason.
+for i in $(seq 1 "$REPS"); do
+  python3 - "$PORT" "$i" <<'PY'
+import json, sys, time, urllib.request
+
+port, run = sys.argv[1], int(sys.argv[2])
 # ~2000 tokens, representative of one map-reduce chunk of a real document.
-prompt = "The quick brown fox jumps over the lazy dog. " * 220
-json.dump({
+# The run-specific prefix defeats the prompt cache.
+prompt = f"Document {run}. " + "The quick brown fox jumps over the lazy dog. " * 220
+body = json.dumps({
     "messages": [{"role": "user", "content": "Summarise this:\n\n" + prompt}],
     "max_tokens": 64,
     "stream": True,
-}, sys.stdout)
-PY
+}).encode()
 
-echo "Prompt tokens (server-reported) appear in /tmp/node-bench-server.log"
-for i in $(seq 1 "$REPS"); do
-  curl -s -o /dev/null \
-    -w "run $i: TTFT %{time_starttransfer}s   total %{time_total}s\n" \
-    -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
-    -H 'Content-Type: application/json' \
-    --data @/tmp/ttft-request.json
+req = urllib.request.Request(
+    f"http://127.0.0.1:{port}/v1/chat/completions",
+    data=body, headers={"Content-Type": "application/json"})
+
+t0 = time.monotonic()
+ttft = None
+ntok = 0
+with urllib.request.urlopen(req) as r:
+    for raw in r:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            delta = json.loads(payload)["choices"][0].get("delta", {})
+        except (ValueError, KeyError, IndexError):
+            continue
+        # Only content counts. The first chunk is often a role marker with no
+        # text, and stamping that would understate TTFT.
+        if delta.get("content"):
+            ntok += 1
+            if ttft is None:
+                ttft = time.monotonic() - t0
+total = time.monotonic() - t0
+gen = (ntok - 1) / (total - ttft) if ttft and total > ttft and ntok > 1 else float("nan")
+print(f"run {run}: TTFT {ttft:.2f}s   total {total:.2f}s   "
+      f"gen {gen:.2f} tok/s   ({ntok} chunks)")
+PY
 done
 
 echo
-echo "--- server-reported prompt eval (authoritative token counts) ---"
-grep -E 'prompt eval|eval time|n_prompt_tokens' /tmp/node-bench-server.log | tail -10 || true
+echo "--- server-reported timings (authoritative; cross-check the above) ---"
+grep -E 'prompt eval time|eval time' /tmp/node-bench-server.log | tail -8 || true
+cat <<'EOF'
+
+Read `prompt eval time = X ms / N tokens` as the ground truth for TTFT.
+If N is 1 on a run, that run hit the prompt cache and is NOT a valid sample.
+EOF
 
 kill $SRV_PID 2>/dev/null || true

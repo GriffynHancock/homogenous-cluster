@@ -281,6 +281,81 @@ set correctly in the systemd unit (F10). The `-t 4` above is the server's.
 
 ---
 
-## Single-node baseline
+## Single-node baseline — Qwen3-4B Q4_K_M
 
-Pending — Task 3.
+**Date:** 2026-08-12 | **Node:** node1 | **Threads:** 4 | **Build:** b10369
+
+| Metric | Value |
+|---|---:|
+| pp512 (t/s) | 33.04 ± 0.22 |
+| pp2048 (t/s) | 28.33 ± 0.23 |
+| tg128 (t/s) | 11.49 ± 0.03 |
+| **TTFT @ 2214-token prompt** | **89.1 s** |
+| Prefill rate at that length (server-reported) | 24.84 t/s |
+| Generation rate (server-reported) | 6.31 t/s |
+
+**Prefill degrades with length**, as the spec predicted: 33.04 t/s at 512 tokens
+→ 28.33 at 2048 → 24.84 at 2214 in the server. An independent hardware reason
+to chunk, on top of "lost in the middle".
+
+### TTFT: 89 s on a 4B model — the plan's threshold is 90 s
+
+**This is the headline result and it is bad.** See F17. The plan's own
+GPU-revisit trigger is *TTFT > 90 s at ~2000 tokens*; the **smallest model in
+the project sits within 1% of it**, before any RPC overhead (a further −39.4%
+on prefill, F14) and before scaling to a 100× larger model.
+
+Generation, by contrast, is fine and behaves exactly as theory predicts. The
+asymmetry is the whole story of this hardware: **4 cores and no AVX-512 make
+prefill the binding constraint, not bandwidth.**
+
+### The measurement method in the plan was wrong
+
+`curl -w %{time_starttransfer}` reported **0.015 s** for the same request that
+actually took 89 s to first token — it times the HTTP headers, which
+`llama-server` sends immediately. Runs 2 and 3 were also invalid, having hit the
+prompt cache (`prompt eval time = ... / 1 tokens`). `bench/node-bench.sh` now
+parses the SSE stream for the first content-bearing chunk and varies the prompt
+per run. **Full detail in F17 — the same bug is in the plan's Task 8
+concurrency test, which measures the project's central claim.**
+
+---
+
+## Memory subsystem — resolved
+
+**Date:** 2026-08-17 | `dmidecode` confirms the DIMM layout is **correct**:
+
+```
+DIMM_1..DIMM_4:  32 GB  DDR4  Rank 2
+Speed: 2400 MT/s     Configured Memory Speed: 2400 MT/s
+Board: LENOVO 30B2S2E800 (ThinkStation P510) — 8 slots, 4 populated
+```
+
+All four channels populated at full rated speed. **An earlier hypothesis in this
+file that the board was half-populated was wrong and has been retracted (F12).**
+
+So 28.2 GB/s is 37% of the 76.8 GB/s quad-channel DDR4-2400 can deliver, with
+nothing wrong with the memory. **The limit is the 4-core CPU**, which cannot
+generate enough memory-level parallelism to saturate its own bus (1 core =
+13.7 GB/s, 4 cores = only 28.2). Saturating quad-channel Broadwell needs ~8–14
+cores.
+
+CPU frequency is ruled out: under load all cores hold 3592 MHz, turbo enabled,
+`max_perf_pct` = 100.
+
+**Implication for `--tensor-split`:** if nodes 3–7 have higher-core Xeons, they
+will be faster at generation despite identical RAM. The split should then be
+weighted by **measured bandwidth**, not RAM as `nodes.env` currently assumes.
+
+---
+
+## Model B disk blocker
+
+**Date:** 2026-08-12. Master has **431 GB free**; Kimi K2 IQ4_XS is **547 GB**.
+Disk — not RAM — is the binding constraint (F16). A drive is being added
+2026-08-17 week. Interim single-node target: **Qwen3-Next-80B-A3B UD-Q8_K_XL,
+93 GB, 3B active.**
+
+## Model A: gpt-oss-120b, single node
+
+Pending — download in progress.
