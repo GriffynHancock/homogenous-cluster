@@ -27,9 +27,15 @@ MANIFEST="${MANIFEST:-cluster/models.json}"
 # Measured on node 1. Re-measure per node: memory bandwidth, not RAM, sets
 # generation speed, and it varies with core count (FINDINGS F12).
 BANDWIDTH_GBS="${BANDWIDTH_GBS:-28.2}"
-# Fraction of a model that rpc-server -c actually caches (tensors >= 10 MiB).
-# Measured: 1.9 GB cached for a 2.5 GB model.
-CACHE_RATIO=0.76
+# Fraction of a node's SHARE that rpc-server -c writes to disk (tensors >=10 MiB).
+#
+# Measured 0.76 on Qwen3-4B (817 MB + 1.1 GB across two workers with separate
+# LLAMA_CACHE dirs, against a 2.4 GB model). But that is a small DENSE model
+# where sub-10 MiB tensors -- embeddings, norms -- are a meaningful fraction.
+# In a large MoE nearly every expert tensor is far above 10 MiB, so the ratio
+# approaches 1.0. Plan with 1.0; under-provisioning worker disk during first
+# load is far worse than over-provisioning it.
+CACHE_RATIO="${CACHE_RATIO:-1.0}"
 
 q() { jq -r "$1" "$MANIFEST"; }
 
@@ -116,7 +122,11 @@ cmd_plan() {
       "Bytes read per token:  \($bpt*1|.*100|round/100) GB",
       "",
       "COORDINATOR needs      \(($m.bytes/1e9)|floor) GB of free DISK (whole GGUF)",
-      "EACH WORKER needs      \((($m.bytes/1e9)/$n*($cr|tonumber))|floor) GB of disk (rpc-server -c cache)",
+      "EACH WORKER needs      \((($m.bytes/1e9)/$n)|floor) GB of RAM (its layer share, FULLY RESIDENT)",
+      "                       \((($m.bytes/1e9)/$n*($cr|tonumber))|floor) GB of disk (rpc-server -c cache)",
+      "  Weights are NOT paged from disk. Each node holds every expert of its",
+      "  layer range in RAM; only the SELECTED experts are read per token.",
+      "  Total params set RAM. Active params set speed.",
       "",
       "Predicted generation:  \(($bw/$bpt)*100|round/100) tok/s   (at \($bw) GB/s)",
       "  Prediction is bandwidth/bytes-per-token. Reliable because generation",

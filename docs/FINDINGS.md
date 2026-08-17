@@ -765,18 +765,52 @@ What each role actually needs on disk:
 
 | Role | Needs | Kimi K2 (547 GB, 7 nodes) |
 |---|---|---|
-| **Coordinator** (`llama-server`) | the entire GGUF | **547 GB** |
-| **Each worker** (`rpc-server -c`) | tensor cache only | **~59 GB** |
+| **Coordinator** (`llama-server`) | the entire GGUF on **disk** | **547 GB disk** |
+| **Each worker** | its layer share in **RAM** | **~78 GB RAM** |
+| **Each worker** | `-c` tensor cache on **disk** | **~78 GB disk** |
 
-The worker figure comes from measurement, not theory. Running two
-`rpc-server -c` instances against the 2.49 GB Qwen3-4B produced a
-**1.9 GB** cache (109 files) — **~76%** of the model, since `-c` caches tensors
-≥10 MiB. So per worker ≈ `0.76 × model_size / n_nodes`.
+No worker ever needs the whole model, on disk or in RAM.
+
+**Weights are RAM-resident, not paged from disk.** Worth stating explicitly
+because the natural assumption — that a MoE keeps all experts on disk and pages
+in whichever are needed — describes a *different* technique (llama.cpp's
+`--override-tensor` offloading, or mmap paging), not RPC sharding.
+
+RPC splits by **layer**, not by expert. Each node receives a contiguous layer
+range and holds **every expert of those layers** resident. Measured by RSS on
+two workers, `--tensor-split 1,1`:
+
+| | Worker A | Worker B |
+|---|---:|---:|
+| RSS before load | 5 MB | 5 MB |
+| **RSS after load** | **1268 MB** | **1449 MB** |
+
+Combined 2717 MB against a 2382 MB model file — each worker holds its full
+share resident. Only the **selected** experts are *read* per token, and that
+read-volume reduction is the entire speed benefit.
+
+**Total params set RAM. Active params set speed.** This is why a 547 GB model
+needs ~692 GB of pooled RAM, and it is the reason the cluster exists at all: if
+experts were paged from disk, one machine with a large disk could run Kimi K2
+and there would be no project.
+
+**Worker disk (the `-c` cache) — corrected.** Two `rpc-server -c` instances with
+**separate `LLAMA_CACHE` dirs** cached 817 MB and 1.1 GB for the 2.4 GB model:
+1.9 GB combined, ~76%. An earlier version of this finding measured a *shared*
+cache directory and divided, which happened to give the same ratio but did not
+actually demonstrate that each worker stores only its own share. The separate
+dirs do.
+
+**However, 0.76 does not generalise.** Qwen3-4B is small and dense, so sub-10 MiB
+tensors (embeddings, norms) are a meaningful fraction. In a large MoE nearly
+every expert tensor is far above the 10 MiB threshold, so the ratio approaches
+**1.0**. **Plan worker disk at the full layer share** — 78 GB per node for
+Kimi K2, not 59.
 
 **Consequences for the storage question:**
 
 1. **No shared storage is needed for inference.** Workers already have 477 GB
-   disks against a ~59 GB requirement.
+   disks against a ~78 GB requirement.
 2. **The coordinator role should follow the disk, not the other way round.**
    Whichever node gets the large drive should run `llama-server`. Shipping
    547 GB to a fixed coordinator solves a problem that does not exist.
