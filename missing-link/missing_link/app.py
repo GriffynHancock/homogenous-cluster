@@ -1,12 +1,15 @@
 """Missing Link web API and UI.
 
-Deliberately minimal: no auth, no priorities, no distributed workers. It runs
-on an isolated network by design (see the security posture in CLAUDE.md --
-securing the network is the organisation's responsibility, and this app makes
-no claim to help).
+Deliberately minimal: no auth, no distributed workers. It runs on an isolated
+network by design (see the security posture in CLAUDE.md -- securing the
+network is the organisation's responsibility, and this app makes no claim to
+help).
 
 The point of this layer is that slowness stops being a defect. A chat window
-makes a user wait; a job queue lets them submit and leave.
+makes a user wait; a job queue lets them submit and leave. Queue control
+(reordering, cancel/stop) and a completion marker exist for the same reason:
+"submit and leave" only works if leaving does not mean losing control of the
+queue, or missing that something finished.
 """
 import os
 import asyncio
@@ -53,7 +56,10 @@ def index(request: Request):
         request, "index.html",
         {"jobs": db.list_jobs(DB_PATH), "kinds": sorted(worker.PROMPTS),
          "rate": _rate_note(), "backlog": db.pending_chunk_backlog(DB_PATH),
-         "tput": db.throughput_stats(DB_PATH)},
+         "tput": db.throughput_stats(DB_PATH),
+         # Part 3: how a returning user finds out what finished without
+         # polling every job page. See db.count_unseen.
+         "unseen": db.count_unseen(DB_PATH)},
     )
 
 
@@ -124,11 +130,67 @@ def job_view(request: Request, job_id: str):
     job = db.get_job(DB_PATH, job_id)
     if job is None:
         raise HTTPException(404, "no such job")
+    # Viewing a finished job's page IS the acknowledgement -- the simplest
+    # "seen" interaction available without JS. Terminal-but-unread is exactly
+    # what "unseen" means; see db.count_unseen / the index banner.
+    if job["status"] in ("done", "failed", "cancelled") and job["seen_at"] is None:
+        db.mark_seen(DB_PATH, job_id)
+        job = db.get_job(DB_PATH, job_id)
     return TEMPLATES.TemplateResponse(
         request, "job.html",
         {"job": job,
          "estimate": _estimate_for(job) if job["status"] in ("pending", "running") else None,
          "sections": db.get_chunk_summaries(DB_PATH, job_id)})
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """Cancel a pending job, or request a cooperative stop of a running one.
+
+    Same route for both -- db.request_cancel decides which applies from the
+    job's current status. See worker.JobCancelled for exactly how far a stop
+    on a RUNNING job goes (it cannot preempt the chunk currently in flight).
+    """
+    result = db.request_cancel(DB_PATH, job_id)
+    if result is None:
+        raise HTTPException(404, "no such job")
+    return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+
+@app.post("/jobs/reorder")
+async def reorder_jobs(request: Request):
+    """Save a new queue order for pending jobs. Takes effect on the NEXT claim
+    (see claim_next_pending) -- a job already running finishes or is stopped
+    separately, it is not interrupted by a reorder.
+
+    Reads raw form data rather than typed FastAPI params because the field
+    names are dynamic (one `priority_<job id>` input per pending row in
+    templates/index.html) -- there is no fixed set of parameters to declare.
+    """
+    form = await request.form()
+    pending = [j for j in db.list_jobs(DB_PATH) if j["status"] == "pending"]
+
+    def sort_key(j):
+        # A missing or unparsable field must not crash the page -- fall back
+        # to the job's existing priority so a partial submission still
+        # produces a sensible (if partially unreordered) result.
+        raw = form.get(f"priority_{j['id']}")
+        try:
+            rank = float(raw)
+        except (TypeError, ValueError):
+            rank = float(j["priority"])
+        return (rank, j["created_at"], j["id"])
+
+    ordered_ids = [j["id"] for j in sorted(pending, key=sort_key)]
+    db.reorder_pending(DB_PATH, ordered_ids)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/jobs/ack")
+def acknowledge_all():
+    """Dismiss the 'N jobs finished' banner on the index page."""
+    db.mark_all_seen(DB_PATH)
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/jobs/{job_id}/result", response_class=PlainTextResponse)
@@ -148,7 +210,7 @@ def health():
         "ok": True,
         "llama_url": LLAMA_URL,
         "counts": {s: sum(1 for j in jobs if j["status"] == s)
-                   for s in ("pending", "running", "done", "failed")},
+                   for s in ("pending", "running", "done", "failed", "cancelled")},
     }
 
 

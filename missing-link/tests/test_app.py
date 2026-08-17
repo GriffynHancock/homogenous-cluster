@@ -84,3 +84,87 @@ def test_health_reports_counts(client):
     h = client.get("/health").json()
     assert h["ok"] is True
     assert h["counts"]["pending"] == 1
+    assert "cancelled" in h["counts"]
+
+
+# --- queue control: cancel / stop / reorder (Part 2) --------------------------
+
+def _submit(client, doc="x"):
+    r = client.post("/jobs", data={"kind": "summarise", "document": doc},
+                    follow_redirects=False)
+    return r.headers["location"].rsplit("/", 1)[-1]
+
+
+def test_cancel_pending_job_via_route(client):
+    job_id = _submit(client)
+    r = client.post(f"/jobs/{job_id}/cancel", follow_redirects=False)
+    assert r.status_code == 303
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "cancelled"
+
+
+def test_cancel_missing_job_404s(client):
+    assert client.post("/jobs/nope/cancel").status_code == 404
+
+
+def test_reorder_changes_which_pending_job_is_listed_where(client):
+    from missing_link import db
+    from missing_link.app import DB_PATH
+
+    first = _submit(client, "first")
+    second = _submit(client, "second")
+
+    r = client.post("/jobs/reorder",
+                    data={f"priority_{first}": "9", f"priority_{second}": "1"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+
+    assert db.get_job(DB_PATH, second)["priority"] < db.get_job(DB_PATH, first)["priority"]
+    # And the new order is what the worker will actually claim next.
+    assert db.claim_next_pending(DB_PATH)["id"] == second
+
+
+def test_index_renders_reorder_form_only_with_multiple_pending(client):
+    r = client.get("/")
+    assert "Save order" not in r.text, "no reorder form with 0 pending jobs"
+    _submit(client, "only one")
+    r = client.get("/")
+    assert "Save order" not in r.text, "no reorder form with exactly 1 pending job"
+    _submit(client, "a second one")
+    r = client.get("/")
+    assert "Save order" in r.text
+
+
+# --- completion notification marker (Part 3) -----------------------------------
+
+def test_unseen_banner_appears_after_completion_and_clears_on_ack(client):
+    from missing_link import db
+    from missing_link.app import DB_PATH
+
+    job_id = _submit(client)
+    r = client.get("/")
+    assert "finished since you last checked" not in r.text  # still pending
+
+    db.claim_next_pending(DB_PATH)
+    db.complete_job(DB_PATH, job_id, "the result", {})
+
+    r = client.get("/")
+    assert "finished since you last checked" in r.text
+    assert "NEW" in r.text
+
+    r = client.post("/jobs/ack", follow_redirects=False)
+    assert r.status_code == 303
+    r = client.get("/")
+    assert "finished since you last checked" not in r.text
+
+
+def test_viewing_a_finished_job_marks_it_seen(client):
+    from missing_link import db
+    from missing_link.app import DB_PATH
+
+    job_id = _submit(client)
+    db.claim_next_pending(DB_PATH)
+    db.complete_job(DB_PATH, job_id, "the result", {})
+    assert db.get_job(DB_PATH, job_id)["seen_at"] is None
+
+    assert client.get(f"/jobs/{job_id}").status_code == 200
+    assert db.get_job(DB_PATH, job_id)["seen_at"] is not None

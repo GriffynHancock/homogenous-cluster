@@ -1,5 +1,14 @@
 {% extends "base.html" %}
 {% block body %}
+{% if unseen %}
+<div class="banner">
+  <span><strong>{{ unseen }}</strong> job{{ "s" if unseen != 1 }} finished since you last checked.</span>
+  <form method="post" action="/jobs/ack" class="inline-form">
+    <button type="submit" class="btn-sm">Dismiss</button>
+  </form>
+</div>
+{% endif %}
+
 <form method="post" action="/jobs" enctype="multipart/form-data">
   <label for="kind">Task</label>
   <select name="kind" id="kind">
@@ -26,22 +35,62 @@
   <em>Approximate — word counts, not tokens.</em>{% endif %}
 </p>
 
+{% set pending_jobs = jobs | selectattr("status", "equalto", "pending") | list %}
+{% if pending_jobs | length > 1 %}
+<form method="post" action="/jobs/reorder">
+  <p style="color:var(--mut);font-size:.85rem;margin:0 0 .5rem">
+    Queue order — lower number runs first. Edit and save; it takes effect from
+    the next job the worker picks up (a job already running is not interrupted).
+  </p>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Order</th><th>Job</th><th>Task</th><th>Submitted</th></tr></thead>
+    <tbody>
+    {% for j in pending_jobs %}
+      <tr>
+        <td><input type="number" name="priority_{{ j.id }}" value="{{ j.priority }}" style="width:4.5rem"></td>
+        <td><code>{{ j.id }}</code></td>
+        <td>{{ j.kind }}</td>
+        <td>{{ j.created_at[:19].replace("T"," ") }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <button type="submit">Save order</button>
+</form>
+{% endif %}
+
 <div class="tbl-wrap">
 <table>
   <thead><tr><th>Job</th><th>Task</th><th>Status</th><th>Chunks</th>
-             <th>Time</th><th>Submitted</th></tr></thead>
+             <th>Time</th><th>Submitted</th><th>Actions</th></tr></thead>
   <tbody>
   {% for j in jobs %}
     <tr>
       <td><a href="/jobs/{{ j.id }}"><code>{{ j.id }}</code></a></td>
       <td>{{ j.kind }}</td>
-      <td><span class="badge {{ j.status }}">{{ j.status }}</span></td>
+      <td><span class="badge {{ j.status }}">{{ j.status }}</span>
+        {%- if j.status in ("done","failed","cancelled") and not j.seen_at %}<span class="new-flag">NEW</span>{% endif %}</td>
       <td>{{ j.chunks if j.chunks is not none else "—" }}</td>
       <td>{{ "%.0fs"|format(j.total_s) if j.total_s else "—" }}</td>
       <td>{{ j.created_at[:19].replace("T"," ") }}</td>
+      <td>
+        {% if j.status == "pending" %}
+        <form method="post" action="/jobs/{{ j.id }}/cancel" class="inline-form">
+          <button type="submit" class="btn-sm">Cancel</button>
+        </form>
+        {% elif j.status == "running" %}
+          {% if j.cancel_requested %}
+          <span style="color:var(--mut);font-size:.75rem">stopping…</span>
+          {% else %}
+          <form method="post" action="/jobs/{{ j.id }}/cancel" class="inline-form">
+            <button type="submit" class="btn-sm">Stop</button>
+          </form>
+          {% endif %}
+        {% else %}—{% endif %}
+      </td>
     </tr>
   {% else %}
-    <tr><td colspan="6" style="color:var(--mut)">No jobs yet.</td></tr>
+    <tr><td colspan="7" style="color:var(--mut)">No jobs yet.</td></tr>
   {% endfor %}
   </tbody>
 </table>

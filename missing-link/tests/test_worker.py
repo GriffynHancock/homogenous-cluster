@@ -20,7 +20,7 @@ class FakeClient:
     multi-minute round trip against a real model.
     """
 
-    def __init__(self, replies=None, fail_with=None):
+    def __init__(self, replies=None, fail_with=None, model="fake-model"):
         self.prompts = []
         # Token budget per call. Needed to assert that the reduce step gets a
         # larger budget than the map step -- using one value for both is how a
@@ -29,6 +29,13 @@ class FakeClient:
         self.replies = replies
         self.fail_with = fail_with
         self.calls = 0
+        # model_name() opts a FakeClient into the resumability path (run_one
+        # only resumes when BOTH the recorded and current model are known --
+        # see run_one). Every FakeClient answers a fixed name by default,
+        # which does not affect any test that never persists chunk summaries;
+        # tests that care about the resume/discard decision pass a different
+        # `model` to simulate the server now serving something else.
+        self.model = model
 
     def complete(self, prompt, max_tokens=512):
         self.prompts.append(prompt)
@@ -39,6 +46,9 @@ class FakeClient:
         if self.replies is None:
             return f"summary-{self.calls}"
         return self.replies[(self.calls - 1) % len(self.replies)]
+
+    def model_name(self):
+        return self.model
 
 
 # --- prompt construction ----------------------------------------------------
@@ -494,3 +504,284 @@ def test_client_without_a_health_probe_still_works(dbpath):
     db.create_job(dbpath, "summarise", "a document")
     assert worker.run_one(dbpath, "http://x", FakeClient()) is True
     assert db.list_jobs(dbpath)[0]["status"] == "done"
+
+
+# --- resumability (Part 1) ----------------------------------------------------
+# BEFORE this feature, save_chunk_summaries was called exactly once, after
+# summarise_traced returned -- i.e. after the WHOLE document (every chunk plus
+# the reduce step) had finished. A job killed mid-document lost every
+# completed chunk summary with it. These tests cover the fix: incremental
+# persistence via on_chunk_done, skipping already-done chunks via
+# resume_records, and the model-identity guard around trusting a resume.
+
+def test_summarise_traced_skips_chunks_present_in_resume_records():
+    """A chunk whose index/span is already in resume_records must not be
+    re-sent to the model -- that is the entire point of resuming."""
+    client = FakeClient()
+    doc = "word " * 20000
+    spans = worker.chunk_spans(doc)
+    assert len(spans) > 2
+
+    # Pretend chunks 0 and 1 already completed in an earlier, interrupted run.
+    resume = [
+        {"index": spans[0]["index"], "start": spans[0]["start"],
+         "end": spans[0]["end"], "summary": "PRIOR SUMMARY 0"},
+        {"index": spans[1]["index"], "start": spans[1]["start"],
+         "end": spans[1]["end"], "summary": "PRIOR SUMMARY 1"},
+    ]
+    final, records = worker.summarise_traced(
+        "summarise", doc, client, resume_records=resume)
+
+    assert records[0]["summary"] == "PRIOR SUMMARY 0"
+    assert records[1]["summary"] == "PRIOR SUMMARY 1"
+    # The resumed summaries legitimately appear in the FINAL reduce prompt
+    # (that is the whole point -- the reduce step covers the union of old and
+    # new chunk summaries). What must never happen is a MAP call re-deriving
+    # them from the source text, so check every call except the last (reduce).
+    assert not any("PRIOR" in p for p in client.prompts[:-1])
+    assert "PRIOR SUMMARY 0" in client.prompts[-1]
+    # Only the REMAINING chunks (+ 1 reduce call) hit the model.
+    assert client.calls == (len(spans) - 2) + 1
+
+
+def test_summarise_traced_ignores_a_resume_record_with_a_stale_span():
+    """If a resumed record's offsets no longer match the current chunking
+    (e.g. CHUNK_TOKENS changed between runs), it must be redone, not trusted."""
+    client = FakeClient()
+    doc = "word " * 20000
+    stale = [{"index": 0, "start": 999999, "end": 999999 + 5, "summary": "STALE"}]
+    final, records = worker.summarise_traced(
+        "summarise", doc, client, resume_records=stale)
+    assert records[0]["summary"] != "STALE"
+
+
+def test_on_chunk_done_fires_once_per_newly_computed_chunk_only():
+    """The callback must fire for NEW chunks and must NOT fire for resumed
+    ones -- resumed chunks are already persisted, re-saving them is at best
+    redundant and at worst overwrites a real record with a stale one."""
+    client = FakeClient()
+    doc = "word " * 20000
+    spans = worker.chunk_spans(doc)
+    resume = [{"index": spans[0]["index"], "start": spans[0]["start"],
+               "end": spans[0]["end"], "summary": "PRIOR"}]
+    seen = []
+    worker.summarise_traced("summarise", doc, client, resume_records=resume,
+                            on_chunk_done=seen.append)
+    assert len(seen) == len(spans) - 1
+    assert all(r["index"] != spans[0]["index"] for r in seen)
+
+
+def test_should_stop_halts_before_the_next_new_chunk():
+    """should_stop is honoured between chunks, and raises JobCancelled rather
+    than silently returning a partial result -- callers must not mistake a
+    stopped job for a completed one."""
+    client = FakeClient()
+    doc = "word " * 20000
+    calls_before_stop = 2
+    flag = {"stop": False}
+
+    def should_stop():
+        return flag["stop"]
+
+    def on_chunk_done(record):
+        if record["index"] == calls_before_stop - 1:
+            flag["stop"] = True
+
+    with pytest.raises(worker.JobCancelled):
+        worker.summarise_traced("summarise", doc, client,
+                                on_chunk_done=on_chunk_done, should_stop=should_stop)
+    assert client.calls == calls_before_stop, "must not start another chunk once stopped"
+
+
+def test_crash_mid_job_resumes_without_redoing_completed_chunks(dbpath):
+    """The core regression test: simulate a real process crash mid-document
+    (not a caught exception -- an actual death) and confirm the chunks
+    completed before it survive, and a resumed run does not redo them.
+    """
+    text = "word " * 20000
+    job_id = db.create_job(dbpath, "summarise", text)
+    job = db.claim_next_pending(dbpath)
+    assert job["id"] == job_id
+    n_chunks = worker.count_chunks(text)
+    assert n_chunks > 3
+
+    crashy = FakeClient(model="model-A")
+    crash_after = 2
+
+    def on_chunk_done(record):
+        # Exactly what run_one's _persist_chunk does: persist as each chunk
+        # completes, not at the end.
+        db.save_chunk_summaries(dbpath, job_id, [record], model=crashy.model_name())
+        if record["index"] == crash_after - 1:
+            raise RuntimeError("simulated process crash")
+
+    with pytest.raises(RuntimeError):
+        worker.summarise_traced("summarise", text, crashy, on_chunk_done=on_chunk_done)
+
+    persisted = db.get_chunk_summaries(dbpath, job_id)
+    assert len(persisted) == crash_after, \
+        "chunks completed before the crash must already be persisted"
+
+    # The process is gone; the job is stuck 'running' until the next startup.
+    assert db.get_job(dbpath, job_id)["status"] == "running"
+    n = db.requeue_running(dbpath)
+    assert n == 1
+
+    resumer = FakeClient(model="model-A")   # same model serving after restart
+    assert worker.run_one(dbpath, "http://x", resumer) is True
+
+    job = db.get_job(dbpath, job_id)
+    assert job["status"] == "done"
+    # Only the chunks NOT already persisted, plus one reduce call, should have
+    # reached the model on resume.
+    assert resumer.calls == (n_chunks - crash_after) + 1
+    assert len(db.get_chunk_summaries(dbpath, job_id)) == n_chunks
+
+
+def test_resume_against_a_different_model_discards_and_restarts(dbpath):
+    """If the server is now serving a different model than produced the
+    persisted chunks, resuming must NOT silently mix outputs from two models.
+    Chosen behaviour (see worker.run_one's comment): discard and restart the
+    map phase cleanly, not refuse -- so an unattended queue is not stuck
+    waiting on an operator just because the server was restarted onto a
+    different model.
+    """
+    text = "word " * 20000
+    job_id = db.create_job(dbpath, "summarise", text)
+    db.claim_next_pending(dbpath)
+    n_chunks = worker.count_chunks(text)
+
+    crashy = FakeClient(model="model-A")
+
+    def on_chunk_done(record):
+        db.save_chunk_summaries(dbpath, job_id, [record], model=crashy.model_name())
+        if record["index"] == 1:
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError):
+        worker.summarise_traced("summarise", text, crashy, on_chunk_done=on_chunk_done)
+    assert len(db.get_chunk_summaries(dbpath, job_id)) == 2
+
+    db.requeue_running(dbpath)
+
+    resumer = FakeClient(model="model-B")   # a DIFFERENT model now serving
+    assert worker.run_one(dbpath, "http://x", resumer) is True
+
+    assert db.get_job(dbpath, job_id)["status"] == "done"
+    # Every chunk was redone (none skipped) because the model changed, plus
+    # one reduce call.
+    assert resumer.calls == n_chunks + 1
+    # And the persisted rows now all carry the NEW model, not a mix.
+    assert db.get_recorded_model(dbpath, job_id) == "model-B"
+
+
+def test_resume_with_unknown_current_model_does_not_resume(dbpath):
+    """A client that cannot identify its model (no model_name(), or /props
+    unreachable) must not be trusted to resume -- an unconfirmed match is
+    treated the same as a mismatch, not as a pass."""
+    class NoModelClient(FakeClient):
+        model_name = None  # simulate a client with no model_name() at all
+
+    text = "word " * 20000
+    job_id = db.create_job(dbpath, "summarise", text)
+    db.claim_next_pending(dbpath)
+    n_chunks = worker.count_chunks(text)
+
+    db.save_chunk_summaries(
+        dbpath, job_id,
+        [{"index": 0, "start": 0, "end": 4, "summary": "prior"}],
+        model="model-A")
+    db.requeue_running(dbpath)
+
+    resumer = NoModelClient()
+    assert worker.run_one(dbpath, "http://x", resumer) is True
+    assert db.get_job(dbpath, job_id)["status"] == "done"
+    # No chunk was skipped -- the whole document was redone from scratch.
+    assert resumer.calls == n_chunks + 1
+
+
+# --- stopping a running job (Part 2) -------------------------------------------
+
+def test_run_one_honours_a_cancel_request_between_chunks(dbpath):
+    """Simulates an operator clicking Stop while a job is mid-document: the
+    cancel_requested flag is set concurrently (here, from inside a chunk
+    completion, standing in for a concurrent web request), and the job must
+    stop at the next chunk boundary rather than finishing the document."""
+    text = "word " * 20000
+    job_id = db.create_job(dbpath, "summarise", text)
+    n_chunks = worker.count_chunks(text)
+    assert n_chunks > 3
+    stop_after = 2
+
+    class StoppingClient(FakeClient):
+        def complete(self, prompt, max_tokens=512):
+            out = super().complete(prompt, max_tokens=max_tokens)
+            if self.calls == stop_after:
+                db.request_cancel(dbpath, job_id)
+            return out
+
+    assert worker.run_one(dbpath, "http://x", StoppingClient()) is True
+
+    job = db.get_job(dbpath, job_id)
+    assert job["status"] == "cancelled"
+    assert job["chunks"] == stop_after
+    # Chunks completed before the stop are kept, not discarded.
+    assert len(db.get_chunk_summaries(dbpath, job_id)) == stop_after
+    # And the job must genuinely have stopped short of the full document.
+    assert job["result"] is None
+
+
+def test_cancelled_job_is_resumable_like_a_crashed_one(dbpath):
+    """A cooperatively-stopped job keeps its persisted chunks, so moving it
+    back to pending (whatever triggers that -- here, direct as a stand-in for
+    a future 'resume' action) continues rather than restarts."""
+    text = "word " * 20000
+    job_id = db.create_job(dbpath, "summarise", text)
+    n_chunks = worker.count_chunks(text)
+    stop_after = 2
+
+    class StoppingClient(FakeClient):
+        def complete(self, prompt, max_tokens=512):
+            out = super().complete(prompt, max_tokens=max_tokens)
+            if self.calls == stop_after:
+                db.request_cancel(dbpath, job_id)
+            return out
+
+    worker.run_one(dbpath, "http://x", StoppingClient())
+    assert db.get_job(dbpath, job_id)["status"] == "cancelled"
+
+    # Put it back in the queue (a manual/future "resume" action).
+    import sqlite3
+    conn = sqlite3.connect(dbpath)
+    conn.execute("UPDATE jobs SET status='pending', cancel_requested=0 WHERE id=?",
+                (job_id,))
+    conn.commit()
+    conn.close()
+
+    resumer = FakeClient()
+    assert worker.run_one(dbpath, "http://x", resumer) is True
+    assert db.get_job(dbpath, job_id)["status"] == "done"
+    assert resumer.calls == (n_chunks - stop_after) + 1
+
+
+# --- notification hook (Part 3) ------------------------------------------------
+
+def test_notify_completion_hook_is_called_and_is_a_documented_noop(dbpath):
+    """notify_completion is the documented hook point for a future
+    email/webhook integration. It must be called with the finished job's full
+    row, and it must do nothing on its own -- CLAUDE.md rules out adding an
+    SMTP dependency or any outbound network call here."""
+    calls = []
+    orig = worker.notify_completion
+    worker.notify_completion = lambda job: calls.append(job)
+    try:
+        job_id = db.create_job(dbpath, "summarise", "hello world")
+        worker.run_one(dbpath, "http://x", FakeClient())
+    finally:
+        worker.notify_completion = orig
+
+    assert len(calls) == 1
+    assert calls[0]["id"] == job_id
+    assert calls[0]["status"] == "done"
+    # The real (default) implementation must not raise or do anything network-y.
+    assert worker.notify_completion(calls[0]) is None
