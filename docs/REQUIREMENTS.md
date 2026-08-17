@@ -141,19 +141,22 @@ certainly yes, and unmeasured.
 
 ## Open requirements not yet met
 
+**Updated 2026-08-18** — verified against the merged code (`main` at `33ddc79`),
+not just against the earlier "in progress" claim.
+
 | Requirement | State |
 |---|---|
-| Batch upload | in progress |
-| Document table with previews + per-row workflow tick boxes | in progress |
-| Per-workflow prompt inputs | in progress |
-| Navigation / no orphaned routes | in progress |
-| Raw-text output page | in progress |
-| Cancel + reorder pending jobs | in progress |
-| Stop a running job | in progress, with a stated limit |
-| Resume from intermediate artifacts | in progress |
-| Notification on completion | in progress |
-| Watchdog moved off-cluster | **not started — needs hardware** |
-| Chunk-size / quant-format measurement | **not started** (`DESIGN-NOTES.md` H) |
+| Batch upload | **done** — `POST /batch`, multi-file |
+| Document table with previews + per-row workflow tick boxes | **done** — `batch.html`; text preview (first 200 chars), a page-1 image thumbnail was considered and deliberately rejected (`app.py`, `PREVIEW_CHARS` comment) rather than left undone |
+| Per-workflow prompt inputs | **done** — typed textarea or uploaded file per workflow, refused (not truncated) over a measured size cap |
+| Navigation / no orphaned routes | **done** — top-level nav in `base.html`; every route reachable by clicking through from the index or a job page |
+| Raw-text output page | **done** — `GET /jobs/{id}/text`, linked from the job page |
+| Cancel + reorder pending jobs | **done** — `POST /jobs/{id}/cancel`, `POST /jobs/reorder` |
+| Stop a running job | **done, with the stated limit** — cooperative only, cannot interrupt an in-flight HTTP call |
+| Resume from intermediate artifacts | **done** — chunk summaries persist per chunk; a resume is trusted only if the recorded model AND instruction both match what is currently serving |
+| Notification on completion | **done** — `seen_at` flag + unseen-jobs banner, `POST /jobs/ack` |
+| Watchdog moved off-cluster | **in progress** — an agent is building the multi-node version now; `cluster/llama-watchdog.sh` still runs on-node today |
+| Chunk-size / quant-format measurement | **in progress on node 2** — `llama-server@8080` up there, `rpc-server@50052` deliberately stopped for the duration (`DESIGN-NOTES.md` H) |
 
 ---
 

@@ -84,8 +84,11 @@ OVERLAP_TOKENS = 410
 WORDS_PER_TOKEN = 0.70
 
 # llama-server on this hardware takes minutes per request, not seconds.
-# BOTH LlamaIndex and LangChain default to a 60 s timeout and retry 3-6 times;
-# against a multi-minute backend that is a retry storm, not a summary.
+# BOTH LlamaIndex and LangChain default to a 60 s timeout; against a
+# multi-minute backend that is a retry storm, not a summary. Corrected
+# 2026-08-18: max_retries defaults to 2 in the underlying OpenAI/Anthropic
+# SDKs both libraries build on, not the 3-6 originally assumed here -- the
+# retry-storm risk is still real, since each retry re-waits the full timeout.
 DEFAULT_TIMEOUT_S = 3600
 
 # Per-model reasoning suppression. There is NO universal flag, and assuming one
