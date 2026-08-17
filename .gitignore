@@ -13,3 +13,4 @@ provisioning/tskey*
 # Operationally necessary on the coordinator, but not part of the published
 # project. Every agent should READ it; nobody should commit it.
 network.md
+llama.log
