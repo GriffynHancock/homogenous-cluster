@@ -8,6 +8,16 @@
   <meta http-equiv="refresh" content="15">
   <p style="color:var(--mut)">This page refreshes every 15 seconds. Nothing is
   waiting on you — close it and come back.</p>
+  {% if estimate %}
+  <p><strong>Expected to take about {{ estimate.human }}.</strong>
+    <span style="color:var(--mut)">
+    {%- if estimate.basis == "measured" %}
+      Based on how long this cluster's completed jobs actually took.
+    {%- else %}
+      Rough estimate — this cluster has not finished enough jobs to calibrate yet,
+      so this comes from benchmark figures, not from observed runs.
+    {%- endif %}</span></p>
+  {% endif %}
 {% endif %}
 
 <div class="tbl-wrap"><table>

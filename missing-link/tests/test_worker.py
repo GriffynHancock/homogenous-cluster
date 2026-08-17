@@ -345,3 +345,54 @@ def test_unknown_model_gets_NO_kwargs_rather_than_a_guess():
 def test_longest_family_match_wins():
     """'qwen3' must beat the more general 'qwen' entry."""
     assert worker.reasoning_kwargs_for("Qwen3-Next-80B") == {"enable_thinking": False}
+
+
+# --- preview estimate (DESIGN-NOTES F: "when will this be done?") -------------
+
+def test_estimate_scales_with_chunks_and_flags_its_basis():
+    one = worker.estimate_seconds("short doc", 100.0)
+    many = worker.estimate_seconds("word " * 20000, 100.0)
+    assert many[0] > one[0]
+    assert one[1] == "measured", "an explicit rate is measured, not an estimate"
+
+
+def test_estimate_falls_back_and_says_so():
+    """The basis must travel with the number. An estimate presented as a
+    measurement is the error F1/F17/F28 were all instances of."""
+    secs, basis = worker.estimate_seconds("short doc")
+    assert basis == "estimate"
+    assert secs == worker.FALLBACK_SECONDS_PER_CHUNK
+
+
+def test_multi_chunk_pays_for_the_reduce_pass():
+    """A single chunk skips reduce; more than one does not."""
+    single, _ = worker.estimate_seconds("tiny", 100.0)
+    assert single == 100.0
+    multi, _ = worker.estimate_seconds("word " * 20000, 100.0)
+    assert multi > worker.count_chunks("word " * 20000) * 100.0
+
+
+def test_humanise_is_readable_by_a_non_specialist():
+    assert worker.humanise_seconds(45) == "45 seconds"
+    assert worker.humanise_seconds(600) == "10 minutes"
+    assert worker.humanise_seconds(7200) == "2.0 hours"
+    assert worker.humanise_seconds(None) == "unknown"
+
+
+def test_seconds_per_chunk_needs_enough_samples(dbpath):
+    """One completed job is not a calibration."""
+    spc, n = db.seconds_per_chunk(dbpath)
+    assert spc is None and n == 0
+
+    j1 = db.create_job(dbpath, "summarise", "a")
+    db.claim_next_pending(dbpath)
+    db.complete_job(dbpath, j1, "r", {"total_s": 200.0, "chunks": 2})
+    spc, n = db.seconds_per_chunk(dbpath)
+    assert spc is None and n == 1, "must refuse to calibrate on a single sample"
+
+    j2 = db.create_job(dbpath, "summarise", "b")
+    db.claim_next_pending(dbpath)
+    db.complete_job(dbpath, j2, "r", {"total_s": 400.0, "chunks": 2})
+    spc, n = db.seconds_per_chunk(dbpath)
+    assert n == 2
+    assert spc == 150.0, "median of 100 and 200 s/chunk"

@@ -170,3 +170,48 @@ def requeue_running(path):
         return cur.rowcount
     finally:
         conn.close()
+
+
+def seconds_per_chunk(path, min_samples=2):
+    """Median seconds-per-chunk from COMPLETED jobs. None if too few samples.
+
+    Self-calibrating: the estimate improves as the cluster runs, rather than
+    relying on a constant that goes stale the moment the model, engine or node
+    count changes. That is the whole point -- this project's recurring failure
+    mode is inherited numbers nobody re-measured (F1, F28, and the 18-month-old
+    dependency pins).
+
+    Returns (median_seconds_per_chunk, n_samples) or (None, n).
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT total_s, chunks FROM jobs "
+            "WHERE status='done' AND total_s IS NOT NULL "
+            "AND chunks IS NOT NULL AND chunks > 0"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    rates = sorted(r["total_s"] / r["chunks"] for r in rows)
+    if len(rates) < min_samples:
+        return None, len(rates)
+    mid = len(rates) // 2
+    if len(rates) % 2:
+        return rates[mid], len(rates)
+    return (rates[mid - 1] + rates[mid]) / 2.0, len(rates)
+
+
+def pending_chunk_backlog(path):
+    """(n_pending_jobs, running_count). Queue depth ahead of a new submission."""
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT "
+            " SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS p, "
+            " SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS r "
+            "FROM jobs"
+        ).fetchone()
+    finally:
+        conn.close()
+    return (row["p"] or 0), (row["r"] or 0)

@@ -433,3 +433,48 @@ def run_forever(db_path, base_url, poll_s=5.0):
     while True:
         if not run_one(db_path, base_url):
             time.sleep(poll_s)
+
+
+# --- Preview estimate --------------------------------------------------------
+# "When will this be done?" is the single most useful thing an async tool can
+# tell a user, and the UI had no answer. See DESIGN-NOTES F.
+#
+# FALLBACK ONLY, and labelled ESTIMATE wherever surfaced. Derived from
+# docs/measurements.md for gpt-oss-120b on ik_llama.cpp, one node:
+#   prefill ~24.5 t/s, generation ~5.2 t/s  (F27)
+# A 4096-token chunk plus ~200 generated tokens is therefore roughly
+#   4096/24.5 + 200/5.2 ~= 167 + 38 ~= 205 s/chunk.
+# The moment two real jobs have completed, observed data replaces this.
+FALLBACK_SECONDS_PER_CHUNK = 205.0
+
+
+def estimate_seconds(document, seconds_per_chunk=None):
+    """Estimated wall-clock seconds for one document. Returns (seconds, basis).
+
+    basis is "measured" when derived from this cluster's own completed jobs, and
+    "estimate" when it fell back to the constant above. Callers MUST surface the
+    distinction -- an estimate presented as a measurement is exactly the error
+    this repo keeps catching.
+    """
+    n = count_chunks(document)
+    if seconds_per_chunk is None:
+        seconds_per_chunk, basis = FALLBACK_SECONDS_PER_CHUNK, "estimate"
+    else:
+        basis = "measured"
+    total = n * seconds_per_chunk
+    # A multi-chunk document pays an extra reduce pass over the map summaries.
+    if n > 1:
+        total += seconds_per_chunk * 0.5
+    return total, basis
+
+
+def humanise_seconds(s):
+    """Round to something a non-specialist reads without decoding it."""
+    if s is None:
+        return "unknown"
+    s = float(s)
+    if s < 90:
+        return f"{s:.0f} seconds"
+    if s < 5400:
+        return f"{s / 60:.0f} minutes"
+    return f"{s / 3600:.1f} hours"

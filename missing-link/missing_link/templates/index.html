@@ -12,6 +12,14 @@
   <button type="submit">Queue it</button>
 </form>
 
+<p style="color:var(--mut);font-size:.85rem">
+  {{ backlog[0] }} waiting, {{ backlog[1] }} running.
+  Typical {{ "%.0f"|format(rate.seconds_per_chunk) }}s per ~4K-token chunk
+  {%- if rate.basis == "measured" %} (measured from {{ rate.samples }} completed job{{ "s" if rate.samples != 1 }})
+  {%- else %} (benchmark estimate — not yet calibrated on this cluster)
+  {%- endif %}.
+</p>
+
 <div class="tbl-wrap">
 <table>
   <thead><tr><th>Job</th><th>Task</th><th>Status</th><th>Chunks</th>

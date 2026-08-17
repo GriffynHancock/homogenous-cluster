@@ -51,7 +51,8 @@ app = FastAPI(title="Missing Link", lifespan=lifespan)
 def index(request: Request):
     return TEMPLATES.TemplateResponse(
         request, "index.html",
-        {"jobs": db.list_jobs(DB_PATH), "kinds": sorted(worker.PROMPTS)},
+        {"jobs": db.list_jobs(DB_PATH), "kinds": sorted(worker.PROMPTS),
+         "rate": _rate_note(), "backlog": db.pending_chunk_backlog(DB_PATH)},
     )
 
 
@@ -92,12 +93,35 @@ def api_get(job_id: str):
     return job
 
 
+def _rate_note():
+    """Seconds-per-chunk for this cluster, and whether it is measured or guessed.
+
+    Surfaced with its BASIS attached. An estimate presented as a measurement is
+    the exact error this repo keeps catching (F1, F17, F28), so the UI says which
+    it is rather than printing a bare number.
+    """
+    spc, n = db.seconds_per_chunk(DB_PATH)
+    if spc is None:
+        return {"seconds_per_chunk": worker.FALLBACK_SECONDS_PER_CHUNK,
+                "basis": "estimate", "samples": n}
+    return {"seconds_per_chunk": spc, "basis": "measured", "samples": n}
+
+
+def _estimate_for(job):
+    """Estimated wall clock for a job, calibrated from completed jobs if possible."""
+    spc, _n = db.seconds_per_chunk(DB_PATH)
+    secs, basis = worker.estimate_seconds(job["document"], spc)
+    return {"seconds": secs, "human": worker.humanise_seconds(secs), "basis": basis}
+
+
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
 def job_view(request: Request, job_id: str):
     job = db.get_job(DB_PATH, job_id)
     if job is None:
         raise HTTPException(404, "no such job")
-    return TEMPLATES.TemplateResponse(request, "job.html", {"job": job})
+    return TEMPLATES.TemplateResponse(
+        request, "job.html",
+        {"job": job, "estimate": _estimate_for(job) if job["status"] in ("pending", "running") else None})
 
 
 @app.get("/jobs/{job_id}/result", response_class=PlainTextResponse)
