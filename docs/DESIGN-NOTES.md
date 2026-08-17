@@ -608,3 +608,59 @@ published KLD comparisons — and it happens to match what a previous session
 already chose: the in-flight Qwen3-Next-80B download is **UD-Q8_K_XL**. Note it
 also interacts with the S=1 threshold: at Q8 that model is **87 GB**, which fits
 one node with ~12 GB spare. At any larger quant it would not.
+
+---
+
+## I. DeepSeek Harness — researched 2026-08-17, and it is a mismatch
+
+`deepseek-ai/deepseek-harness` ("dsh"), released 2026-08-13, MIT, TypeScript, plugin
+("Cordis") architecture, launched via `npx @deepseek-ai/dsh web`. It is an
+**interactive agent runtime in the Claude Code shape** — tool loop, sandboxing,
+session UI — not a scheduler.
+
+**Verdict: do not adopt.** Three independent reasons:
+
+1. **It solves a different problem.** Nothing in it addresses triaging a queue,
+   health-checking R endpoints, routing around a dead node, or assembling batches.
+   It targets a single interactive session against a single configured model.
+2. **It brings no local inference.** It always calls out to an API — DeepSeek's own,
+   or any custom OpenAI-compatible endpoint. Pointing it at `llama-server` is
+   *plausible* but **nobody has demonstrated it** (INFERRED, not confirmed).
+3. **It is four days old and in developer preview with breaking changes promised.**
+   Replacing a working, tested SQLite+FastAPI queue with that does not clear the bar
+   this project sets for adopting a framework over working code.
+
+**Revisit only if** it matures past preview *and* someone demonstrates multi-endpoint
+fan-out. Not before.
+
+---
+
+## H (addendum). Unsloth `UD-` dynamic quants: real, with one capacity trap
+
+Researched 2026-08-17. We already depend on these files (`UD-IQ2_M`, `UD-Q3_K_XL`,
+and the in-flight `UD-Q8_K_XL`) and had never checked the claim behind them.
+
+**What they are (CONFIRMED from Unsloth's docs):** per-*layer*, per-*tensor* bit
+allocation chosen individually per model — important tensors bumped to 4–8 bit,
+unimportant ones as low as 1-bit — using an imatrix built from a curated 300K–1.5M
+token calibration set chosen because plain text calibration is a poor proxy for
+instruct behaviour. **The selection heuristic is not published.**
+
+**Evidence it beats same-size standard quants:** an *independent* Aider Polyglot run
+(not Unsloth staff) gave UD-IQ2_M **64.3%** vs community IQ2_M **56.6%**, and
+UD-IQ4_XS 69.2% vs 66.3%. Unsloth's own KLD/MMLU tables agree. **But** an independent
+DeepSeek-R1 perplexity thread found UD-IQ2_XXS/UD-Q2_K_XL "in the range of the usual
+Q2_K" — i.e. **the advantage may shrink at the extreme low-bit end**, which is exactly
+where we would be tempted to use it.
+
+**THE TRAP, and it is ours specifically:** a UD quant of a given letter is **a size
+tier heavier** than the plain quant, because more tensors get more bits. **So S=1
+capacity maths must use the ACTUAL file size on disk, never the nominal
+quant-letter size from a sizing table.** This is how a model that "fits at Q4" turns
+out not to.
+
+**Ruled out from Unsloth for an inference-only CPU fleet:** fine-tuning/LoRA/RL (its
+core product), Unsloth Desktop (GUI), Dynamic NVFP4 (needs Blackwell-class GPU
+tensor cores), and the GGUF export/tokeniser-patch pipeline (fires only when
+exporting a fine-tune). No merged Unsloth PRs into `ggml-org/llama.cpp` core were
+found.

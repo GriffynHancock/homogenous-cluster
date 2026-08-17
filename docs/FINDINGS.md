@@ -1619,3 +1619,47 @@ measure, provision idempotently, distribute, gate at N=2, then verify by output.
 Every defect since — the claim race, empty completions, truncation, PDF mojibake,
 the wedged backend — lived in the seam between our code and something real. **Report
 what was exercised, not how many assertions ran.**
+
+---
+
+## F38. Uploaded PDFs were decoded as UTF-8 and summarised as binary. The first real input broke it.
+
+**CONFIRMED by the operator uploading a PDF, 2026-08-17.** Recorded with an F-number
+because it was previously only in commit messages and a module docstring, and it is
+the clearest example in this repo of the difference between "tested" and "used".
+
+`app.py` did `raw.decode("utf-8", errors="replace")` on **every** upload. A PDF became
+mojibake beginning `%PDF-1.6 %...346 0 obj <</Metadata...`, was chunked, and was
+summarised — the model would have described object tables and stream keywords, and the
+job would have been stored **`done`**. Four of the operator's jobs were destroyed this
+way before anyone looked at the `document` column.
+
+**There was no PDF text extraction anywhere in the codebase**, for the most common
+document format in health, legal, government and education — the exact sectors this
+project targets. The code comment even said *"documents come from scanners and Windows
+desktops"*, which is where PDFs come from, while handling only text encodings.
+
+**Fixed** in `missing_link/extract.py`: sniff **magic bytes** (not filename
+extensions), extract PDF text with `pypdf`, and **refuse** everything it cannot read —
+naming the format, and telling the operator what to do. A PDF with almost no
+extractable text is **scanned**, needs OCR we do not have, and raises rather than
+summarising an empty document.
+
+**The pattern this completes.** Four defects in one component, all the same shape — a
+plausible-looking result that is actually worthless:
+
+| Finding | Stored as | Actually |
+|---|---|---|
+| F21 | `done` | empty summary |
+| F34 | `done` | truncated mid-sentence |
+| **F38** | `done` | a summary of PDF structure |
+| F36 | `running` | nothing happening at all |
+
+**So the rule for this codebase is now explicit: a completion path must refuse, not
+degrade.** Every guard in `worker.py` and `extract.py` exists because the alternative
+was output that looked fine.
+
+**And the process lesson, which is F34's restated one level up:** the pipeline had 41
+passing tests, then 66, and still fell over on the first *real* file. Synthetic
+fixtures test the half we wrote. **Exercise it with the operator's actual inputs before
+believing anything about it.**

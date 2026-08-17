@@ -24,7 +24,7 @@ real hardware.** Full detail and caveats in `docs/measurements.md`.
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **37 findings** from running this on real
+1. **Read `docs/FINDINGS.md`.** **38 findings** from running this on real
    hardware. Several correct the plan or the spec — **and F28 corrects this file
    and F23.** Do not trust the original plan's numbers over these.
 2. `docs/measurements.md` is the only place performance numbers may be quoted
@@ -318,6 +318,18 @@ Concretely:
   a corpus. See `DESIGN-NOTES.md` E, concessions 1 and 2.
 
 ### 3. Resolve the Model B decision
+
+**Research completed 2026-08-17 and now recorded — read before deciding:**
+`docs/MODEL-SELECTION.md` gained (a) **Meta's whole open-weight line assessed** —
+Llama 4 Scout is the best-evidenced option (7.7% Vectara vs gpt-oss's 14.2%, fits
+S=1) but costs **~3.5× throughput** because it has 17B active against gpt-oss's
+5.1B; Maverick is S=2 at N=2 and rejected; Muse Glimmer is dense 27.8B-active with
+**no Vectara entry**; Muse Spark has no weights. And (b) **the agent-appliance model
+choice** — the Qwen3-4B already on disk is good enough (BFCL-v3 57.6) with thinking
+forced off. `docs/DESIGN-NOTES.md` I rejects the DeepSeek Harness, and H's addendum
+records the **UD-quant capacity trap: a UD quant is a size tier heavier than its
+letter suggests, so S=1 maths must use real file sizes.**
+
 
 **Do not fetch Kimi K2 until this is settled.** K2-Instruct has the worst
 REPORTED hallucination rate of any model checked (17.9%, Vectara
