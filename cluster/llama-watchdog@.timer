@@ -1,0 +1,14 @@
+[Unit]
+Description=Probe llama-server on port %i every minute (in-band)
+
+[Timer]
+# OnBootSec is deliberately long: a 65 GB model load is single-core serialised
+# and can take minutes (F3), and llama-server@.service has TimeoutStartSec=1800.
+# Startup is systemd's problem, not the watchdog's.
+OnBootSec=5min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=llama-watchdog@%i.service
+
+[Install]
+WantedBy=timers.target

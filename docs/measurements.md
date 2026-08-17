@@ -826,3 +826,81 @@ A real completion, verbatim, from the run:
 
 On-topic, accurate, and coherent — so the throughput above was not bought by
 degrading output, per the standing rule in `CLAUDE.md`.
+
+---
+
+## Watchdog liveness signals — what separates BUSY from WEDGED (2026-08-18)
+
+Measured on node 1, `llama-server@8080.service`, ik_llama.cpp, gpt-oss-120b-F16,
+`-t 4 -c 32768 --parallel 4`, `n_threads_http=7`, `n_ctx_slot=8192`. These are the
+numbers `cluster/llama-watchdog.sh` is built on.
+
+### Cgroup CPU (`CPUUsageNSec`) — the discriminator
+
+| Server state | 3 s window | 10 s window | 20 s window | % of one core |
+|---|---:|---:|---:|---:|
+| idle | **0 ms** | **0 ms** | **0 ms** | 0% |
+| ONE real completion in flight | 12,028 ms | 40,046 ms | — | **400%** |
+| 4 concurrent completions | — | 39,827–40,161 ms | — | **398–401%** |
+| SIGSTOPped (simulated wedge) | — | 0 ms | 0 ms | 0% |
+
+Exactly zero against exactly 400%, holding across six consecutive 10 s windows
+spanning both prefill and generation. **The 3 s window separates them as cleanly
+as the 20 s window**, so the 10 s default is margin, not necessity.
+
+Machine-wide **load average was 2.27–3.09 throughout**, from unrelated agent
+processes — which is why load average is not usable here (F39: node 1 read 2.30
+while llama-server was completely idle).
+
+### `/health` latency, and why its timeout is not diagnostic
+
+On an idle (CPU-flat) server, 20 consecutive samples:
+
+| endpoint | min | max | codes |
+|---|---:|---:|---|
+| `/health` (loopback) | 0.736 ms | 0.912 ms | 200 × 20 |
+| `/health` (via 10.10.0.34) | 0.712 ms | 1.211 ms | 200 × 10 |
+| `/props` | 0.649 ms | 0.710 ms | 200 × 5 |
+
+Because CPU is checked first, `/health` is only ever asked when the unit burned
+no CPU — i.e. when a healthy server is idle. In that branch it answers in under
+a millisecond or never. **Any timeout above a few hundred ms yields the same
+verdict**; 5 s is used purely for transport headroom (~520× F28's 9.544 ms
+saturated RTT).
+
+### The probe's own footprint on a busy server
+
+One `curl --max-time 5 /health` issued during four concurrent completions:
+curl gave up at 5.001 s; the server logged the request **75 seconds later** with
+`status=200`. That is 75 s of one of seven http workers pinned in
+`queue_results.recv()`, per probe. Across a **ten-tick busy run the CPU-first
+watchdog issued zero HTTP requests** (`log_server_request` count over the whole
+window: **0**).
+
+### Per-service signals — the CPU predicate does NOT generalise
+
+| service | idle CPU over the window | idle is… | predicate used |
+|---|---:|---|---|
+| `llama-server@8080` | 0 ms | a **fault** when silent | cgroup CPU, then `/health` |
+| `rpc-server@50052` | **0 ms while perfectly healthy** | **NORMAL** | unit active + RPC port accepting *on the node* |
+| `missing-link` | 5,061 ms / 3 s = **0.17% of a core** | **NORMAL** | HTTP + read-only job-store counters |
+
+Applying the llama-server predicate to either of the other two would restart
+healthy services on an idle cluster.
+
+### `/proc/<MainPID>/stat` is unusable on this fleet
+
+`llama-server@.service` runs `ExecStart=/bin/sh -c '...'` and the shell does not
+exec away: `MainPID=72777` is `comm=sh`, 1 thread, `utime=0 stime=0`, while its
+child `72781` (`comm=llama-server`) burns 400% of a core. The `utime+stime`
+signal recommended in `docs/watchdog-research.md` reads **identically zero** here
+and would classify every busy server as wedged. Cgroup accounting covers both
+processes; `CPUUsageNSec` 6,569,646,000 ns == `cpu.stat usage_usec` 6,569,646.
+
+### Missing Link's job store is in WAL mode
+
+`pragma journal_mode` → `wal`. A read-only SQLite connection to a WAL database
+needs **write** access to the `-shm` index, so `mode=ro` as the unprivileged
+watchdog user returns `-1` for every count while succeeding for the owner. The
+watchdog is not given write access to the job store; the query is re-run as the
+store's own user through one narrow `sudoers` rule.
