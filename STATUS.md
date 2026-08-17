@@ -52,6 +52,54 @@ ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'   # then: cla
 
 ---
 
+## IN FLIGHT: three feature agents in git worktrees (2026-08-17, ~22:40)
+
+**These survive a session change. Do not lose them.** Each is a Sonnet agent
+implementing one feature in an isolated worktree, branched from `aaff5f5`, told NOT
+to commit. Their work is in the working tree of each worktree:
+
+```bash
+git worktree list        # all three are 'locked' while the agents hold them
+#  .claude/worktrees/agent-a525fd5f262ad64fb  -> FAN-OUT across R endpoints
+#  .claude/worktrees/agent-a58fdf247ea665915  -> UI (batch upload, table+previews,
+#                                                 per-workflow tickboxes, nav,
+#                                                 prompt inputs, raw-output page)
+#  .claude/worktrees/agent-a2c3ef4fcf6c9806f  -> QUEUE CONTROL + RESUMABILITY
+#                                                 (cancel/reorder/stop, resume from
+#                                                  persisted chunks, notification)
+```
+
+**To pick this up cold:**
+
+```bash
+for w in .claude/worktrees/agent-*; do echo "== $w"; git -C "$w" status --short; done
+# review each, then merge into main by hand -- ALL THREE touch app.py, which is
+# exactly why they were isolated. Expect conflicts in app.py; the changes are
+# mostly in different functions.
+cd missing-link && .venv/bin/python -m pytest tests/ -q   # 75 must still pass
+```
+
+**Merge order that minimises pain:** queue-control/resumability first (deepest
+`db.py` + `worker.py` changes), then fan-out (worker loop), then the UI (routes and
+templates, most additive). If a worktree is unfinished or broken, **discard it and
+re-run that one agent** rather than half-merging — the guards in `worker.py`/`db.py`
+are load-bearing bug fixes (F20/F21/F34/F35/F36) and a botched merge that weakens
+one is worse than not having the feature.
+
+**Owed after the merge**, deliberately deferred to avoid conflicting with the
+agents:
+
+- `WORDS_PER_TOKEN = 0.70` is optimistic. Measured on a real PDF: 2202 chars ->
+  534 tokens, i.e. ~0.62 words/token. Lower it, conservatively.
+- **Add a slot-budget guard.** `LlamaClient` can read `/props` for `n_ctx` and
+  `total_slots`; assert `CHUNK_TOKENS + wrapper + MAP_MAX_TOKENS` fits
+  `n_ctx / total_slots` and fail loudly if not. This session found `-c 16384
+  --parallel 4` silently giving **4096 tokens per slot** against a 4096-token chunk;
+  mitigated by raising `LLAMA_CTX` to 32768 (8192/slot), but nothing in the code
+  would catch a regression.
+
+---
+
 ## Completed this session (was "in flight")
 
 **The 65 GB model copy to node 2 finished and was verified byte-identical**
