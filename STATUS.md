@@ -1,9 +1,12 @@
 # Status
 
-**Updated:** 2026-08-17 (evening — node 2 session)
+**Updated:** 2026-08-18 (early morning — post-merge session)
 **Phase:** **N=2. Node 2 joined, provisioned, characterised and serving.** Both
 engines distributed fleet-wide. **Upstream bug #26500 gate PASSED across real
-machines.** Missing Link **run end-to-end for the first time** and hardened (75 tests).
+machines.** Missing Link **fans out across R inference endpoints, supports queue
+control and resumable chunk-level persistence, and has live per-job telemetry**
+(193 tests). **A chunk-size benchmark is running on node 2 right now** — see the
+box immediately below before doing anything else.
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
 
 **THE REPLICATION MEASUREMENT IS DONE, AND IT PASSES.** Aggregate throughput
@@ -19,6 +22,44 @@ real hardware.** Full detail and caveats in `docs/measurements.md`.
   and qualifies the expert-parallelism comms analysis. See **F28**.
 - **`nodes.env` had node 1's RAM as 125629 MB, which `free -m` does not report**
   (128709 on both nodes). Corrected — it sets `--tensor-split` ratios. See F29.
+
+---
+
+## ⚠ TWO THINGS IN FLIGHT RIGHT NOW — read before touching node 2 or restarting Missing Link
+
+1. **A chunk-size benchmark is RUNNING ON NODE 2 as of this session.**
+   `llama-server@8080` is up on node 2 and `rpc-server@50052` there is
+   **deliberately stopped** for the duration (confirmed:
+   `systemctl is-active llama-server@8080 rpc-server@50052` on node 2 returns
+   `active` / `inactive`). **Do not start `rpc-server@50052` on node 2, do not
+   stop `llama-server@8080` there, and do not run anything else against node 2
+   that contends for the CPU** until the sweep finishes. **Whoever picks this up
+   next must restart the RPC worker on node 2** (`sudo systemctl start
+   rpc-server@50052` on node 2, or re-run `./cluster/install-services.sh`) once
+   it is done, or node 2 is silently missing from any future sharding/RPC work.
+   The bench agent owns `bench/` and `docs/measurements.md`; its results land
+   there, not here.
+
+2. **`missing-link.service` on node 1 is still running the code it loaded
+   BEFORE tonight's five merges.** It has been up since 23:28 the evening
+   before (`systemctl status missing-link.service` shows `Active: active
+   (running) since Mon 2026-08-17 23:28:27`), which predates all five merge
+   commits below. It only picks up the new code — fan-out, queue control,
+   resumability, the db-race fix, live telemetry, per-workflow guidance — on
+   **restart**, and that restart is also the thing that migrates the **live**
+   database. Checked directly against `/opt/missing-link/jobs.sqlite`
+   (`PRAGMA table_info`): `jobs` genuinely lacks `priority`, `cancel_requested`,
+   `seen_at` and `endpoint`; `chunk_summaries` genuinely lacks `model`,
+   `instruction`, `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms` and
+   `completed_at`. **This restart has deliberately NOT been done this session**
+   — the fan-out worker loop only starts on process start, and starting it
+   while node 2's benchmark owns node 2's `llama-server` would pull node 2 into
+   the job queue as an inference endpoint mid-sweep, contaminating the
+   benchmark. **Restart `missing-link.service` only after the node-2 benchmark
+   above is done and its RPC worker is back**, and expect the first request
+   after restart to pay the one-time `_add_missing_columns` migration (fast,
+   additive, idempotent — see `db.py`, F-shape guard tested in
+   `test_db.py`).
 
 ---
 
@@ -52,81 +93,121 @@ ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'   # then: cla
 
 ---
 
-## IN FLIGHT: three feature agents in git worktrees (2026-08-17, ~22:40)
+## MERGED THIS SESSION (2026-08-17 late night → 2026-08-18 early morning)
 
-**ALL THREE FINISHED AND WERE INDEPENDENTLY VERIFIED (2026-08-17 ~23:00).** Each
-is uncommitted in its worktree, awaiting merge:
+**All three feature agents from the previous entry finished, were independently
+verified, and are now on `main` — along with a fourth fix and a rewritten
+watchdog found along the way.** Nothing is awaiting merge. Five commits landed,
+in order:
 
-| Worktree | Feature | Tests | Verified by me |
-|---|---|---:|---|
-| `agent-a525fd5f262ad64fb` | **fan-out** across R endpoints | **86** | `BEGIN IMMEDIATE` intact; both concurrency tests pass; all 6 guards present |
-| `agent-a58fdf247ea665915` | **UI**: batch upload, nav, tick boxes, prompt inputs, raw-output page | **96** | prompts **byte-identical** with no instruction (cannot change model output); migration preserves the live DB |
-| `agent-a2c3ef4fcf6c9806f` | **queue control + resumability** | **110** | migration on a copy of the LIVE db: 7 jobs, same ids, idempotent, index created; `BEGIN IMMEDIATE` intact with new ordering inside the atomic claim |
+| Commit | What | Tests after |
+|---|---|---:|
+| `151ed32` | **fan-out across R inference endpoints** (`fbb7f4d`) merged together with **queue control + resumability** (`a41666e`, via `e9ca351`) | 145 |
+| `9f968a1` | **fixed a concurrency race in `db.init_chunks`** found only by the merge of the two branches above | 145 |
+| `8849fd0` | **rewrote the llama-server watchdog** (`5ba25d6`) + added finding **F39** | 145 (watchdog has no Python tests) |
+| `33ddc79` (`2c1be61`) | **live telemetry on the job page** + **per-workflow guidance input** | **193** |
 
-**Key results worth knowing before merging:**
+`git log --oneline` confirms the chain:
 
-- **Resumability confirmed the diagnosis:** chunk summaries were persisted only
-  after the whole document finished, so a 40-chunk job dying at chunk 39 restarted
-  from zero. Now each chunk persists as it completes, and a resume is trusted **only
-  if the serving model matches the model recorded against those rows** — on mismatch
-  it discards and restarts rather than mixing two models' outputs. That directly
-  implements the operator's own proviso (`REQUIREMENTS.md`).
-- **"Stop a running job" is COOPERATIVE ONLY** and honestly scoped: the flag is
-  checked between chunks and once before reduce. It **cannot** interrupt an in-flight
-  HTTP call — there is no llama.cpp cancellation endpoint — so a stop lands after the
-  current chunk. Completed chunks are never lost.
-- **No PDF thumbnail.** Preview is first-200-characters text; rasterising page 1
-  needs an imaging stack (pypdfium2 / pdf2image+poppler) and the agent flagged rather
-  than silently added it. **Operator decision.**
-- **Notification is a `seen_at` flag + unseen banner**, plus a documented
-  `notify_completion(job)` no-op hook. No SMTP, no outbound network.
-- **Open retention question, raised by the UI agent and worth a real answer:** batch
-  review rows and `jobs.document` are kept **forever**. For sensitive documents that
-  is a policy decision, not a default to inherit.
-
-**These survive a session change. Do not lose them.** Each is a Sonnet agent
-implementing one feature in an isolated worktree, branched from `aaff5f5`, told NOT
-to commit. Their work is in the working tree of each worktree:
-
-```bash
-git worktree list        # all three are 'locked' while the agents hold them
-#  .claude/worktrees/agent-a525fd5f262ad64fb  -> FAN-OUT across R endpoints
-#  .claude/worktrees/agent-a58fdf247ea665915  -> UI (batch upload, table+previews,
-#                                                 per-workflow tickboxes, nav,
-#                                                 prompt inputs, raw-output page)
-#  .claude/worktrees/agent-a2c3ef4fcf6c9806f  -> QUEUE CONTROL + RESUMABILITY
-#                                                 (cancel/reorder/stop, resume from
-#                                                  persisted chunks, notification)
+```
+33ddc79 Merge branch 'worktree-agent-afe0a29dc429a3445'
+2c1be61 feat(ui): live telemetry on the job page, and per-workflow guidance input
+8849fd0 Merge branch 'worktree-agent-acde2185fb6ed82e2'
+5ba25d6 fix(watchdog): /health cannot judge liveness on this engine; use cgroup CPU progress
+9f968a1 fix(db): init_chunks raced under R workers and marked real jobs failed
+151ed32 Merge branch 'worktree-agent-a525fd5f262ad64fb' (fan out across R endpoints)
+e9ca351 Merge queue control + resumability
+fbb7f4d feat(worker): fan out across R inference endpoints
+a41666e feat(queue): cancel/reorder/cooperative-stop, and resume from persisted chunk summaries
 ```
 
-**To pick this up cold:**
+**What each one actually does:**
 
-```bash
-for w in .claude/worktrees/agent-*; do echo "== $w"; git -C "$w" status --short; done
-# review each, then merge into main by hand -- ALL THREE touch app.py, which is
-# exactly why they were isolated. Expect conflicts in app.py; the changes are
-# mostly in different functions.
-cd missing-link && .venv/bin/python -m pytest tests/ -q   # 75 must still pass
-```
+- **Fan-out (`151ed32`).** `main` runs one `_worker_loop` task per
+  `LLAMA_URLS` entry — **job-level** fan-out, deliberately, not chunk-level (see
+  Task 2 below for why that split matters and what is still owed).
+  Health-aware routing probes `/health` **before** claiming a job, so a dead
+  endpoint just stops claiming — costing 1/R of throughput — instead of
+  claim-then-immediately-fail. Per-endpoint status is surfaced on `/health` and
+  the index page.
+- **Queue control + resumability (`151ed32`, via `a41666e`).** Cancel a
+  pending job; reorder pending jobs (`POST /jobs/reorder`, applied on the next
+  claim); cooperative stop of a running job (checked between chunks and once
+  before reduce — it **cannot** interrupt an in-flight HTTP call, there is no
+  llama.cpp cancellation endpoint, so a stop lands after the current chunk).
+  **Chunk summaries now persist as each chunk completes** (`_persist_chunk` in
+  `worker.py`), not only after the whole document finishes — the bug that made
+  a 40-chunk job dying at chunk 39 restart from zero. **A resume is trusted
+  only if the recorded model AND the recorded instruction both match** what is
+  currently serving; on either mismatch it discards and restarts rather than
+  mixing outputs from two different runs. Notification is a `seen_at` flag +
+  unseen-jobs banner (`POST /jobs/ack`).
+- **`init_chunks` race (`9f968a1`).** The lazy check-then-`ALTER TABLE`
+  migration ran on every chunk write; safe with one worker, but main now runs
+  R concurrent workers and the loser of the race got `OperationalError:
+  duplicate column name: model`, which `run_one`'s broad except turned into a
+  **failed** job — a whole night of work marked dead by a migration that had
+  in fact succeeded. Reproduced 20/20 before the fix, 0/20 after (8 full-suite
+  runs, 0 failures). `init_db` is now the single complete migration entry
+  point for `jobs`, `chunk_summaries` and `batch_documents`; the six lazy
+  per-operation calls are gone. **Two agents (the fan-out one and the
+  queue-control one) found the shape of this independently** — neither branch
+  was wrong on its own, the race existed only in their combination, which is
+  why neither branch's own tests caught it.
+- **Watchdog rewrite (`8849fd0`, F39).** `/health`, `/slots` and `/metrics`
+  all post onto the **same task queue** `update_slots()` drains for token
+  generation, so none of them is an out-of-band signal — the F36 watchdog
+  restarted a perfectly healthy server mid-prefill on 2026-08-17 and destroyed
+  a job with 10m55s of completed work. **`/health`'s own slot counters read
+  `n_idle_slots=4 n_processing_slots=0` while the server was busiest prefilling
+  a document** — `3 idle / 1 processing` only showed up during the (much
+  shorter) generation phase. The rewritten watchdog instead reads the unit's
+  own `CPUUsageNSec` (cgroup-scoped, immune to other load on the box) and only
+  restarts after 300 s of unbroken **silent AND CPU-flat** evidence. Read F39
+  in `docs/FINDINGS.md` directly; it is the authoritative account and this
+  paragraph is a summary of it, not a replacement.
+- **Live telemetry + per-workflow guidance (`33ddc79`).** The job page now
+  shows chunk N of M, separate prefill/generation tok/s **derived from the
+  server's own `timings`, never wall-clock** (F17's lesson applied), a
+  three-tier labelled ETA (measured this job / measured this model /
+  estimated), and which endpoint actually ran the job — persisted to a new
+  `jobs.endpoint` column so a **failed** job still shows which node it died
+  on. Per-workflow guidance is a textarea **or** a file upload, extracted via
+  `extract.py`, **refused, not silently truncated**, against a measured size
+  cap (`check_instruction_length` in `worker.py` — see "Owed after the merge"
+  below, this is what closes that item). The resume check from the previous
+  bullet was extended in this commit to require the **instruction** to match,
+  not just the model.
 
-**Merge order that minimises pain:** queue-control/resumability first (deepest
-`db.py` + `worker.py` changes), then fan-out (worker loop), then the UI (routes and
-templates, most additive). If a worktree is unfinished or broken, **discard it and
-re-run that one agent** rather than half-merging — the guards in `worker.py`/`db.py`
-are load-bearing bug fixes (F20/F21/F34/F35/F36) and a botched merge that weakens
-one is worse than not having the feature.
+**Verified, not just counted:** 193 tests pass over the current tree
+(`.venv/bin/python -m pytest tests/ -q`, 8 seconds, 0 failures) — but per
+`CLAUDE.md`'s own standing rule, a test count is not evidence of working
+software on its own. The concurrency fix specifically was verified by
+reproduction (20/20 failures → 0/40), not merely by a passing suite, and the
+`init_db` migration was run twice against a **copy of the live**
+`/opt/missing-link/jobs.sqlite` — 8 job ids preserved, rows identical, second
+run a no-op.
 
-**Owed after the merge**, deliberately deferred to avoid conflicting with the
-agents:
+**Open item the UI agent raised and nobody has answered:** batch review rows
+and `jobs.document` are kept **forever**. For sensitive documents that is a
+policy decision, not a default to inherit.
 
-- `WORDS_PER_TOKEN = 0.70` is optimistic. Measured on a real PDF: 2202 chars ->
-  534 tokens, i.e. ~0.62 words/token. Lower it, conservatively.
-- **Add a slot-budget guard.** `LlamaClient` can read `/props` for `n_ctx` and
-  `total_slots`; assert `CHUNK_TOKENS + wrapper + MAP_MAX_TOKENS` fits
-  `n_ctx / total_slots` and fail loudly if not. This session found `-c 16384
-  --parallel 4` silently giving **4096 tokens per slot** against a 4096-token chunk;
-  mitigated by raising `LLAMA_CTX` to 32768 (8192/slot), but nothing in the code
-  would catch a regression.
+**"Owed after the merge" from the previous entry, updated:**
+
+- ~~Add a slot-budget guard~~ — **done, in a different form than described.**
+  `worker.check_instruction_length()` asserts the guidance text fits inside
+  `N_CTX_SLOT - CHUNK_TOKENS - MAP_MAX_TOKENS - wrapper` and fails loudly
+  rather than silently truncating. It guards the instruction budget, not a
+  live `/props` read of `n_ctx`/`total_slots` — that live-introspection form
+  was not built, so a future `-c`/`--parallel` change that shrinks
+  `N_CTX_SLOT` still needs to be caught by hand, the same way the original
+  `-c 16384` regression was.
+- `WORDS_PER_TOKEN = 0.70` is **under active measurement on node 2 right now**
+  (see the box at the top of this file) — **not** merely owed. Do not lower it
+  by hand while that sweep is running; it will land a real value in
+  `docs/measurements.md` when it finishes, and `worker.py`'s own comments
+  already flag every place `MAX_INSTRUCTION_WORDS` derives from it so the
+  correction propagates from one constant.
 
 ---
 
@@ -279,43 +360,47 @@ sudo ./provisioning/setup.sh node2
 **`nodes.env` values must be MEASURED, not assumed** — LAN IP, RAM MB and
 **physical** cores. Do not leave placeholders, and do not copy node 1's values.
 
-### 2. Missing Link fan-out across R endpoints
+### 2. Missing Link fan-out across R endpoints — DONE (job-level), two sub-items still owed
 
-**This is the main outstanding code change**, and it blocks the replicated
-topology from being usable.
+**The main outstanding code change from the previous entry landed** (see
+"MERGED THIS SESSION" above, `151ed32` and `33ddc79`). `missing_link/worker.py`
+no longer targets a single `base_url`; `app.py`'s lifespan starts one
+`_worker_loop` task per `LLAMA_URLS` entry, each claiming jobs independently
+against `db.claim_next_pending` (already atomic under concurrency —
+`BEGIN IMMEDIATE`, F20). Concretely, against the original list:
 
-Today `missing_link/worker.py` targets a single `base_url` and `app.py` runs
-**one** background worker. Under replication the queue must keep **R independent
-servers** busy.
+- ~~`nodes.env` grows a list of inference endpoints~~ — **done**,
+  `LLAMA_URLS`, kept separate from the RPC endpoint list.
+- ~~`run_forever` becomes R concurrent workers~~ — **done**, one
+  `_worker_loop(base_url)` task per endpoint.
+- ~~Health-check endpoints and route around a dead one~~ — **done**,
+  `_probe_endpoint` runs **before** claiming, not after, so a dead endpoint
+  just stops claiming rather than claim-then-fail; per-endpoint status is on
+  `/health` and the index page.
+- ~~Keep the task profile separable from the queue~~ — **holds**, unchanged.
+- ~~Carry provenance through the map step~~ — **done** (landed earlier,
+  `7ceb799`, and unaffected by tonight's merges). `chunk_summaries` records
+  `start_char`/`end_char` per chunk; confirmed present in the live
+  `/opt/missing-link/jobs.sqlite` schema.
 
-Concretely:
+**NOT done — two real gaps remain, and neither landed tonight:**
 
-- `nodes.env` (or the manifest) grows a list of **inference endpoints**, kept
-  separate from RPC endpoints — they are not the same thing.
-- `run_forever` becomes R concurrent workers, one per endpoint, each claiming
-  jobs independently. `db.claim_next_pending` is **already atomic** under
-  concurrency (`BEGIN IMMEDIATE`, tested — F20), so the store is ready.
-- Chunks within one document should fan out across endpoints too, not just whole
-  jobs — otherwise a single 14-chunk document leaves the rest of the fleet idle.
-- Health-check endpoints and route around a dead one. Under replication a node
-  failure costs 1/R of throughput and must not fail the job.
-- Keep the task profile (prompts/chunking) separable from the queue — that seam
-  becomes the skill's task-profile interface.
-- **Carry provenance through the map step.** Chunk summaries must record their
-  **chunk id and source offsets**, so every sentence in the final output is
-  traceable to the span it came from. Today the map step emits prose and the
-  reduce step consumes prose, so **provenance is destroyed** and the reduce step
-  cannot check any claim against source — which is exactly the fabrication-
-  laundering risk in F25. It also makes the paired faithfulness experiment
-  (task 4) mechanically checkable rather than needing a human to re-read the
-  source. Cheap now, expensive to retrofit. See `DESIGN-NOTES.md` E, concession 3.
-- **A retrieval-based task profile is owed, not a competing architecture.**
-  `CLAUDE.md` lists medium-horizon search and Q&A as a target workload, and for
-  *that* workload RAG is the correct primitive — it should arrive as a task
-  profile plugged into the seam above, not as a second system. Also unconsidered:
-  at corpus scale, retrieve which **documents** matter, then read those
-  **completely**. Map-reduce is right within a document; retrieval is right across
-  a corpus. See `DESIGN-NOTES.md` E, concessions 1 and 2.
+- **Chunk-level fan-out within one document.** `_worker_loop`'s own docstring
+  is explicit about this: *"Job-level, not chunk-level: chunk-level fan-out
+  only reduces the wall-clock of a SINGLE document (same total work, spread
+  wider), while job-level fan-out is what multiplies aggregate throughput...
+  Chunk-level is deliberately out of scope here."* So a single large document
+  submitted alone still only uses one endpoint's worker at a time; the rest of
+  the fleet sits idle until there is a second job to claim. See
+  `DESIGN-NOTES.md` G for why the two granularities optimise different
+  metrics (throughput vs one-document latency) and should be selected by
+  queue depth, not built as one thing.
+- **A retrieval-based task profile.** `CLAUDE.md` lists medium-horizon search
+  and Q&A as a target workload, and for that workload RAG is the correct
+  primitive — it should arrive as a task profile plugged into the
+  prompts/chunking seam, not as a second system. No retrieval or embedding
+  code exists anywhere in `missing_link/` yet. See `DESIGN-NOTES.md` E,
+  concessions 1 and 2.
 
 ### 3. Resolve the Model B decision
 
@@ -439,10 +524,15 @@ implicitly claims Missing Link is better than reaching for the obvious library;
 that claim is currently untested.
 
 **Set the timeouts explicitly before running it.** LlamaIndex and LangChain both
-default to a **60 s timeout with 3–6 retries**, and against a backend where one
-chunk takes minutes that is a retry storm, not a summary — it will look like the
-library "cannot handle" the cluster when in fact it was never configured for it.
-Compare on wall-clock **and** on faithfulness, using the paired design above.
+default to a 60 s-class timeout, and against a backend where one chunk takes
+minutes that is a retry storm, not a summary — it will look like the library
+"cannot handle" the cluster when in fact it was never configured for it.
+**Corrected 2026-08-18:** research into the underlying OpenAI/Anthropic SDKs
+both libraries build on found `max_retries` defaults to **2**, not the 3–6
+originally assumed here. The retry-storm risk is still real: each retry
+re-waits the full timeout, so even 2 retries at a naive short timeout is tens
+of seconds of silent waiting against this backend. Compare on wall-clock
+**and** on faithfulness, using the paired design above.
 
 ### 5. Smaller, still open
 
@@ -518,11 +608,11 @@ second replica, `10.10.0.39`)** — both provisioned, both serving.
 |---|---|---|
 | llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` | **same, exec-verified** |
 | ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` | **same, shipped 2026-08-17** |
-| `rpc-server@50052` | **active, `-t 4`, user `cluster`, 0 restarts** | **active, `-t 4`, 0 restarts** |
+| `rpc-server@50052` | **active, `-t 4`, user `cluster`, 0 restarts** | **`active` normally, but STOPPED right now — chunk-size benchmark in progress, see the box at the top of this file. Restart it when the sweep finishes.** |
 | Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB); **Qwen3-Next-80B UD-Q8_K_XL 87 GB downloading, 26%** | **gpt-oss-120b, md5-verified** |
 | SSH | password auth still ON (no key installed until this session) | **key-only, hardened** |
 | Disk free | 367 GB | 437 GB |
-| Missing Link | job store + worker + web API, **50 tests**; **first real end-to-end run done 2026-08-17** (F34) | n/a (coordinator only) |
+| Missing Link | job store + worker + web API, fan-out across R endpoints, queue control (cancel/reorder/cooperative stop), resumable per-chunk persistence, live telemetry, per-workflow guidance — **193 tests**. Running on node 1, but **still serving the code from before tonight's five merges** — see the restart note at the top of this file | n/a (coordinator only) |
 | Phase 0 gate | **PASSED** | — |
 | #26500 gate | **PASSED across both machines** (F31) | — |
 
@@ -539,8 +629,10 @@ It runs as the **`cluster`** system user, whose account and tensor-cache
 directory (`/var/lib/cluster/.cache/llama.cpp/rpc`) nothing created until this
 session — see F30.
 
-**Not done:** the aggregate replication measurement (in flight), nodes 3+,
-Missing Link fan-out, Model B decision, Open WebUI, evaluation harness.
+**Not done:** nodes 3+, Model B decision, Open WebUI, evaluation harness,
+chunk-level fan-out within one document, a retrieval task profile, watchdog
+moved fully off-cluster. The aggregate replication measurement is done (see
+the top of this file); a chunk-size benchmark is in flight on node 2 now.
 
 ---
 
@@ -735,8 +827,11 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
   gap.
 - **If reaching for a library**, LlamaIndex's `tree_summarize` is the closest
   building block. But **both LlamaIndex and LangChain default to a 60 s timeout**
-  and retry 3–6 times — against a multi-minute backend that is a retry storm,
-  not a summary. Set timeouts explicitly.
+  — against a multi-minute backend that is a retry storm, not a summary. Set
+  timeouts explicitly. **Corrected 2026-08-18:** `max_retries` defaults to
+  **2** in the underlying SDKs, not the 3–6 originally stated here; the
+  retry-storm risk itself is still real because each retry re-waits the full
+  timeout.
 - **Map-reduce beats refine decisively** (BooookScore, arXiv:2310.00785 —
   Mixtral 81.5 vs 64.5; LLaMA 2 failed refine entirely), and refine is strictly
   sequential so far slower in wall-clock.
@@ -836,3 +931,26 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
 - **2026-08-17** — Missing Link built through Task 12 (41 tests). Found and
   fixed a real race in the plan's job store (F20) and a silent empty-output
   failure with reasoning models (F21).
+- **2026-08-17 (late night) → 2026-08-18 (early morning)** — **All three
+  feature-agent worktrees merged to `main`, plus a fourth fix found along the
+  way.** Fan-out across R inference endpoints (`151ed32`); queue control
+  (cancel/reorder/cooperative stop) and resumability from persisted per-chunk
+  summaries, gated on model **and** instruction matching (also `151ed32`, via
+  `a41666e`); a real concurrency race in `db.init_chunks` that only existed in
+  the *combination* of the fan-out and resumability branches, found
+  independently by two agents and fixed structurally by making `init_db` the
+  single migration entry point (`9f968a1`, reproduced 20/20 before → 0/20
+  after); a rewritten llama-server watchdog reading cgroup `CPUUsageNSec`
+  instead of `/health`, because `/health` shares the same task queue
+  `update_slots()` drains and reported `n_idle_slots=4 n_processing_slots=0`
+  while the server was busiest prefilling — F39, which corrects an earlier
+  belief that 3 of 4 slots were idle during that incident (`8849fd0`); and
+  live per-job telemetry (chunk N of M, prefill/generation tok/s from the
+  server's own timings, a three-tier ETA, per-endpoint attribution) plus
+  per-workflow guidance via textarea or file upload (`33ddc79`). **Test count
+  131 → 142 → 145 → 193.** Missing Link fan-out (Task 2) is now DONE at the
+  job level; chunk-level fan-out within one document and a retrieval-based
+  task profile remain open. `missing-link.service` on node 1 still runs the
+  pre-merge code and has not been restarted this session — see the box at the
+  top of this file for why. A chunk-size benchmark is running on node 2 with
+  `rpc-server@50052` there deliberately stopped for the duration.
