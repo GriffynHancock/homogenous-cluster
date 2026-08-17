@@ -1,0 +1,23 @@
+[Unit]
+Description=Missing Link async job queue and web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=debian1
+WorkingDirectory=/home/debian1/homogenous-cluster/missing-link
+EnvironmentFile=/etc/default/missing-link
+ExecStart=/home/debian1/homogenous-cluster/missing-link/.venv/bin/python -m uvicorn \
+  missing_link.app:app --host 0.0.0.0 --port ${ML_PORT}
+Restart=always
+RestartSec=5
+
+# The queue survives restarts by design: requeue_running() returns jobs stranded
+# in 'running' back to 'pending' at worker startup (F20). Jobs here take hours,
+# so a crash or reboot mid-job is routine rather than exceptional, and a job
+# stuck in 'running' with no process behind it is invisible work that never
+# finishes and never errors.
+
+[Install]
+WantedBy=multi-user.target

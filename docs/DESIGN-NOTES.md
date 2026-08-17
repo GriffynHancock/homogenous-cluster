@@ -437,3 +437,71 @@ narrower than "RAG is the wrong shape":
 > right for finding which documents to read, and for question-answering. We need
 > both, at different levels, and we should borrow RAG's provenance tracking
 > regardless of which one is running.
+
+---
+
+## F. The user interface was never researched, and "Open WebUI" may be the RAG mistake again
+
+**Raised by the operator, 2026-08-17: "what is the actual user interface for
+Missing Link and did we even research that?"** The answer is **no.**
+
+Research to date covered summarisation pipelines, benchmarks, faithfulness
+metrics, engine internals, model selection and tool-calling models. **Nothing
+covered the interface.** What exists was built from the plan's spec, and the plan
+did not research it either.
+
+### What exists today
+
+A single-page job console: a task dropdown (`summarise`/`report`/`qa`), a file
+upload or paste-text area, a "Queue it" button, and a table of jobs
+(id / task / status / chunks / time / submitted) with a result page per job.
+Minimal CSS, dark mode, no JavaScript. It works — verified end-to-end — and it is
+plainly **a developer's job console.**
+
+### The bigger problem: "Open WebUI" is a settled decision that was never examined
+
+`CLAUDE.md` lists **Open WebUI, lightly skinned** as the settled chat frontend.
+**Open WebUI is a CHAT interface**, and this workload is explicitly not
+interactive: *"submit overnight, read in the morning"*, *"slow is fine; nobody is
+waiting at a prompt."*
+
+**This is the same category error as section E.** There, popular self-hosted tools
+were RAG-QA systems adopted for a summarisation problem. Here, the popular
+self-hosted frontend is a chat UI adopted for a batch problem. In both cases the
+pull is toward the shape everyone else built, for a different job. **A chat window
+is the interface whose central affordance — type, wait, read — is the exact thing
+this project cannot offer.**
+
+### What UI research would actually have to answer
+
+The users are non-specialists in health, legal, education and community services.
+Against that, the current UI has four concrete gaps:
+
+1. **Batch submission.** The form takes **one** document. The real task is "here
+   are 40 case files." One-at-a-time is not a workflow.
+2. **When will it be done?** No estimate at all — and **we can compute one**, from
+   `docs/measurements.md`: chunks x measured prefill rate + expected output x
+   generation rate, divided by R replicas. An ETA built from our own measured
+   throughput is exactly the kind of thing this project should be able to do and
+   currently does not.
+3. **Why should the reader trust it?** No provenance. A summary of a legal
+   document with no way back to the source is not usable evidence — which is the
+   same conclusion the faithfulness work reached from the other direction
+   (`docs/EVALUATION.md`: score each chunk summary against its own chunk;
+   section E concession 3: carry chunk ids and offsets). **Three independent
+   lines now converge on provenance.**
+4. **Failure has to be loud.** A job that fails overnight must be obvious in the
+   morning, not a row in a table nobody reloaded. Notification-on-completion is
+   arguably the single most important feature of an async tool, and there is none.
+
+### Recommendation
+
+**Do not build more UI yet, and do not adopt Open WebUI by default.** Research the
+interface the way the summarisation pipeline was researched: find what exists for
+**asynchronous batch document work** (not chat, not RAG-QA), and check whether
+anything fits before writing more Jinja. Then treat the four gaps above as the
+requirements list.
+
+**Keep the current console.** It is genuinely useful for the operator — submitting
+test jobs, watching the queue, reading results — and that is a different user from
+the eventual end user. **Do not skin it and call it the product.**

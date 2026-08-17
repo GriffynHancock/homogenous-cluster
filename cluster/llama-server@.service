@@ -1,0 +1,45 @@
+[Unit]
+Description=llama.cpp inference server (port %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=debian1
+# Config is per-node in /etc/default/llama-server, written by install-inference.sh.
+# systemd does not expand shell substitutions, hence the EnvironmentFile.
+EnvironmentFile=/etc/default/llama-server
+
+# WHY EACH FLAG:
+#  -t         PHYSICAL cores. Generation is memory-bandwidth-bound and SMT
+#             siblings contend for the same pipe: -t 8 is 26% SLOWER than -t 4
+#             on this 4c/8t CPU (F10). Never nproc.
+#  -c         TOTAL context, divided across --parallel slots. Missing Link chunks
+#             at 4096 tokens and can ask for 2048 of output, so a slot needs
+#             ~6-7K. With --parallel 4 that means -c 16384 minimum. A server left
+#             on a small -c fails real documents while passing every short test.
+#  --parallel 4, never 8: measured 1.79x at batch 4 and WORSE THAN 1 at batch 8
+#             on sparse MoE (F24).
+#  --jinja    required for chat_template_kwargs to reach the template at all.
+#             Without it, reasoning-suppression is silently inert (F35).
+#  --no-warmup  skip the warmup pass; load is already slow (F3).
+ExecStart=/bin/sh -c '${LLAMA_BIN}/llama-server \
+  -m ${LLAMA_MODEL} \
+  -t ${LLAMA_THREADS} \
+  -c ${LLAMA_CTX} \
+  --parallel ${LLAMA_PARALLEL} \
+  --host 0.0.0.0 --port %i \
+  --no-warmup --jinja'
+
+Restart=always
+RestartSec=10
+LimitMEMLOCK=infinity
+# Models are sized to fit RAM and swap is disabled fleet-wide. If a node is
+# genuinely out of memory, failing loudly beats thrashing.
+OOMPolicy=stop
+# A 65 GB load is single-core serialised (F3) and can take minutes. Do not let
+# systemd give up on it.
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target
