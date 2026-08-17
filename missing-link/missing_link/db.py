@@ -497,6 +497,99 @@ def is_cancel_requested(path, job_id):
     return bool(row and row["cancel_requested"])
 
 
+def revive_job(path, job_id):
+    """Explicit OPERATOR OVERRIDE: return a TERMINAL job to 'pending' for
+    another attempt, with a fresh attempt budget.
+
+    THE GAP THIS FILLS. A job that exhausts MAX_ATTEMPTS, or fails
+    permanently, or is cancelled, has no way back except hand-written SQL --
+    yet its chunk_summaries rows are still sitting on disk and WOULD be reused
+    (worker.run_one's resume check) if the job ever ran again. Without this,
+    the operator's only recovery path after a night the cluster was broken is
+    to resubmit the document from scratch, discarding work that is sitting
+    right there. See templates/job.html for what the operator is told, BEFORE
+    they click, about what those persisted chunks will actually get them --
+    this function only performs the transition, it does not predict the
+    outcome (that depends on which model is serving at the NEXT claim, which
+    this function has no way to know and does not guess at).
+
+    Revivable statuses: 'failed' and 'cancelled'. Deliberately NOT 'done'
+    (nothing was lost -- there is no recovery to perform), and NOT 'pending'
+    or 'running' (already active; reviving those would race the very claim
+    this is meant to unstick). CANCELLATION IS INCLUDED ON PURPOSE: a
+    cancelled job is not a failure and carries no signal that a retry would
+    fail identically the way a permanent failure does -- it was stopped by
+    request, mid-document, with whatever chunks had completed already
+    persisted exactly like a crash would leave them. Refusing to revive it
+    would make "I stopped this for now" a one-way door, which is a worse
+    property for an operator-facing stop button to have than the one it has
+    today.
+
+    RESETS, and why each one: `attempts` -> 0 so the revived run gets a FULL
+    fresh budget (worker.MAX_ATTEMPTS starts) rather than inheriting an
+    exhausted one -- claim_next_pending increments it to 1 on the next claim,
+    same as a first-ever attempt. `retry_after` -> NULL, in case any residual
+    timestamp is present (normally already NULL by the time a job reaches a
+    terminal status -- claim_next_pending clears it at claim time -- cleared
+    again here defensively, since a job revived while a backoff timestamp
+    somehow survived must be claimable immediately, not silently invisible to
+    claim_next_pending's predicate until that timestamp passed).
+    `cancel_requested` -> 0: LOAD-BEARING for a cancelled job specifically --
+    request_cancel sets this to 1 for a job cancelled while RUNNING, and
+    nothing before this function ever clears it back to 0. Leaving it set
+    would mean a revived job calls worker._should_stop() and cancels itself
+    again before the first chunk, silently reproducing the exact status this
+    was meant to escape. `error`/`result`/`started_at`/`finished_at` -> NULL,
+    the same fields schedule_retry clears and for the same reason: the next
+    attempt's state must read as its own, not a blend with the terminal run's.
+    `seen_at` -> NULL, because a revived job is not "seen" in its new,
+    unfinished state -- it is exactly what the index page's "did anything
+    finish while I was away" banner exists to (re)surface once it lands
+    somewhere terminal again.
+
+    BEGIN IMMEDIATE for the same reason as claim_next_pending/request_cancel:
+    this is a status transition on a row a worker could be touching (a
+    concurrent auto-retry finalising, or another operator click), and must
+    not interleave with either.
+
+    Returns the string "revived" on success -- deliberately NOT "pending",
+    even though "pending" is the status this writes: a job asked to revive
+    while it happens to ALREADY be pending (a stale page, a double click) has
+    a CURRENT status of "pending" too, and reusing that string for the
+    success case would make request_cancel-style "return the current status"
+    indistinguishable from "the transition just happened", exactly the bug a
+    caller comparing `result != "pending"` would silently get wrong. Returns
+    None if no such job exists, or the job's CURRENT status unchanged if it
+    is not in a revivable state -- the caller turns that into an honest 409
+    rather than silently doing nothing.
+    """
+    conn = _connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            status = row["status"]
+            if status not in ("failed", "cancelled"):
+                conn.execute("ROLLBACK")
+                return status
+            conn.execute(
+                "UPDATE jobs SET status='pending', error=NULL, result=NULL, "
+                "started_at=NULL, finished_at=NULL, attempts=0, retry_after=NULL, "
+                "cancel_requested=0, seen_at=NULL WHERE id=?",
+                (job_id,))
+            conn.execute("COMMIT")
+            return "revived"
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+
 def finish_cancelled(path, job_id, metrics=None):
     """Finalise a RUNNING job that honoured a cooperative stop request.
 

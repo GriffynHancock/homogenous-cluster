@@ -3,6 +3,81 @@
 {% block sub %}Job <code>{{ job.id }}</code> — {{ job.kind }}
   <span class="badge {{ job.status }}">{{ job.status }}</span>{% endblock %}
 {% block body %}
+{# "Retry now" / "Resume" -- an explicit OPERATOR OVERRIDE for a terminal job.
+   Shared between the failed and cancelled branches below so the two states
+   cannot drift into inconsistent copy. See app.py's _revive_preview and
+   db.revive_job for what this is actually doing and why cancelled jobs are
+   included. The one thing this box deliberately does NOT do is probe the
+   inference server to say for certain whether the resume will succeed --
+   see _revive_preview's docstring -- so it states what is RECORDED and the
+   rule that decides resume-vs-restart, not a guess dressed up as a fact. #}
+{% macro revive_box(job, progress, revive_preview) %}
+<div style="border:1px solid var(--line);border-radius:8px;padding:.8rem 1rem;margin:.7rem 0 1.1rem">
+  {% if revive_preview %}
+    {% set remaining = progress.chunks_expected - revive_preview.n_chunks %}
+    <p style="margin:.1rem 0;font-size:.85rem">
+      {{ revive_preview.n_chunks }} chunk summar{{ "y" if revive_preview.n_chunks == 1 else "ies" }}
+      of {{ progress.chunks_expected }}
+      {{ "is" if revive_preview.n_chunks == 1 else "are" }} already saved on disk
+      {%- if revive_preview.model %}, produced by <code>{{ revive_preview.model }}</code>{% endif %}.
+      <strong>Reviving will reuse {{ "it" if revive_preview.n_chunks == 1 else "them" }}
+      {%- if remaining > 0 %} and only send the remaining {{ remaining }}
+      chunk{{ "s" if remaining != 1 }} to the model{% else %} and go straight to the
+      reduce step{% endif %} -- but only if the model that claims this job still matches
+      the one that produced them{% if not revive_preview.instruction_matches %}, and
+      these chunks do not currently agree on the operator instruction that produced
+      them, so a match is unlikely{% endif %}.</strong>
+      If a different model is serving when this is claimed, these saved summaries are
+      discarded automatically and the whole document restarts from the beginning --
+      never mixed with a different model's output.
+    </p>
+  {% else %}
+    <p style="margin:.1rem 0;font-size:.85rem;color:var(--mut)">No chunk summaries
+    were saved before this job stopped, so reviving it starts the document from the
+    beginning.</p>
+  {% endif %}
+
+  {% if job.status == "failed" and progress.attempts > 1 and progress.attempts < progress.max_attempts %}
+    <p style="margin:.5rem 0 .3rem;font-size:.85rem;color:#c0392b">
+      <strong>This failed without using its full retry budget</strong>
+      (attempt {{ progress.attempts }} of {{ progress.max_attempts }}), which
+      Missing Link only does for a failure it classifies as a problem with the
+      DOCUMENT or the REQUEST, not the cluster -- retrying reproduces the identical
+      request against the identical document, so <strong>this will very likely fail
+      again in exactly the same way</strong>. Read the error below before retrying
+      blind; this button exists for when the operator knows something that changed
+      (a corrected document, a shortened instruction), not as a first response.
+    </p>
+  {% elif job.status == "failed" and progress.attempts <= 1 %}
+    <p style="margin:.5rem 0 .3rem;font-size:.85rem;color:#c0392b">
+      <strong>This failed on its first attempt</strong> (attempt
+      {{ progress.attempts }} of {{ progress.max_attempts }}), which -- IF this job ran
+      under the current retry policy -- usually means the DOCUMENT or the REQUEST was
+      the problem, and <strong>retrying will very likely fail again in exactly the
+      same way</strong>. But a job that failed BEFORE this retry policy existed shows
+      the same "attempt 1" reading even when the real cause was the cluster, not the
+      document (found live while building this feature, against exactly such a job --
+      see the error below rather than trusting this number alone).
+    </p>
+  {% elif job.status == "failed" %}
+    <p style="margin:.5rem 0 .3rem;font-size:.85rem">
+      This exhausted all {{ progress.max_attempts }} attempts, each ending with the
+      inference backend unreachable or dying mid-document -- a CLUSTER problem, not a
+      problem with this document. If the backend has since been fixed, this is
+      exactly the case this button is for.
+    </p>
+  {% else %}
+    <p style="margin:.5rem 0 .3rem;font-size:.85rem">
+      This was cancelled by request, not a failure -- reviving it should simply pick
+      up where it stopped.
+    </p>
+  {% endif %}
+
+  <form method="post" action="/jobs/{{ job.id }}/revive">
+    <button type="submit">{{ "Resume" if job.status == "cancelled" else "Retry now" }}</button>
+  </form>
+</div>
+{% endmacro %}
 {% if job.status in ("pending","running") %}
   <!-- Jobs run for hours; a manual refresh is the wrong interaction. This
        reload is also the NO-JS FALLBACK for live progress -- every field in
@@ -111,6 +186,7 @@
   of {{ progress.chunks_expected }} chunk{{ "s" if progress.chunks_expected != 1 }}.
   {%- if job.endpoint %} Was running on <code>{{ job.endpoint }}</code>.{% endif %}
   Not an error — this was requested.</p>
+  {{ revive_box(job, progress, revive_preview) }}
 {% endif %}
 
 <div class="tbl-wrap"><table>
@@ -141,6 +217,7 @@
     </p>
     <pre style="margin:.4rem 0 0">{{ job.error }}</pre>
   </div>
+  {{ revive_box(job, progress, revive_preview) }}
 {% elif job.status == "done" %}
   <h3>Result <span style="font-weight:400;color:var(--mut);font-size:.8rem">—
     <a href="/jobs/{{ job.id }}/text">copy box</a> ·

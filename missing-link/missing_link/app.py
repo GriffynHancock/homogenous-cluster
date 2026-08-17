@@ -401,6 +401,40 @@ def _progress_payload(job, chunks_done=None):
     }
 
 
+def _revive_preview(job, sections):
+    """What db.revive_job's resume would actually reuse, for the job page to
+    tell the operator BEFORE they click Retry -- see templates/job.html. None
+    for anything but a terminal (failed/cancelled) job, or one with no
+    persisted chunks -- there is nothing to preview in either case.
+
+    Reads db.get_recorded_model / get_recorded_instruction -- the SAME two
+    calls worker.run_one itself makes when deciding whether a resume is safe
+    -- rather than reimplementing that judgement here, so this preview and
+    the actual resume can never silently disagree.
+
+    What this CANNOT tell the operator, deliberately: which model is serving
+    RIGHT NOW. This project has a standing rule against a status page probing
+    the inference server (see job_progress's docstring and F39 -- /health,
+    /slots and /metrics all queue behind token generation on this server, so
+    a "cheap" liveness check can itself hang for as long as the job it is
+    reporting on). /props is not known to share that queue, but the rule is
+    "a status-rendering page does not call the backend", not "unless the
+    specific route seems safe today" -- and the model actually serving at the
+    NEXT claim may not even be the one serving now, once fan-out means R
+    endpoints. So this states what is RECORDED and the rule that decides
+    resume-vs-restart, not a yes/no prediction of which one will happen.
+    """
+    if job["status"] not in ("failed", "cancelled") or not sections:
+        return None
+    recorded_model = db.get_recorded_model(DB_PATH, job["id"])
+    instr_ok, recorded_instruction = db.get_recorded_instruction(DB_PATH, job["id"])
+    return {
+        "n_chunks": len(sections),
+        "model": recorded_model,
+        "instruction_matches": instr_ok and recorded_instruction == job.get("instruction"),
+    }
+
+
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
 def job_view(request: Request, job_id: str):
     job = db.get_job(DB_PATH, job_id)
@@ -421,7 +455,8 @@ def job_view(request: Request, job_id: str):
          # Rendered server-side so the page is fully correct on first load and
          # on every 15s no-JS refresh; the JS below only makes updates land
          # sooner than that, it is never the only source of this data.
-         "progress": _progress_payload(job, chunks_done=len(sections))})
+         "progress": _progress_payload(job, chunks_done=len(sections)),
+         "revive_preview": _revive_preview(job, sections)})
 
 
 @app.get("/jobs/{job_id}/progress")
@@ -459,6 +494,29 @@ def cancel_job(job_id: str):
     result = db.request_cancel(DB_PATH, job_id)
     if result is None:
         raise HTTPException(404, "no such job")
+    return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+
+@app.post("/jobs/{job_id}/revive")
+def revive_job(job_id: str):
+    """Explicit operator override: return a FAILED or CANCELLED job to
+    'pending' with a fresh attempt budget, reusing whatever chunk summaries
+    db.revive_job left on disk (worker.run_one's ordinary resume check decides
+    how many of those actually get reused once the job is claimed -- this
+    route only performs the status transition, it does not predict the
+    outcome). See templates/job.html for what the operator is told about that
+    BEFORE they click, and db.revive_job's docstring for the full reasoning,
+    including why a cancelled job is revivable and a done one is not.
+
+    409, not a silent no-op, for a job that is not in a revivable state --
+    reachable if the job page is stale (e.g. an auto-retry claimed the job
+    between page load and this click) or if this is ever hit directly.
+    """
+    result = db.revive_job(DB_PATH, job_id)
+    if result is None:
+        raise HTTPException(404, "no such job")
+    if result != "revived":
+        raise HTTPException(409, f"job is {result}, not revivable")
     return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
 

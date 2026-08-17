@@ -29,6 +29,7 @@ import re
 import time
 import json
 import http.client
+import sqlite3
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -559,6 +560,35 @@ RETRY_BACKOFF_BASE_S = 60
 RETRY_BACKOFF_CAP_S = 600
 
 
+def _is_locked_sqlite_error(exc):
+    """True for sqlite3's "two workers briefly wanted the same write lock"
+    condition. TRANSIENT -- the document is fine, the backend is fine, a
+    contended write lost a race it will very likely win on the next attempt.
+
+    THIS IS THE ONE PLACE IN THIS FILE THAT MATCHES BY MESSAGE, AND IT IS
+    DELIBERATE, not a lapse in a file that otherwise classifies strictly by
+    exception type. sqlite3 gives every SQL-level failure the SAME exception
+    class, OperationalError -- it covers both this transient lock contention
+    AND genuine, permanent bugs: "no such table", "no such column", and
+    "duplicate column name" (the exact error `db._add_missing_columns` guards
+    against, from a real startup race hit earlier in this project). Treating
+    OperationalError as a class would retry a schema bug identically, forever,
+    on a queue nobody is watching -- precisely the failure mode this file's
+    "unrecognised exceptions default to permanent" rule exists to prevent. So
+    only the specific locked-database message matches; every other
+    OperationalError -- including messages this function does not recognise --
+    falls through to the permanent default below, exactly as before.
+
+    Expected to be RARE: the store is WAL with a 30s busy_timeout (see
+    db._connect) and every transaction here is short. But this queue is meant
+    to run for months and R grows as nodes are added, so "rare" compounds --
+    and losing a multi-hour document to lock contention would have nothing to
+    do with what the document contains.
+    """
+    return (isinstance(exc, sqlite3.OperationalError)
+            and "database is locked" in str(exc).lower())
+
+
 def classify_failure(exc):
     """"transient" (worth retrying) or "permanent" (never). Unknown -> permanent."""
     if isinstance(exc, urllib.error.HTTPError):
@@ -567,6 +597,8 @@ def classify_failure(exc):
         # 404 from a wrong path -- is our request being wrong, and will be
         # exactly as wrong next time.
         return "transient" if (exc.code >= 500 or exc.code == 429) else "permanent"
+    if _is_locked_sqlite_error(exc):
+        return "transient"
     if isinstance(exc, _PERMANENT_EXCEPTIONS):
         return "permanent"
     if isinstance(exc, _TRANSIENT_EXCEPTIONS):
@@ -583,6 +615,8 @@ def is_recognised_failure(exc):
     Those are different things to read at 8am and they warrant different next
     steps.
     """
+    if _is_locked_sqlite_error(exc):
+        return True
     return isinstance(exc, (urllib.error.HTTPError,)
                       + _PERMANENT_EXCEPTIONS + _TRANSIENT_EXCEPTIONS)
 
