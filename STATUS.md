@@ -54,6 +54,36 @@ ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'   # then: cla
 
 ## IN FLIGHT: three feature agents in git worktrees (2026-08-17, ~22:40)
 
+**ALL THREE FINISHED AND WERE INDEPENDENTLY VERIFIED (2026-08-17 ~23:00).** Each
+is uncommitted in its worktree, awaiting merge:
+
+| Worktree | Feature | Tests | Verified by me |
+|---|---|---:|---|
+| `agent-a525fd5f262ad64fb` | **fan-out** across R endpoints | **86** | `BEGIN IMMEDIATE` intact; both concurrency tests pass; all 6 guards present |
+| `agent-a58fdf247ea665915` | **UI**: batch upload, nav, tick boxes, prompt inputs, raw-output page | **96** | prompts **byte-identical** with no instruction (cannot change model output); migration preserves the live DB |
+| `agent-a2c3ef4fcf6c9806f` | **queue control + resumability** | **110** | migration on a copy of the LIVE db: 7 jobs, same ids, idempotent, index created; `BEGIN IMMEDIATE` intact with new ordering inside the atomic claim |
+
+**Key results worth knowing before merging:**
+
+- **Resumability confirmed the diagnosis:** chunk summaries were persisted only
+  after the whole document finished, so a 40-chunk job dying at chunk 39 restarted
+  from zero. Now each chunk persists as it completes, and a resume is trusted **only
+  if the serving model matches the model recorded against those rows** — on mismatch
+  it discards and restarts rather than mixing two models' outputs. That directly
+  implements the operator's own proviso (`REQUIREMENTS.md`).
+- **"Stop a running job" is COOPERATIVE ONLY** and honestly scoped: the flag is
+  checked between chunks and once before reduce. It **cannot** interrupt an in-flight
+  HTTP call — there is no llama.cpp cancellation endpoint — so a stop lands after the
+  current chunk. Completed chunks are never lost.
+- **No PDF thumbnail.** Preview is first-200-characters text; rasterising page 1
+  needs an imaging stack (pypdfium2 / pdf2image+poppler) and the agent flagged rather
+  than silently added it. **Operator decision.**
+- **Notification is a `seen_at` flag + unseen banner**, plus a documented
+  `notify_completion(job)` no-op hook. No SMTP, no outbound network.
+- **Open retention question, raised by the UI agent and worth a real answer:** batch
+  review rows and `jobs.document` are kept **forever**. For sensitive documents that
+  is a policy decision, not a default to inherit.
+
 **These survive a session change. Do not lose them.** Each is a Sonnet agent
 implementing one feature in an isolated worktree, branched from `aaff5f5`, told NOT
 to commit. Their work is in the working tree of each worktree:
