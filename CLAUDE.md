@@ -327,7 +327,9 @@ Standing constraints when writing anything that touches the cluster:
   `--parallel`, so `-c 16384 --parallel 4` gives **4096 tokens per slot** — less
   than `CHUNK_TOKENS` (4096) plus the wrapper plus `MAP_MAX_TOKENS` (1024). Now
   `-c 32768` for 8192/slot. A short test document never reveals this; a real one
-  overflows.
+  overflows. **Diagnostic:** the server logs `n_ctx_slot=N` per slot at startup —
+  `journalctl -u llama-server@8080 | grep n_ctx_slot`. Check it against
+  `CHUNK_TOKENS`, do not infer it from `-c`.
 
 ## Verification
 
