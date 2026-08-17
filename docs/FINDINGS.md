@@ -662,6 +662,95 @@ against the original and passes against the fix.
 
 ---
 
+## F21. Reasoning models return EMPTY content when max_tokens runs out mid-thought
+
+**CONFIRMED by direct observation on node 1.** This is the most dangerous
+failure mode found so far, because it produces a **successful-looking job with
+no output**.
+
+Qwen3-4B, `max_tokens: 120`, ordinary summarisation request. The HTTP response
+was `200 OK` and contained:
+
+```
+finish_reason : "length"
+content       : 0 characters
+reasoning_content : 659 characters
+```
+
+Reasoning models (Qwen3, DeepSeek-R1 and relatives) emit their chain of thought
+into a **separate `reasoning_content` field**. If the token budget is exhausted
+before they finish thinking, `content` comes back as an **empty string** — a
+200 OK carrying nothing.
+
+The plan's worker does `payload["choices"][0]["message"]["content"]`, so it
+would have stored `""` as the summary and called `complete_job` — marking the
+job **done**. On an overnight queue that means **discovering empty summaries the
+following morning, with nothing logged as an error.** For a project whose entire
+value proposition is "submit overnight, read in the morning", this is the worst
+possible failure.
+
+**Fixed** with `extract_content()`, which refuses to return empty text and
+raises `EmptyCompletion` with an actionable message naming the token budget and
+the fix. `run_one` records it as a *failed* job, so it is visible. Five
+regression tests added.
+
+**Operational consequences:**
+
+- **Budget `max_tokens` for thinking, not just for the answer.** A reasoning
+  model needs several times the tokens its output implies.
+- **Or disable thinking** — `/no_think`, or
+  `--chat-template-kwargs '{"enable_thinking":false}'`. For map-reduce
+  summarisation the chain of thought is pure cost: it is discarded, and on this
+  hardware every token costs ~90 ms.
+- **Check this per model.** gpt-oss-120b and Qwen3-Next are both affected
+  classes. Any evaluation harness (Task 14) must treat empty output as a
+  failure rather than scoring it as a zero-quality summary.
+
+---
+
+## F22. Two-worker RPC sharding WORKS on b10369 — bug #26500 does not fire here
+
+**CONFIRMED by measurement**, and it partially retires the F2 risk earlier than
+expected.
+
+F2 warned that upstream PR #26500 (open, unmerged) breaks clusters with **2 or
+more** RPC workers. The key detail is that the trigger is worker *count*, not
+machines — so it can be tested on **one box** with two `rpc-server` processes on
+different ports, without waiting for node 2.
+
+Run on node 1, b10369, two `rpc-server` instances (ports 50052/50053),
+`--tensor-split 1,1` to force tensors onto both:
+
+| Check | Result |
+|---|---|
+| Server reached healthy | **yes** |
+| `[create_node] invalid data ptr` in any log | **0 occurrences** |
+| Generation completed | **yes** — 150 tokens |
+| Abort / malformed-response errors | **0** |
+| prompt eval | 9.72 t/s |
+| generation | 6.45 t/s |
+
+**Two-worker RPC graph compute works on the pinned build.**
+
+**Do not over-read this.** The public reproductions of #26500 involve MoE graphs
+with unusual constant/view nodes (DeepSeek-V4, Qwen3-VL), and this test used a
+**dense 4B** model. The bug may well still fire on Kimi K2. So:
+
+- **Re-run `bench/two-node-smoke.sh` with the actual Model B GGUF** before
+  committing to the 7-node launch. That check is still mandatory.
+- But the *architecture* is not dead on arrival, and nodes 3–7 are no longer
+  blocked on this question for dense models.
+
+**Method worth keeping for the skill:** multi-worker RPC bugs are reproducible
+on a single machine with multiple `rpc-server` processes. That is a much cheaper
+gate than provisioning hardware, and it should be a standard pre-flight check.
+
+**Caveat on the numbers:** each `rpc-server` got `-t 2` here (4 cores split two
+ways), so 6.45 t/s is not comparable to the 10.95 t/s single-RPC figure. This
+run was a correctness test, not a performance one.
+
+---
+
 ## F9. Operational notes for the bring-up scripts
 
 **CONFIRMED by direct observation on node 1.**

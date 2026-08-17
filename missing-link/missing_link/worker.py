@@ -143,7 +143,52 @@ class LlamaClient:
             data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             payload = json.load(r)
-        return payload["choices"][0]["message"]["content"]
+
+        choice = payload["choices"][0]
+        return extract_content(choice, max_tokens)
+
+
+class EmptyCompletion(RuntimeError):
+    """The model returned no usable text."""
+
+
+def extract_content(choice, max_tokens):
+    """Pull the answer out of a chat completion, refusing to return nothing.
+
+    Reasoning models (Qwen3, DeepSeek-R1 and friends) emit their chain of
+    thought into a SEPARATE `reasoning_content` field. If `max_tokens` runs out
+    while the model is still thinking, `content` comes back as an EMPTY STRING
+    with `finish_reason: "length"` -- a 200 OK carrying nothing.
+
+    Observed on node 1: a 120-token request to Qwen3-4B returned
+    `content` of 0 chars and `reasoning_content` of 659. Returning that
+    verbatim would have stored an empty summary and marked the job DONE --
+    silent data loss discovered the morning after an overnight run, which is
+    the single worst failure mode for this project.
+
+    So: fail loudly instead. The queue records it as a failed job with an
+    actionable message.
+    """
+    message = choice.get("message", {})
+    content = (message.get("content") or "").strip()
+    if content:
+        return content
+
+    reasoning = (message.get("reasoning_content") or "").strip()
+    finish = choice.get("finish_reason")
+
+    if reasoning and finish == "length":
+        raise EmptyCompletion(
+            f"model exhausted max_tokens ({max_tokens}) while still reasoning: "
+            f"{len(reasoning)} chars of reasoning_content, 0 of content. "
+            "Raise max_tokens, or disable thinking for this model "
+            "(e.g. /no_think, or --chat-template-kwargs '{\"enable_thinking\":false}')."
+        )
+    if finish == "length":
+        raise EmptyCompletion(
+            f"model hit max_tokens ({max_tokens}) and returned no content.")
+    raise EmptyCompletion(
+        f"model returned empty content (finish_reason={finish!r}).")
 
 
 def summarise(kind, document, base_url, client, max_tokens=512):

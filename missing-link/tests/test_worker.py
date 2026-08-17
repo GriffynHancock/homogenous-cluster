@@ -155,3 +155,46 @@ def test_failure_does_not_stall_the_queue(dbpath):
     worker.run_one(dbpath, "http://x", FakeClient(fail_with=RuntimeError("boom")))
     worker.run_one(dbpath, "http://x", FakeClient())
     assert db.get_job(dbpath, good)["status"] == "done"
+
+
+# --- reasoning-model empty-content guard (F21) ------------------------------
+
+def test_extract_content_returns_normal_content():
+    choice = {"message": {"content": "the summary"}, "finish_reason": "stop"}
+    assert worker.extract_content(choice, 512) == "the summary"
+
+
+def test_empty_content_while_reasoning_raises():
+    """Observed against Qwen3-4B on node 1: content='', reasoning_content=659
+    chars, finish_reason='length'. Returning '' would store an empty summary
+    and mark the job done."""
+    choice = {
+        "message": {"content": "", "reasoning_content": "thinking " * 80},
+        "finish_reason": "length",
+    }
+    with pytest.raises(worker.EmptyCompletion) as e:
+        worker.extract_content(choice, 120)
+    assert "reasoning" in str(e.value)
+    assert "120" in str(e.value)
+
+
+def test_empty_content_without_reasoning_raises():
+    choice = {"message": {"content": ""}, "finish_reason": "length"}
+    with pytest.raises(worker.EmptyCompletion):
+        worker.extract_content(choice, 512)
+
+
+def test_whitespace_only_content_is_empty():
+    choice = {"message": {"content": "   \n  "}, "finish_reason": "stop"}
+    with pytest.raises(worker.EmptyCompletion):
+        worker.extract_content(choice, 512)
+
+
+def test_empty_completion_fails_the_job_not_the_worker(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "hello")
+    client = FakeClient(fail_with=worker.EmptyCompletion("exhausted max_tokens"))
+    assert worker.run_one(dbpath, "http://x", client) is True
+    job = db.get_job(dbpath, job_id)
+    assert job["status"] == "failed"
+    assert job["result"] is None
+    assert "exhausted max_tokens" in job["error"]
