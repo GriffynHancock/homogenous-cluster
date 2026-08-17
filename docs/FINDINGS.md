@@ -1333,3 +1333,93 @@ much smaller change than writing a new inference engine.
 **Caveat:** checked against the tree on disk (`8337e4cd`) and a 2026-02-23
 maintainer comment. A newer ik_llama.cpp commit could have added a CPU path;
 re-grep `GGML_OP_REDUCE` before relying on this.
+
+---
+
+## F34. Missing Link had never been run. "41 tests passing" hid a silent truncation bug.
+
+**CONFIRMED by running it, 2026-08-17.** Prompted by the question "have you ever
+even tried Missing Link with a small model?" The answer was **no** — and the
+evidence was sitting in plain sight:
+
+- Every worker test constructs a `FakeClient`. **`LlamaClient` — the class that
+  actually speaks HTTP to llama-server — had never executed.**
+- There was **no jobs database anywhere on the box.** The pipeline had never
+  processed a document, not once.
+- `STATUS.md` said "41 tests passing", which was true and misleading in the same
+  breath.
+
+### It does work
+
+A 2057-char health-service records memo went in and a faithful summary came out
+through the real path (`create_job` → `claim_next_pending` → `LlamaClient` → HTTP
+→ `extract_content` → `complete_job`). Every claim checked against the source:
+the 41 non-clinical staff, the 7/3/15-year retention tiers, the March 2026
+remediation, the incomplete pre-January-2026 reconstruction. **No fabrication.**
+It also correctly *omitted* detail rather than inventing any.
+
+### But the first run found a defect mocked tests structurally cannot find
+
+`max_tokens` defaulted to **512**. The server reported `eval time = 512 tokens` —
+**exactly the ceiling** — and the stored summary ended mid-sentence on
+*"Recommendations include implementing automated archival for clinical"*. The job
+was recorded **`status='done'`**.
+
+`extract_content` *did* inspect `finish_reason`. But only to improve the error
+message when `content` was **empty**. Non-empty-but-truncated returned as a
+success.
+
+**This is the F21 family, and worse in one specific way.** An empty summary is
+obviously broken. A truncated one **looks finished** until you read the last
+sentence. And under map-reduce a truncated *chunk* summary becomes source
+material for the reduce step, where the missing content is indistinguishable from
+content the document never contained — the same laundering mechanism F25 and
+`DESIGN-NOTES.md` E worry about, arriving through a different door.
+
+**Fixed:** `TruncatedCompletion` on `finish_reason='length'` with non-empty text,
+naming the budget and quoting the final characters. Inline `<think>` stripping
+with a hard failure if nothing but thought came back (some servers emit reasoning
+in `content` rather than `reasoning_content`, which slips past the F21 guard while
+carrying no answer). `enable_thinking: false` sent on every request. Budgets split
+**map 1024 / reduce 2048**, because the reduce output legitimately exceeds any
+single map output and one shared value is how a long document ends truncated even
+though every chunk succeeded.
+
+**Measured effect of disabling thinking:** the same document went **70.6 s →
+32.2 s**, and generation stopped naturally at **175 tokens** instead of jamming
+into the 512 ceiling. Over half the tokens had been chain-of-thought that was
+discarded. On this hardware every token costs ~110 ms, so that is not a rounding
+error.
+
+### The generalisable lessons
+
+1. **A mocked test suite cannot discover what the protocol actually does.** Every
+   defect in this file's Missing Link entries — F20's race, F21's empty content,
+   F34's truncation — lived in the seam between our code and something real
+   (SQLite's locking, the model's output shape, the server's `finish_reason`).
+   The tests were not bad; they were testing the half we wrote.
+2. **"N tests passing" is not a claim about working software** and should not be
+   reported as one. `STATUS.md` now says what was and was not exercised.
+3. **Any completion guard must check finish_reason even when content is
+   non-empty.** Empty output is the *obvious* failure; truncated output is the
+   dangerous one.
+4. **Run the thing once, end to end, before believing anything about it.** This
+   is the same lesson as the rest of this file, applied to our own code rather
+   than to upstream's.
+
+### Also fixed while here
+
+- **`ttft_s` was never populated**, though the schema reserved the column and
+  `complete_job` read it. llama-server returns a `timings` object on its
+  OpenAI-compatible endpoint (`prompt_n`, `prompt_ms`, `predicted_ms` — verified
+  in `tools/server/server-task.cpp`), so the authoritative TTFT was already in the
+  response we parse. Now recorded, and **`None` rather than `0.0`** when
+  unavailable — a missing measurement must look missing, which is precisely how
+  F17's bug survived.
+- **Dependencies were 18 months stale** (fastapi 0.115.6, starlette 0.41.3,
+  jinja2 3.1.5, pytest 8.3.4 — Dec 2024/Jan 2025), with 9 Dependabot advisories
+  (3 high) on the default branch. **They came from the original plan**, written
+  against whatever versions its author knew about, and were never reviewed — the
+  same inherited-unmeasured-number failure mode as the 75% RAM rule (F1) and the
+  "~110 MB/s gigabit LAN" figure (F28). Bumped to current; **50 tests pass**,
+  including a major starlette 0.41 → 1.6 jump.

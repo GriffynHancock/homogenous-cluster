@@ -22,7 +22,7 @@ only on the 65 GB gpt-oss-120b copy to node 2 — see "In flight" below.
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **33 findings** from running this on real
+1. **Read `docs/FINDINGS.md`.** **34 findings** from running this on real
    hardware. Several correct the plan or the spec — **and F28 corrects this file
    and F23.** Do not trust the original plan's numbers over these.
 2. `docs/measurements.md` is the only place performance numbers may be quoted
@@ -381,7 +381,7 @@ second replica, `10.10.0.39`)** — both provisioned, both serving.
 | Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB) | **gpt-oss-120b copying** |
 | SSH | password auth still ON (no key installed until this session) | **key-only, hardened** |
 | Disk free | 367 GB | 437 GB |
-| Missing Link | job store + worker + web API, **41 tests passing** | n/a (coordinator only) |
+| Missing Link | job store + worker + web API, **50 tests**; **first real end-to-end run done 2026-08-17** (F34) | n/a (coordinator only) |
 | Phase 0 gate | **PASSED** | — |
 | #26500 gate | **PASSED across both machines** (F31) | — |
 
