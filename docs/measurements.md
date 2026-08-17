@@ -361,11 +361,29 @@ Disk — not RAM — is the binding constraint (F16). A drive is being added
 **Date:** 2026-08-17 | **Node:** node1 | **Model:** gpt-oss-120b F16 | `-t 4`
 `llama-batched-bench -npp 512 -ntg 128 -npl 1,2,4,8 -c 16384`
 
-| Batch | Prefill t/s | Generation t/s | Gen speedup |
-|---:|---:|---:|---:|
-| 1 | 15.96 | 5.43 | 1.00× |
-| 2 | 16.63 | 7.99 | 1.47× |
-| 4 | 16.58 | 9.73 | **1.79×** |
+| Batch | Prefill t/s | Generation t/s | Gen speedup | **Total t/s** |
+|---:|---:|---:|---:|---:|
+| 1 | 15.96 | 5.43 | 1.00× | 11.50 |
+| 2 | 16.63 | 7.99 | 1.47× | 13.67 |
+| **4** | 16.58 | 9.73 | **1.79×** | **14.54 ← peak** |
+| 8 | **7.34** | 10.96 | 2.02× | **7.86 ← worse than batch 1** |
+
+### `--parallel 8` is worse than `--parallel 1`. Set it to 4.
+
+**At batch 8 prefill collapses 56%** (16.58 → 7.34 t/s) and total system
+throughput falls to **7.86 t/s — below the 11.50 of batch 1.** Prefill wall-time
+went from 123.5 s to 557.8 s: **4.5× longer for 2× the work**, i.e. sharply
+superlinear degradation.
+
+The likely cause is working-set pressure: at batch 8, `N_KV` is 5120 and the
+combined KV cache plus activations stop streaming efficiently through a memory
+subsystem that is already saturated at 28.2 GB/s by four cores. Generation keeps
+improving slightly (10.96 t/s) because it is a smaller working set, but prefill
+dominates total throughput and drags the system under.
+
+**Operational rule: `--parallel 4` on this hardware. Never 8.** And because the
+plan leaves `--parallel` unset — which silently means **4 slots** — the default
+happens to be correct here, but only by accident. Set it explicitly.
 
 **Verdict: batching helps, but far less than on a dense model.** The reference
 dense CPU measurement (Intel Ultra 9 285K, discussion #18030) scaled **5.75×**

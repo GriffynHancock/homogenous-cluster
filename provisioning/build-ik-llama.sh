@@ -41,6 +41,10 @@ cmake --build build --config Release -j"$(nproc)"
 for b in llama-cli llama-server llama-bench llama-batched-bench rpc-server ggml-rpc-server; do
   [ -f "build/bin/$b" ] && cp -a "build/bin/$b" "$DEST/bin/"
 done
-cp -a build/bin/*.so* "$DEST/bin/" 2>/dev/null || true
+# ik_llama.cpp scatters its shared libs across build/src, build/ggml/src and
+# build/examples/mtmd rather than collecting them in build/bin the way mainline
+# does. Copying only build/bin/*.so* silently produces binaries that cannot
+# start ("cannot open shared object file: libllama.so").
+find build -name '*.so*' -exec cp -a {} "$DEST/bin/" \;
 echo "ik_llama.cpp built -> $DEST/bin  ($(cat "$DEST/COMMIT"))"
 ls "$DEST/bin"
