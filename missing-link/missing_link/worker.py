@@ -25,6 +25,7 @@ WHY MAP-REDUCE, decided on evidence rather than preference:
   * Chunk size barely matters for map-reduce (unlike refine), so ~4K with 10%
     overlap is fine and is not worth tuning.
 """
+import re
 import time
 import json
 import urllib.request
@@ -401,7 +402,10 @@ def run_one(db_path, base_url, client=None):
     started = time.monotonic()
     try:
         n_chunks = count_chunks(job["document"])
-        result = summarise(job["kind"], job["document"], base_url, client)
+        # summarise_traced keeps each chunk's identity and offsets, so the final
+        # output stays traceable to spans of the source. See "Provenance" above.
+        result, chunk_records = summarise_traced(job["kind"], job["document"], client)
+        db.save_chunk_summaries(db_path, job["id"], chunk_records)
         db.complete_job(db_path, job["id"], result, {
             "total_s": round(time.monotonic() - started, 2),
             "chunks": n_chunks,
@@ -478,3 +482,90 @@ def humanise_seconds(s):
     if s < 5400:
         return f"{s / 60:.0f} minutes"
     return f"{s / 3600:.1f} hours"
+
+
+# --- Provenance --------------------------------------------------------------
+# chunk_document() returns plain strings, so the map step destroys every chunk's
+# identity: the reduce step consumes prose and emits prose, and nothing in the
+# final summary can be traced back to the source.
+#
+# That is a real defect, not a missing nicety, and THREE independent lines of
+# reasoning arrived at the same fix:
+#   1. DESIGN-NOTES E concession 3 -- RAG systems keep a span per claim and so
+#      structurally cannot launder a fabrication through a reduce step; we can.
+#   2. docs/EVALUATION.md -- arXiv:2511.07689 found factual-consistency metrics
+#      are unreliable at whole-document scope but improve markedly when scored
+#      against a correctly-scoped evidence window, ESPECIALLY for legal text. That
+#      window is exactly "this chunk summary vs its own chunk".
+#   3. DESIGN-NOTES F -- a summary of a legal document with no route back to the
+#      source is not usable evidence, whatever its quality.
+#
+# So chunks carry (index, start_char, end_char) and the per-chunk summaries are
+# PERSISTED rather than discarded.
+
+def word_spans(text):
+    """[(start_char, end_char)] for every whitespace-delimited token."""
+    return [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+
+
+def chunk_spans(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
+    """Chunk with TRUE character offsets into the original text.
+
+    Returns [{"index", "start", "end", "text"}]. Note `text` is sliced from the
+    ORIGINAL string rather than rejoined from split words, so original spacing and
+    line breaks survive -- which matters when a human is asked to check a claim
+    against the source.
+    """
+    if overlap_tokens >= chunk_tokens:
+        raise ValueError(
+            f"overlap_tokens ({overlap_tokens}) must be less than chunk_tokens "
+            f"({chunk_tokens}); otherwise the stride is <= 0 and this loops forever")
+
+    spans = word_spans(text)
+    if not spans:
+        return []
+
+    size = max(1, int(chunk_tokens * WORDS_PER_TOKEN))
+    overlap = int(overlap_tokens * WORDS_PER_TOKEN)
+    stride = size - overlap
+
+    out = []
+    start_w = 0
+    while start_w < len(spans):
+        end_w = min(start_w + size, len(spans))
+        s_char = spans[start_w][0]
+        e_char = spans[end_w - 1][1]
+        out.append({"index": len(out), "start": s_char, "end": e_char,
+                    "text": text[s_char:e_char]})
+        if end_w >= len(spans):
+            break
+        start_w += stride
+    return out
+
+
+def summarise_traced(kind, document, client,
+                     max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS):
+    """Map-reduce that RETAINS provenance.
+
+    Returns (final_text, chunk_records) where each record is
+    {"index", "start", "end", "summary"} -- enough to show a reader which span of
+    the source produced which part of the output, and enough to score each chunk
+    summary against its own chunk rather than against the whole document.
+    """
+    chunks = chunk_spans(document)
+    if not chunks:
+        raise ValueError("document contains no words")
+
+    records = []
+    for ch in chunks:
+        summary = client.complete(build_prompt(kind, ch["text"]), max_tokens=max_tokens)
+        records.append({"index": ch["index"], "start": ch["start"],
+                        "end": ch["end"], "summary": summary})
+
+    if len(records) == 1:
+        return records[0]["summary"], records
+
+    final = client.complete(
+        build_reduce_prompt(kind, [r["summary"] for r in records]),
+        max_tokens=reduce_max_tokens)
+    return final, records

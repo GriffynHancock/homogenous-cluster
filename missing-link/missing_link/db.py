@@ -193,13 +193,22 @@ def seconds_per_chunk(path, min_samples=2):
     finally:
         conn.close()
 
-    rates = sorted(r["total_s"] / r["chunks"] for r in rows)
+    rates = [r["total_s"] / r["chunks"] for r in rows]   # oldest -> newest
     if len(rates) < min_samples:
         return None, len(rates)
-    mid = len(rates) // 2
-    if len(rates) % 2:
-        return rates[mid], len(rates)
-    return (rates[mid - 1] + rates[mid]) / 2.0, len(rates)
+
+    # RECENCY-WEIGHTED, not a plain median. The rate genuinely changes under us --
+    # a different model, engine, quant, --parallel setting or node count all move
+    # it, and this session changed several of those in one evening. An unweighted
+    # mean over all history would keep quoting a rate the cluster no longer has.
+    # Exponential weights, newest heaviest, halving every ~5 jobs.
+    decay = 0.87
+    num = den = 0.0
+    for age, rate in enumerate(reversed(rates)):     # age 0 == most recent
+        w = decay ** age
+        num += w * rate
+        den += w
+    return num / den, len(rates)
 
 
 def pending_chunk_backlog(path):
@@ -215,3 +224,82 @@ def pending_chunk_backlog(path):
     finally:
         conn.close()
     return (row["p"] or 0), (row["r"] or 0)
+
+
+CHUNK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chunk_summaries (
+    job_id     TEXT NOT NULL,
+    idx        INTEGER NOT NULL,
+    start_char INTEGER NOT NULL,
+    end_char   INTEGER NOT NULL,
+    summary    TEXT NOT NULL,
+    PRIMARY KEY (job_id, idx)
+);
+"""
+
+
+def init_chunks(path):
+    conn = _connect(path)
+    try:
+        conn.executescript(CHUNK_SCHEMA)
+    finally:
+        conn.close()
+
+
+def save_chunk_summaries(path, job_id, records):
+    """Persist per-chunk summaries so the final output stays traceable.
+
+    Without this the map step's output is consumed by the reduce step and thrown
+    away, and no claim in the final summary can be checked against its source.
+    """
+    init_chunks(path)
+    conn = _connect(path)
+    try:
+        conn.executemany(
+            "INSERT OR REPLACE INTO chunk_summaries "
+            "(job_id, idx, start_char, end_char, summary) VALUES (?,?,?,?,?)",
+            [(job_id, r["index"], r["start"], r["end"], r["summary"])
+             for r in records])
+    finally:
+        conn.close()
+
+
+def get_chunk_summaries(path, job_id):
+    init_chunks(path)
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT idx, start_char, end_char, summary FROM chunk_summaries "
+            "WHERE job_id=? ORDER BY idx", (job_id,)).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def throughput_stats(path, limit=10):
+    """Observed tok/s over recent completed jobs, for a live readout.
+
+    `tokens` is a WORD COUNT of the output, not a real token count -- the queue
+    process deliberately does not carry the model's tokeniser. So this is labelled
+    approximate wherever it is shown; it is a trend indicator, not a benchmark
+    figure, and must never be quoted against docs/measurements.md.
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT total_s, tokens, chunks, ttft_s FROM jobs "
+            "WHERE status='done' AND total_s > 0 AND tokens IS NOT NULL "
+            "ORDER BY finished_at DESC LIMIT ?", (limit,)).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return None
+    out_per_s = [r["tokens"] / r["total_s"] for r in rows]
+    ttfts = [r["ttft_s"] for r in rows if r["ttft_s"]]
+    return {
+        "samples": len(rows),
+        "out_words_per_s": sum(out_per_s) / len(out_per_s),
+        "median_prefill_s": (sorted(ttfts)[len(ttfts) // 2] if ttfts else None),
+        "last_job_s": rows[0]["total_s"],
+        "last_job_chunks": rows[0]["chunks"],
+    }

@@ -35,6 +35,22 @@
   <pre>{{ job.result }}</pre>
 {% endif %}
 
+{% if sections %}
+  <h3>How this was built <span style="font-weight:400;color:var(--mut);font-size:.8rem">— {{ sections|length }} section{{ "s" if sections|length != 1 }}, each traceable to the source</span></h3>
+  <p style="color:var(--mut);font-size:.85rem">A summary of a legal or clinical
+  document is only usable if you can check it. Each section below records the exact
+  character range of the original it came from.</p>
+  {% for s in sections %}
+    <details style="border:1px solid var(--line);border-radius:6px;padding:.6rem;margin-bottom:.5rem">
+      <summary>Section {{ s.idx + 1 }}
+        <code style="color:var(--mut);font-size:.8rem">chars {{ s.start_char }}–{{ s.end_char }}</code></summary>
+      <p>{{ s.summary }}</p>
+      <p style="color:var(--mut);font-size:.8rem">Source span:</p>
+      <pre style="font-size:.78rem">{{ job.document[s.start_char:s.start_char+700] }}{% if s.end_char - s.start_char > 700 %} …{% endif %}</pre>
+    </details>
+  {% endfor %}
+{% endif %}
+
 <h3>Source document</h3>
 <pre>{{ job.document[:4000] }}{% if job.document|length > 4000 %}
 

@@ -395,4 +395,73 @@ def test_seconds_per_chunk_needs_enough_samples(dbpath):
     db.complete_job(dbpath, j2, "r", {"total_s": 400.0, "chunks": 2})
     spc, n = db.seconds_per_chunk(dbpath)
     assert n == 2
-    assert spc == 150.0, "median of 100 and 200 s/chunk"
+    # Recency-weighted, so it sits between the two samples but leans toward the
+    # NEWER (slower) one rather than landing on the plain mean of 150.
+    assert 100.0 < spc < 200.0
+    assert spc > 150.0, "the newer sample must carry more weight, got %.1f" % spc
+
+
+# --- provenance: offsets must point at the real source -----------------------
+
+def test_chunk_spans_offsets_are_exact():
+    """doc[start:end] must equal the chunk text, or provenance is a lie."""
+    doc = "ALPHA one two three. " * 900 + "OMEGA final."
+    for ch in worker.chunk_spans(doc):
+        assert doc[ch["start"]:ch["end"]] == ch["text"]
+
+
+def test_chunk_spans_cover_the_whole_document():
+    doc = " ".join(f"w{i}" for i in range(5000))
+    chunks = worker.chunk_spans(doc)
+    assert chunks[0]["start"] == 0
+    assert chunks[-1]["end"] == len(doc)
+
+
+def test_chunk_spans_preserve_original_formatting():
+    """Sliced from the original, not rejoined from split() -- so a human checking
+    a claim sees the document as it was written."""
+    doc = "Line one.\n\n    Indented line two.\n\nLine three."
+    ch = worker.chunk_spans(doc)[0]
+    assert "\n\n" in ch["text"]
+
+
+def test_summarise_traced_returns_a_record_per_chunk():
+    client = FakeClient()
+    doc = "word " * 20000
+    final, records = worker.summarise_traced("summarise", doc, client)
+    assert len(records) == worker.count_chunks(doc)
+    for i, r in enumerate(records):
+        assert r["index"] == i
+        assert r["end"] > r["start"]
+        assert r["summary"]
+    assert final
+
+
+def test_single_chunk_record_matches_the_final_output():
+    client = FakeClient()
+    final, records = worker.summarise_traced("summarise", "a short document", client)
+    assert len(records) == 1
+    assert final == records[0]["summary"], "no reduce pass for one chunk"
+
+
+def test_provenance_survives_a_real_job(dbpath):
+    from missing_link import db as _db
+    job_id = _db.create_job(dbpath, "summarise", "word " * 20000)
+    worker.run_one(dbpath, "http://x", FakeClient())
+    rows = _db.get_chunk_summaries(dbpath, job_id)
+    assert len(rows) > 1, "per-chunk summaries must be PERSISTED, not discarded"
+    assert all(r["end_char"] > r["start_char"] for r in rows)
+
+
+def test_rate_is_recency_weighted_not_a_plain_average(dbpath):
+    """The rate changes under us -- model, engine, quant, --parallel, node count.
+    A newer, slower reality must dominate older, faster history."""
+    from missing_link import db as _db
+    for total_s in (100.0, 100.0, 100.0, 100.0, 400.0):   # last one is 4x slower
+        j = _db.create_job(dbpath, "summarise", "x")
+        _db.claim_next_pending(dbpath)
+        _db.complete_job(dbpath, j, "r", {"total_s": total_s, "chunks": 1})
+    rate, n = _db.seconds_per_chunk(dbpath)
+    assert n == 5
+    plain_mean = (100 + 100 + 100 + 100 + 400) / 5      # == 160
+    assert rate > plain_mean, "recent slowdown must be weighted UP, got %.1f" % rate

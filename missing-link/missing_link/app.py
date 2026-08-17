@@ -52,7 +52,8 @@ def index(request: Request):
     return TEMPLATES.TemplateResponse(
         request, "index.html",
         {"jobs": db.list_jobs(DB_PATH), "kinds": sorted(worker.PROMPTS),
-         "rate": _rate_note(), "backlog": db.pending_chunk_backlog(DB_PATH)},
+         "rate": _rate_note(), "backlog": db.pending_chunk_backlog(DB_PATH),
+         "tput": db.throughput_stats(DB_PATH)},
     )
 
 
@@ -125,7 +126,9 @@ def job_view(request: Request, job_id: str):
         raise HTTPException(404, "no such job")
     return TEMPLATES.TemplateResponse(
         request, "job.html",
-        {"job": job, "estimate": _estimate_for(job) if job["status"] in ("pending", "running") else None})
+        {"job": job,
+         "estimate": _estimate_for(job) if job["status"] in ("pending", "running") else None,
+         "sections": db.get_chunk_summaries(DB_PATH, job_id)})
 
 
 @app.get("/jobs/{job_id}/result", response_class=PlainTextResponse)
