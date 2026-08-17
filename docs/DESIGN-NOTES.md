@@ -349,3 +349,91 @@ Do not build an engine. Recover the idle nodes with what already exists:
 S = 1 and replicate it — with sharding reserved for the single frontier model
 that genuinely cannot fit.** Which is the architecture already recorded; this
 note exists so the question is not re-opened a third time.
+
+---
+
+## E. "Every other repo does RAG. Why don't we?"
+
+**Asked 2026-08-17, and it deserves a real answer** — "we are different" is not
+an argument, and the question is the right one to ask of any design that departs
+from what everyone else built.
+
+### The short answer: they are not doing our task, and our cost model is inverted
+
+`private-gpt`, `Kotaemon`, `localGPT` and the rest are **RAG question-answering**
+systems: embed a corpus, retrieve top-k chunks for a query, answer from those.
+Two things drive that design, and **neither holds here**:
+
+| | Typical RAG-QA tool | **This project** |
+|---|---|---|
+| Task | "answer a question about my documents" | **summarise / draft from the whole document** |
+| Who is waiting | a user at a prompt | **nobody — overnight batch** |
+| Marginal cost of tokens | real money (API) or rented GPU-hours | **~zero: owned, depreciated, idle hardware** |
+| What the design optimises | **reading less** | **completeness** |
+| Recall failure | a slightly worse answer | **a silently incomplete summary** |
+
+**Retrieval presupposes you know what you are looking for.** For a *question*
+that is fine — the question names the target. For a *summary* it is circular: if
+you already knew which passages mattered, you would not need the summary. There
+is no top-k that yields a faithful summary of a document you have not read.
+
+And the economics invert cleanly. RAG's entire value proposition is reading
+fewer tokens, because tokens cost money or GPU time. Here the machines are
+already bought, already depreciated, and otherwise idle, and the work is
+explicitly *"submit overnight, read in the morning."* **So RAG optimises the one
+resource we have in surplus and sacrifices the one we cannot afford to lose.**
+For legally sensitive material a retriever that silently fails to rank a relevant
+section is not a degraded answer, it is a wrong one.
+
+### This is not only reasoning — the literature agrees for THIS task
+
+- **BooookScore** (arXiv:2310.00785): map-reduce beats refine decisively on
+  book-length summarisation (Mixtral 81.5 vs 64.5; LLaMA-2 failed refine
+  outright). Refine is also strictly sequential, so far worse in wall-clock.
+- **arXiv:2307.03172**: a bigger context window does *not* fix "lost in the
+  middle" — extended-context variants show near-identical position bias. So
+  chunking is right even where a large window exists.
+
+### Three concessions — places where the RAG crowd is right and we are not
+
+**1. For one of our own stated workloads, RAG is the correct primitive, and we
+must not rebuild it.** `CLAUDE.md` lists *"medium-horizon multi-step search and
+Q&A"* as a target workload. That **is** what those tools do. Writing our own
+retriever for it would be exactly the reinvention this section is accusing others
+of not needing. It should arrive as a **task profile** with retrieval inside it,
+plugged into the seam `CLAUDE.md` already says to preserve — not as a competing
+architecture.
+
+**2. Map-reduce is right WITHIN a document; retrieval may be right ACROSS a
+corpus.** We have been conflating two levels. "Read every chunk" is correct for
+one document you have been asked to summarise. It is **not** obviously correct
+for "answer this from a 10,000-document archive" — reading all of it per question
+is absurd, and that is precisely the case retrieval was invented for. **A hybrid
+is the honest answer at corpus scale:** retrieve which *documents* are relevant,
+then read those **completely**. We have never considered this and should.
+
+**3. We should steal RAG's provenance discipline — this is a real weakness in our
+design.** RAG systems keep a citation or span per claim, which makes verification
+cheap and grounding checkable. Our map-reduce currently turns each chunk into
+**prose**, and the reduce step consumes prose. **Provenance is destroyed at the
+map step**, so the reduce step cannot check any claim against source text — which
+is exactly the fabrication-laundering risk in F25 and in the reframed eval
+(`STATUS.md` 4). A retrieval system would not have this problem.
+
+**Concrete fix, cheap now and expensive to retrofit:** chunk summaries should
+carry their **chunk id and source offsets**, so every sentence in the final
+output can be traced to the span it came from. That makes the paired
+map-reduce-vs-single-pass faithfulness experiment mechanically checkable instead
+of requiring a human to re-read the source, and it is the difference between
+"the summary looks right" and "every claim in the summary is locatable."
+
+### Verdict
+
+**The departure is justified for the summarisation workload and is supported by
+the literature — but it was stated too broadly.** The defensible claim is
+narrower than "RAG is the wrong shape":
+
+> Reading the whole document is right for summarising a document. Retrieval is
+> right for finding which documents to read, and for question-answering. We need
+> both, at different levels, and we should borrow RAG's provenance tracking
+> regardless of which one is running.

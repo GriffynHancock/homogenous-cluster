@@ -207,6 +207,21 @@ Concretely:
   failure costs 1/R of throughput and must not fail the job.
 - Keep the task profile (prompts/chunking) separable from the queue — that seam
   becomes the skill's task-profile interface.
+- **Carry provenance through the map step.** Chunk summaries must record their
+  **chunk id and source offsets**, so every sentence in the final output is
+  traceable to the span it came from. Today the map step emits prose and the
+  reduce step consumes prose, so **provenance is destroyed** and the reduce step
+  cannot check any claim against source — which is exactly the fabrication-
+  laundering risk in F25. It also makes the paired faithfulness experiment
+  (task 4) mechanically checkable rather than needing a human to re-read the
+  source. Cheap now, expensive to retrofit. See `DESIGN-NOTES.md` E, concession 3.
+- **A retrieval-based task profile is owed, not a competing architecture.**
+  `CLAUDE.md` lists medium-horizon search and Q&A as a target workload, and for
+  *that* workload RAG is the correct primitive — it should arrive as a task
+  profile plugged into the seam above, not as a second system. Also unconsidered:
+  at corpus scale, retrieve which **documents** matter, then read those
+  **completely**. Map-reduce is right within a document; retrieval is right across
+  a corpus. See `DESIGN-NOTES.md` E, concessions 1 and 2.
 
 ### 3. Resolve the Model B decision
 
