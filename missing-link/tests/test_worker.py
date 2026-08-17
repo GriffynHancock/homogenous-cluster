@@ -721,6 +721,83 @@ def test_resume_against_a_different_model_discards_and_restarts(dbpath):
     assert db.get_recorded_model(dbpath, job_id) == "model-B"
 
 
+def test_resume_against_a_different_instruction_discards_and_restarts(dbpath):
+    """The same soundness gap the model check exists to prevent, arriving
+    through `instruction` instead: chunks persisted under one operator
+    instruction must not be reused when the job's instruction no longer
+    matches -- otherwise a reduce step could silently combine chunk summaries
+    written under two different sets of guidance.
+    """
+    text = "word " * 20000
+    job_id = db.create_job(dbpath, "summarise", text, instruction="Focus on dates.")
+    db.claim_next_pending(dbpath)
+    n_chunks = worker.count_chunks(text)
+
+    crashy = FakeClient(model="model-A")
+
+    def on_chunk_done(record):
+        db.save_chunk_summaries(dbpath, job_id, [record], model=crashy.model_name(),
+                                instruction="Focus on dates.")
+        if record["index"] == 1:
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError):
+        worker.summarise_traced("summarise", text, crashy, instruction="Focus on dates.",
+                                on_chunk_done=on_chunk_done)
+    assert len(db.get_chunk_summaries(dbpath, job_id)) == 2
+
+    # Simulate the job's instruction having changed before it was resumed
+    # (the row itself is immutable via any current route, but the resume
+    # check must not rely on that -- see the report on why this is guarded
+    # explicitly rather than assumed impossible).
+    import sqlite3
+    conn = sqlite3.connect(dbpath)
+    conn.execute("UPDATE jobs SET status='pending', instruction=? WHERE id=?",
+                ("Focus on risk instead.", job_id))
+    conn.commit()
+    conn.close()
+
+    resumer = FakeClient(model="model-A")   # SAME model, DIFFERENT instruction
+    assert worker.run_one(dbpath, "http://x", resumer) is True
+
+    assert db.get_job(dbpath, job_id)["status"] == "done"
+    # Every chunk redone (none skipped) because the instruction changed, even
+    # though the model did not -- both must match to trust a resume.
+    assert resumer.calls == n_chunks + 1
+    ok, recorded = db.get_recorded_instruction(dbpath, job_id)
+    assert ok is True
+    assert recorded == "Focus on risk instead."
+
+
+def test_resume_with_matching_model_and_no_instruction_on_either_side_resumes(dbpath):
+    """The common case: no guidance given, then or now. Must resume normally
+    -- "no instruction" recorded is not the same kind of unknown as "no model
+    recorded", and must not be treated as untrustworthy."""
+    text = "word " * 20000
+    job_id = db.create_job(dbpath, "summarise", text)  # no instruction
+    db.claim_next_pending(dbpath)
+    n_chunks = worker.count_chunks(text)
+
+    crashy = FakeClient(model="model-A")
+
+    def on_chunk_done(record):
+        db.save_chunk_summaries(dbpath, job_id, [record], model=crashy.model_name())
+        if record["index"] == 1:
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError):
+        worker.summarise_traced("summarise", text, crashy, on_chunk_done=on_chunk_done)
+
+    db.requeue_running(dbpath)
+    resumer = FakeClient(model="model-A")
+    assert worker.run_one(dbpath, "http://x", resumer) is True
+
+    assert db.get_job(dbpath, job_id)["status"] == "done"
+    # Only the chunks NOT already persisted, plus the reduce call -- i.e. a
+    # TRUE resume, not a full redo.
+    assert resumer.calls == (n_chunks - 2) + 1
+
+
 def test_resume_with_unknown_current_model_does_not_resume(dbpath):
     """A client that cannot identify its model (no model_name(), or /props
     unreachable) must not be trusted to resume -- an unconfirmed match is
@@ -862,6 +939,228 @@ def test_run_one_without_on_claim_is_unaffected(dbpath):
     none, and must keep working exactly as before."""
     db.create_job(dbpath, "summarise", "hello world")
     assert worker.run_one(dbpath, "http://x", FakeClient()) is True
+
+
+# --- endpoint attribution (live telemetry support) -----------------------------
+
+def test_run_one_records_which_endpoint_claimed_the_job(dbpath):
+    """Persisted immediately at claim, not only held in app.py's in-memory
+    ENDPOINT_STATE -- that dict is cleared the moment a worker moves on, so a
+    FAILED job would otherwise carry no record of which node it died on."""
+    job_id = db.create_job(dbpath, "summarise", "hello world")
+    assert worker.run_one(dbpath, "http://node3:8080", FakeClient()) is True
+    assert db.get_job(dbpath, job_id)["endpoint"] == "http://node3:8080"
+
+
+def test_run_one_persists_timings_through_to_the_db(dbpath):
+    """End-to-end: run_one -> summarise_traced -> _persist_chunk ->
+    save_chunk_summaries -> get_chunk_timings, with a client that reports
+    timings the way the real LlamaClient does."""
+    class TimedClient(FakeClient):
+        def complete(self, prompt, max_tokens=512):
+            out = super().complete(prompt, max_tokens=max_tokens)
+            self.timings_log.append({
+                "prompt_n": 4096, "prompt_ms": 4000.0,
+                "predicted_n": 200, "predicted_ms": 2000.0})
+            return out
+
+    client = TimedClient()
+    client.timings_log = []
+    job_id = db.create_job(dbpath, "summarise", "hello world")
+    assert worker.run_one(dbpath, "http://x", client) is True
+    timings = db.get_chunk_timings(dbpath, job_id)
+    assert len(timings) == 1
+    assert timings[0]["prompt_n"] == 4096
+
+
+def test_run_one_records_endpoint_even_when_the_job_fails(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "hello world")
+    assert worker.run_one(
+        dbpath, "http://node4:8080",
+        FakeClient(fail_with=RuntimeError("boom"))) is True
+    job = db.get_job(dbpath, job_id)
+    assert job["status"] == "failed"
+    assert job["endpoint"] == "http://node4:8080"
+
+
+# --- guidance length guard ------------------------------------------------------
+# Guidance is embedded in EVERY map call (once per chunk, not once per
+# document), so it must fit alongside one chunk and the model's output inside
+# a single llama-server slot. See the constants' comments for the arithmetic.
+
+def test_check_instruction_length_accepts_empty_and_none():
+    worker.check_instruction_length(None)
+    worker.check_instruction_length("")
+    worker.check_instruction_length("   ")
+
+
+def test_check_instruction_length_accepts_a_normal_note():
+    worker.check_instruction_length("Focus on the financial terms and dates.")
+
+
+def test_check_instruction_length_refuses_an_oversized_guide():
+    too_long = "word " * (worker.MAX_INSTRUCTION_WORDS + 500)
+    with pytest.raises(worker.GuidanceTooLong) as excinfo:
+        worker.check_instruction_length(too_long)
+    # The message must name the limit, not just say "too long" -- an operator
+    # needs the number to know how much to cut.
+    assert str(worker.MAX_INSTRUCTION_WORDS) in str(excinfo.value)
+
+
+def test_check_instruction_length_boundary_is_inclusive():
+    at_limit = "word " * worker.MAX_INSTRUCTION_WORDS
+    worker.check_instruction_length(at_limit)  # must not raise
+    over_by_one = "word " * (worker.MAX_INSTRUCTION_WORDS + 1)
+    with pytest.raises(worker.GuidanceTooLong):
+        worker.check_instruction_length(over_by_one)
+
+
+# --- remaining_seconds (live-progress ETA) --------------------------------------
+
+def test_remaining_seconds_uses_measured_rate_when_given():
+    secs, basis = worker.remaining_seconds(
+        n_chunks=10, chunks_done=4, reduce_pending=False, seconds_per_chunk=100.0)
+    assert basis == "measured"
+    # 6 map chunks left, PLUS the reduce call still ahead (this job has more
+    # than 1 chunk and has not reduced yet) -- same 0.5x overhead
+    # estimate_seconds already applies for a whole document.
+    assert secs == 6 * 100.0 + 0.5 * 100.0
+
+
+def test_remaining_seconds_falls_back_to_the_estimate_constant():
+    secs, basis = worker.remaining_seconds(
+        n_chunks=10, chunks_done=4, reduce_pending=False, seconds_per_chunk=None)
+    assert basis == "estimate"
+    assert secs == 6 * worker.FALLBACK_SECONDS_PER_CHUNK + 0.5 * worker.FALLBACK_SECONDS_PER_CHUNK
+
+
+def test_remaining_seconds_adds_reduce_overhead_once_maps_are_done():
+    """Every map chunk finished but the reduce call has not returned -- there
+    is still real work left (the reduce inference call itself), which a naive
+    "chunks remaining" count of zero would miss entirely."""
+    secs, _basis = worker.remaining_seconds(
+        n_chunks=10, chunks_done=10, reduce_pending=True, seconds_per_chunk=100.0)
+    assert secs == 0.5 * 100.0
+
+
+def test_remaining_seconds_is_zero_once_a_single_chunk_document_is_done():
+    secs, _basis = worker.remaining_seconds(
+        n_chunks=1, chunks_done=1, reduce_pending=False, seconds_per_chunk=100.0)
+    assert secs == 0
+
+
+def test_remaining_seconds_preserves_an_explicit_basis_label():
+    """The operator's own request: a per-job rate must not collapse into the
+    same 'measured' label as the cluster-wide rate -- they are different
+    claims and must stay visibly different through to display."""
+    secs, basis = worker.remaining_seconds(
+        n_chunks=10, chunks_done=4, reduce_pending=False,
+        seconds_per_chunk=80.0, basis="job")
+    assert basis == "job"
+    assert secs == (6 + 0.5) * 80.0
+
+
+def test_remaining_seconds_none_rate_always_means_estimate_regardless_of_basis():
+    """seconds_per_chunk=None can only ever mean the fallback constant -- a
+    caller passing a basis alongside None is nonsensical and must not leak
+    through as a false claim of being job- or cluster-calibrated."""
+    secs, basis = worker.remaining_seconds(
+        n_chunks=10, chunks_done=4, reduce_pending=False,
+        seconds_per_chunk=None, basis="job")
+    assert basis == "estimate"
+    assert secs == (6 + 0.5) * worker.FALLBACK_SECONDS_PER_CHUNK
+
+
+# --- per-chunk timings: prefill/generation tok/s, kept separate -----------------
+
+def test_last_timings_reads_the_most_recent_call():
+    class TimedClient(FakeClient):
+        def complete(self, prompt, max_tokens=512):
+            out = super().complete(prompt, max_tokens=max_tokens)
+            self.timings_log.append({
+                "prompt_n": 100 * self.calls, "prompt_ms": 1000.0,
+                "predicted_n": 10 * self.calls, "predicted_ms": 200.0})
+            return out
+
+    client = TimedClient()
+    client.timings_log = []
+    client.complete("p1")
+    client.complete("p2")
+    t = worker._last_timings(client)
+    assert t == {"prompt_n": 200, "prompt_ms": 1000.0,
+                "predicted_n": 20, "predicted_ms": 200.0}
+
+
+def test_last_timings_empty_for_a_client_with_no_timings_log():
+    assert worker._last_timings(FakeClient()) == {}
+
+
+def test_summarise_traced_attaches_timings_to_new_chunk_records():
+    class TimedClient(FakeClient):
+        def complete(self, prompt, max_tokens=512):
+            out = super().complete(prompt, max_tokens=max_tokens)
+            self.timings_log.append({
+                "prompt_n": 4096, "prompt_ms": 4000.0,
+                "predicted_n": 200, "predicted_ms": 2000.0})
+            return out
+
+    client = TimedClient()
+    client.timings_log = []
+    doc = "word " * 20000
+    _final, records = worker.summarise_traced("summarise", doc, client)
+    assert records, "expected at least one chunk"
+    for r in records:
+        assert r["prompt_n"] == 4096
+        assert r["predicted_ms"] == 2000.0
+
+
+def test_summarise_traced_resumed_chunks_have_no_new_timings():
+    """A resumed chunk made no new call, so it must not be attributed the
+    NEXT chunk's timings, or any timing at all from this run."""
+    client = FakeClient()
+    doc = "word " * 20000
+    spans = worker.chunk_spans(doc)
+    resume = [{"index": spans[0]["index"], "start": spans[0]["start"],
+               "end": spans[0]["end"], "summary": "PRIOR"}]
+    _final, records = worker.summarise_traced(
+        "summarise", doc, client, resume_records=resume)
+    assert "prompt_n" not in records[0]
+
+
+def test_chunk_rate_stats_is_none_for_no_timings():
+    assert worker.chunk_rate_stats([]) is None
+    assert worker.chunk_rate_stats(None) is None
+
+
+def test_chunk_rate_stats_splits_prefill_and_generation():
+    timings = [
+        {"idx": 0, "prompt_n": 4000, "prompt_ms": 200000.0,   # 20 tok/s prefill
+         "predicted_n": 100, "predicted_ms": 20000.0},         # 5 tok/s gen
+        {"idx": 1, "prompt_n": 4000, "prompt_ms": 160000.0,   # 25 tok/s prefill
+         "predicted_n": 100, "predicted_ms": 20000.0},         # 5 tok/s gen
+    ]
+    stats = worker.chunk_rate_stats(timings)
+    assert stats["n_timed"] == 2
+    # LAST chunk only.
+    assert stats["last_prefill_tok_s"] == 25.0
+    assert stats["last_gen_tok_s"] == 5.0
+    # POOLED across both (sum tokens / sum ms), not a mean of per-chunk ratios.
+    assert stats["avg_prefill_tok_s"] == pytest.approx(8000 / 360.0)
+    assert stats["avg_gen_tok_s"] == pytest.approx(200 / 40.0)
+    assert stats["seconds_per_chunk"] == pytest.approx(
+        ((200000 + 20000) / 1000.0 + (160000 + 20000) / 1000.0) / 2)
+
+
+def test_chunk_rate_stats_never_blends_prefill_and_generation():
+    """The rates must be reported separately -- never averaged together into
+    one number, which would be dominated by whichever phase happened to run
+    when sampled (prefill and generation run at very different speeds)."""
+    timings = [{"idx": 0, "prompt_n": 1000, "prompt_ms": 40000.0,
+               "predicted_n": 1000, "predicted_ms": 200000.0}]
+    stats = worker.chunk_rate_stats(timings)
+    assert stats["last_prefill_tok_s"] != stats["last_gen_tok_s"]
+    assert set(stats) >= {"last_prefill_tok_s", "last_gen_tok_s",
+                          "avg_prefill_tok_s", "avg_gen_tok_s"}
 
 
 def test_concurrent_endpoint_workers_never_double_claim(dbpath):

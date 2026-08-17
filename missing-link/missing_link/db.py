@@ -63,6 +63,13 @@ _JOBS_NEW_COLUMNS = [
     ("priority", "INTEGER NOT NULL DEFAULT 0"),
     ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
     ("seen_at", "TEXT"),
+    # Which inference endpoint (LLAMA_URLS entry) claimed and ran this job.
+    # Set once at claim time (see worker.run_one / set_job_endpoint) and left
+    # in place through to done/failed/cancelled, so a FAILED job still shows
+    # which node it died on -- under fan-out a node dying costs 1/R of
+    # throughput, and "which one" is exactly what ENDPOINT_STATE (in-memory,
+    # cleared once the worker moves on) cannot answer after the fact.
+    ("endpoint", "TEXT"),
 ]
 _CHUNK_NEW_COLUMNS = [
     # Which model produced this row, from LlamaClient.model_name() (/props).
@@ -71,6 +78,35 @@ _CHUNK_NEW_COLUMNS = [
     # worker.run_one. NULL for rows written before this column existed, which
     # get_recorded_model treats as "unknown", not as "matches".
     ("model", "TEXT"),
+    # Which operator instruction was in effect when this row was produced.
+    # `instruction` shapes the map prompt exactly as much as the model does
+    # (see worker.build_prompt), so a resume that only checks the model and
+    # not this would mix chunk summaries written under two different
+    # instructions -- the same unsoundness the model check exists to
+    # prevent, arriving through a different door. See get_recorded_instruction
+    # and worker.run_one's resume check.
+    ("instruction", "TEXT"),
+    # llama-server's OWN timings for the call that produced this chunk --
+    # never derived from wall-clock (F17: a wall-clock-derived TTFT once
+    # reported 0.015s against a real 89s). NULL for a resumed chunk (no new
+    # call was made) or a client that does not report timings (e.g. tests'
+    # FakeClient) -- a missing measurement must stay NULL, never a fabricated
+    # 0, per this project's standing rule (ttft_s is None, not 0.0). Live
+    # per-chunk tok/s and a per-job ETA are derived from these -- see
+    # worker.chunk_rate_stats and get_chunk_timings. Prefill and generation
+    # are kept as SEPARATE counters (prompt_* vs predicted_*), never blended
+    # into one rate: they run at very different speeds on this hardware
+    # (prefill ~16-25 t/s, generation ~5-6 t/s) and a blended figure would be
+    # dominated by whichever phase happened to be running when read.
+    ("prompt_n", "INTEGER"),
+    ("prompt_ms", "REAL"),
+    ("predicted_n", "INTEGER"),
+    ("predicted_ms", "REAL"),
+    # When this row was written (server clock, stamped by save_chunk_summaries
+    # itself -- not supplied by the caller, so it cannot drift from whichever
+    # clock actually persisted it). Lets a live-progress view show "last chunk
+    # landed Ns ago" and is a cheap sanity check against a stalled worker.
+    ("completed_at", "TEXT"),
 ]
 
 
@@ -545,7 +581,7 @@ def init_chunks(path):
         conn.close()
 
 
-def save_chunk_summaries(path, job_id, records, model=None):
+def save_chunk_summaries(path, job_id, records, model=None, instruction=None):
     """Persist per-chunk summaries so the final output stays traceable.
 
     Without this the map step's output is consumed by the reduce step and thrown
@@ -558,14 +594,29 @@ def save_chunk_summaries(path, job_id, records, model=None):
 
     `model` records which model produced these summaries (from
     LlamaClient.model_name()), so a later resume attempt can tell whether it is
-    safe to reuse them -- see get_recorded_model.
+    safe to reuse them -- see get_recorded_model. `instruction` records the
+    operator guidance in effect for this run, for the same reason -- see
+    get_recorded_instruction.
+
+    Each record MAY also carry `prompt_n`/`prompt_ms`/`predicted_n`/
+    `predicted_ms` (from worker._last_timings, itself from llama-server's own
+    `timings` object) -- absent for a resumed chunk or a client that reports
+    no timings, and stored as NULL rather than a fabricated 0 when absent, per
+    this project's standing rule that a missing measurement must look missing.
+    `completed_at` is stamped here, from this process's own clock, not
+    supplied by the caller.
     """
+    now = _now()
     conn = _connect(path)
     try:
         conn.executemany(
             "INSERT OR REPLACE INTO chunk_summaries "
-            "(job_id, idx, start_char, end_char, summary, model) VALUES (?,?,?,?,?,?)",
-            [(job_id, r["index"], r["start"], r["end"], r["summary"], model)
+            "(job_id, idx, start_char, end_char, summary, model, instruction, "
+            " prompt_n, prompt_ms, predicted_n, predicted_ms, completed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(job_id, r["index"], r["start"], r["end"], r["summary"], model, instruction,
+              r.get("prompt_n"), r.get("prompt_ms"), r.get("predicted_n"),
+              r.get("predicted_ms"), now)
              for r in records])
     finally:
         conn.close()
@@ -577,6 +628,28 @@ def get_chunk_summaries(path, job_id):
         rows = conn.execute(
             "SELECT idx, start_char, end_char, summary, model FROM chunk_summaries "
             "WHERE job_id=? ORDER BY idx", (job_id,)).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_chunk_timings(path, job_id):
+    """This job's OWN per-chunk timings, in chunk order, for rows that were
+    actually timed (prompt_ms IS NOT NULL) -- excludes a resumed chunk (no new
+    call was made for it) and rows written before this column existed.
+
+    This is the raw data behind a PER-JOB live tok/s and ETA, as distinct from
+    the cluster-wide average in seconds_per_chunk: this job's own measured
+    rate is the better predictor of what THIS job will do next, once there is
+    enough of it to trust -- see worker.chunk_rate_stats, which turns this
+    into prefill/generation tok/s and a seconds-per-chunk figure.
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT idx, prompt_n, prompt_ms, predicted_n, predicted_ms "
+            "FROM chunk_summaries WHERE job_id=? AND prompt_ms IS NOT NULL "
+            "ORDER BY idx", (job_id,)).fetchall()
     finally:
         conn.close()
     return [dict(r) for r in rows]
@@ -603,6 +676,52 @@ def get_recorded_model(path, job_id):
     if len(rows) != 1:
         return None
     return rows[0]["model"]
+
+
+def get_recorded_instruction(path, job_id):
+    """The operator instruction recorded against this job's persisted chunks.
+
+    Returns (True, instruction) when every persisted chunk row agrees --
+    including agreeing it was None, which is the ordinary case of no guidance
+    given, and is trustworthy (unlike model=None, "no instruction" was already
+    true of every job before this column existed, so it is not new
+    information to distrust). Returns (False, None) when there are no
+    persisted chunks, or the rows disagree (should not happen in normal
+    operation -- every chunk of one run is saved with the same instruction;
+    defensive anyway, same posture as get_recorded_model).
+
+    Why this check exists at all: `instruction` shapes the map prompt exactly
+    as much as the model does (see worker.build_prompt), so trusting a resume
+    on model alone would let a job resumed after its guidance changed
+    silently mix chunk summaries produced under two different instructions --
+    the same unsoundness the model check exists to prevent. See worker.run_one.
+
+    No lazy init_chunks() call here, deliberately -- see init_db's docstring
+    for why that pattern was removed from every hot-path read/write.
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT instruction FROM chunk_summaries WHERE job_id=?",
+            (job_id,)).fetchall()
+    finally:
+        conn.close()
+    if len(rows) != 1:
+        return False, None
+    return True, rows[0]["instruction"]
+
+
+def set_job_endpoint(path, job_id, url):
+    """Record which inference endpoint claimed this job. See the `endpoint`
+    column's note in _JOBS_NEW_COLUMNS for why this is persisted rather than
+    read from the in-memory ENDPOINT_STATE (app.py), which is cleared the
+    moment the worker moves on to its next iteration.
+    """
+    conn = _connect(path)
+    try:
+        conn.execute("UPDATE jobs SET endpoint=? WHERE id=?", (url, job_id))
+    finally:
+        conn.close()
 
 
 def delete_chunk_summaries(path, job_id):

@@ -4,10 +4,52 @@
   <span class="badge {{ job.status }}">{{ job.status }}</span>{% endblock %}
 {% block body %}
 {% if job.status in ("pending","running") %}
-  <!-- Jobs run for hours; a manual refresh is the wrong interaction. -->
+  <!-- Jobs run for hours; a manual refresh is the wrong interaction. This
+       reload is also the NO-JS FALLBACK for live progress -- every field in
+       the box below is rendered server-side from the live database on every
+       request, so it is correct on a plain page load with no script at all.
+       JS below only makes updates land sooner than 15s; it is never the only
+       source of this data, so a browser with JS off just sees it update
+       more slowly, never a blank or stale-forever page. -->
   <meta http-equiv="refresh" content="15">
   <p style="color:var(--mut)">This page refreshes every 15 seconds. Nothing is
   waiting on you — close it and come back.</p>
+
+  {% if job.status == "running" %}
+  {% set basis_labels = {
+       "job": "measured from this job's own chunks so far",
+       "measured": "measured from this cluster's completed jobs",
+       "estimate": "estimate — not yet calibrated"} %}
+  <div id="live-progress" style="border:1px solid var(--line);border-radius:8px;
+       padding:.8rem 1rem;margin:.6rem 0 1.1rem">
+    <p style="margin:.1rem 0">
+      <strong>Chunk <span id="lp-chunk-n">{{ [progress.chunks_done + 1, progress.chunks_expected] | min }}</span> of
+      <span id="lp-expected">{{ progress.chunks_expected }}</span></strong>
+      (<span id="lp-chunks">{{ progress.chunks_done }}</span> done)
+      {%- if progress.endpoint %} — running on <code>{{ progress.endpoint }}</code>{% endif %}
+    </p>
+    <p style="margin:.1rem 0;color:var(--mut);font-size:.85rem">
+      Elapsed: <span id="lp-elapsed">{{ "%.0fs"|format(progress.elapsed_s) if progress.elapsed_s is not none else "—" }}</span>
+      {%- if progress.eta_human %} · ETA: <span id="lp-eta">{{ progress.eta_human }}</span>
+        <span id="lp-eta-basis">({{ basis_labels.get(progress.eta_basis, progress.eta_basis) }})</span>
+      {%- endif %}
+    </p>
+    {% if progress.tok_s %}
+    <p style="margin:.1rem 0;color:var(--mut);font-size:.85rem" id="lp-toks">
+      Prefill: <span id="lp-prefill">{{ "%.1f"|format(progress.tok_s.last_prefill_tok_s) if progress.tok_s.last_prefill_tok_s else "—" }} tok/s</span>
+      (avg <span id="lp-prefill-avg">{{ "%.1f"|format(progress.tok_s.avg_prefill_tok_s) if progress.tok_s.avg_prefill_tok_s else "—" }}</span>)
+      · Generation: <span id="lp-gen">{{ "%.1f"|format(progress.tok_s.last_gen_tok_s) if progress.tok_s.last_gen_tok_s else "—" }} tok/s</span>
+      (avg <span id="lp-gen-avg">{{ "%.1f"|format(progress.tok_s.avg_gen_tok_s) if progress.tok_s.avg_gen_tok_s else "—" }}</span>)
+      <span style="font-size:.78rem">— from this job's own <span id="lp-n-timed">{{ progress.tok_s.n_timed }}</span> timed chunk{{ "s" if progress.tok_s.n_timed != 1 }}, kept separate: prefill and generation run at very different speeds on this hardware.</span>
+    </p>
+    {% endif %}
+    <p style="margin:.3rem 0 0;font-size:.78rem"><a href="/jobs/{{ job.id }}/progress">progress as JSON</a></p>
+  </div>
+  {% elif job.status == "pending" %}
+  <p style="color:var(--mut);font-size:.85rem">Queued — will split into about
+  {{ progress.chunks_expected }} chunk{{ "s" if progress.chunks_expected != 1 }} once it starts.</p>
+  {% endif %}
+
   {% if estimate %}
   <p><strong>Expected to take about {{ estimate.human }}.</strong>
     <span style="color:var(--mut)">
@@ -29,8 +71,10 @@
   </form>
   {% endif %}
 {% elif job.status == "cancelled" %}
-  <p style="color:var(--mut)">Cancelled{% if job.chunks %} after completing {{ job.chunks }}
-  chunk{{ "s" if job.chunks != 1 }}{% endif %}. Not an error — this was requested.</p>
+  <p style="color:var(--mut)">Cancelled after completing {{ progress.chunks_done }}
+  of {{ progress.chunks_expected }} chunk{{ "s" if progress.chunks_expected != 1 }}.
+  {%- if job.endpoint %} Was running on <code>{{ job.endpoint }}</code>.{% endif %}
+  Not an error — this was requested.</p>
 {% endif %}
 
 <div class="tbl-wrap"><table>
@@ -39,6 +83,7 @@
   {% if job.finished_at %}<tr><th>Finished</th><td>{{ job.finished_at[:19].replace("T"," ") }}</td></tr>{% endif %}
   {% if job.chunks %}<tr><th>Chunks</th><td>{{ job.chunks }}</td></tr>{% endif %}
   {% if job.total_s %}<tr><th>Wall clock</th><td>{{ "%.1f s"|format(job.total_s) }}</td></tr>{% endif %}
+  {% if job.endpoint %}<tr><th>Endpoint</th><td><code>{{ job.endpoint }}</code></td></tr>{% endif %}
 </table></div>
 
 {% if job.instruction %}
@@ -47,7 +92,18 @@
 {% endif %}
 
 {% if job.status == "failed" %}
-  <h3>Error</h3><pre>{{ job.error }}</pre>
+  <div style="border:1px solid #c0392b;border-radius:8px;padding:.9rem 1.1rem;
+       margin:.6rem 0 1.2rem;background:color-mix(in srgb, #c0392b 8%, transparent)">
+    <h3 style="margin:.1rem 0;color:#c0392b">This job failed</h3>
+    <p style="margin:.2rem 0;color:var(--mut);font-size:.85rem">
+      Got through {{ progress.chunks_done }} of {{ progress.chunks_expected }}
+      chunk{{ "s" if progress.chunks_expected != 1 }} before failing
+      {%- if job.endpoint %}, running against <code>{{ job.endpoint }}</code>{% endif %}.
+      {%- if progress.chunks_done > 0 %} Those chunk summaries are kept on disk,
+      in case this job is ever moved back to pending and resumed.{% endif %}
+    </p>
+    <pre style="margin:.4rem 0 0">{{ job.error }}</pre>
+  </div>
 {% elif job.status == "done" %}
   <h3>Result <span style="font-weight:400;color:var(--mut);font-size:.8rem">—
     <a href="/jobs/{{ job.id }}/text">copy box</a> ·
@@ -76,4 +132,80 @@
 <pre>{{ job.document[:4000] }}{% if job.document|length > 4000 %}
 
 … truncated for display ({{ job.document|length }} characters total){% endif %}</pre>
+
+{% if job.status == "running" %}
+<script>
+// Progressive enhancement ONLY -- see the comment above the <meta refresh>
+// tag near the top of this page. Plain setInterval + fetch against a cheap
+// SQLite-only JSON endpoint: no websocket, no SSE, nothing that can wedge,
+// and a closed tab costs nothing because there is no connection to leave open.
+(function () {
+  "use strict";
+  var url = "/jobs/{{ job.id }}/progress";
+  var pollMs = 3000;  // no faster than 2-3s, per this project's own standing rule
+
+  // Mirrors the basis_labels dict in the server-rendered version of this box
+  // (see the Jinja above) -- three tiers, never collapsed into one "measured"
+  // bucket: a rate calibrated on this job's own first couple of chunks is a
+  // materially different claim from the cluster-wide average, which is in
+  // turn different from the unconditioned fallback constant.
+  var BASIS_LABELS = {
+    job: "measured from this job's own chunks so far",
+    measured: "measured from this cluster's completed jobs",
+    estimate: "estimate — not yet calibrated"
+  };
+
+  function setText(id, text) {
+    var el = document.getElementById(id);
+    if (el && text !== undefined && text !== null) el.textContent = text;
+  }
+
+  function fmt1(n) { return (n === null || n === undefined) ? "—" : n.toFixed(1); }
+
+  function paint(d) {
+    setText("lp-chunks", d.chunks_done);
+    setText("lp-expected", d.chunks_expected);
+    setText("lp-chunk-n", Math.min(d.chunks_done + 1, d.chunks_expected));
+    if (d.elapsed_s !== null && d.elapsed_s !== undefined) {
+      setText("lp-elapsed", Math.round(d.elapsed_s) + "s");
+    }
+    if (d.eta_human) {
+      setText("lp-eta", d.eta_human);
+      setText("lp-eta-basis", "(" + (BASIS_LABELS[d.eta_basis] || d.eta_basis) + ")");
+    }
+    // tok_s is null until this job has produced at least one real (non-
+    // resumed) timed chunk -- the box may not exist yet on first paint if the
+    // page was rendered before any chunk landed, so guard every element.
+    if (d.tok_s) {
+      setText("lp-prefill", fmt1(d.tok_s.last_prefill_tok_s) + " tok/s");
+      setText("lp-prefill-avg", fmt1(d.tok_s.avg_prefill_tok_s));
+      setText("lp-gen", fmt1(d.tok_s.last_gen_tok_s) + " tok/s");
+      setText("lp-gen-avg", fmt1(d.tok_s.avg_gen_tok_s));
+      setText("lp-n-timed", d.tok_s.n_timed);
+    }
+    // The job reached a terminal state while this tab was open -- reload once
+    // to pick up the result/error section, which this lightweight endpoint
+    // deliberately does not carry (it never returns job.result or the full
+    // document). Stop polling either way; there is nothing further to learn.
+    if (d.status !== "pending" && d.status !== "running") {
+      clearInterval(timer);
+      window.location.reload();
+    }
+  }
+
+  function poll() {
+    fetch(url, {cache: "no-store"})
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d) paint(d); })
+      .catch(function () { /* one missed poll is not worth reporting */ });
+  }
+
+  poll();
+  var timer = setInterval(poll, pollMs);
+  // Belt-and-braces: stop even if the terminal-state check above never fires
+  // (e.g. this tab is backgrounded through the actual completion).
+  window.addEventListener("pagehide", function () { clearInterval(timer); });
+})();
+</script>
+{% endif %}
 {% endblock %}

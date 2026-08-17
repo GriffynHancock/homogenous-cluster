@@ -9,7 +9,7 @@
   per-workflow instructions below, then confirm. Refused files are listed with
   the reason and will not be queued — fix them and upload separately if needed.</p>
 
-<form method="post" action="/batch/{{ batch_id }}/confirm">
+<form method="post" action="/batch/{{ batch_id }}/confirm" enctype="multipart/form-data">
 <div class="tbl-wrap">
 <table>
   <thead><tr><th>File</th><th>Preview</th><th>Status</th><th>Workflows</th></tr></thead>
@@ -43,11 +43,18 @@
   <legend>Optional instructions per workflow</legend>
   <p class="hint">Applied to every job of that workflow created from this batch
     — e.g. "focus on financial figures" for a report, or "list only dates and
-    obligations" for Q&amp;A. Leave blank to use the default prompt as-is.</p>
+    obligations" for Q&amp;A. Leave blank to use the default prompt as-is. Type
+    guidance, or upload a file instead (a house style guide, a report
+    template, a list of questions) — a typed box and a file for the same
+    workflow are combined. A guidance file is refused, with a reason, if it
+    cannot be read or is too long to fit alongside a document chunk; it is
+    never silently shortened.</p>
   {% for k in kinds %}
     <label for="instruction_{{ k }}">Instructions for “{{ k }}” jobs</label>
     <textarea name="instruction_{{ k }}" id="instruction_{{ k }}"
       placeholder="Optional guidance for the {{ k }} workflow…"></textarea>
+    <label for="guidance_file_{{ k }}">…or a guidance file for “{{ k }}” jobs</label>
+    <input type="file" name="guidance_file_{{ k }}" id="guidance_file_{{ k }}">
   {% endfor %}
 </fieldset>
 
