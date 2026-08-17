@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     ttft_s      REAL,
     total_s     REAL,
     tokens      INTEGER,
-    chunks      INTEGER
+    chunks      INTEGER,
+    instruction TEXT
 );
 -- rowid cannot be named in an index (SQLite rejects it), but it is the
 -- implicit tiebreaker anyway, so (status, created_at) is sufficient.
@@ -50,17 +51,31 @@ def init_db(path):
     conn = _connect(path)
     try:
         conn.executescript(SCHEMA)
+        # A DB created before `instruction` existed won't get the column from
+        # CREATE TABLE IF NOT EXISTS above -- that only fires on a brand-new
+        # file. This makes upgrading an already-deployed jobs.sqlite idempotent
+        # rather than requiring a manual migration, in the spirit of the rest of
+        # this project's provisioning (see CLAUDE.md: "node provisioning must be
+        # idempotent").
+        _ensure_column(conn, "jobs", "instruction", "TEXT")
     finally:
         conn.close()
 
 
-def create_job(path, kind, document):
+def _ensure_column(conn, table, column, coltype):
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
+def create_job(path, kind, document, instruction=None):
     job_id = uuid.uuid4().hex[:12]
     conn = _connect(path)
     try:
         conn.execute(
-            "INSERT INTO jobs (id, kind, document, created_at) VALUES (?,?,?,?)",
-            (job_id, kind, document, _now()),
+            "INSERT INTO jobs (id, kind, document, instruction, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (job_id, kind, document, instruction, _now()),
         )
     finally:
         conn.close()
@@ -303,3 +318,80 @@ def throughput_stats(path, limit=10):
         "last_job_s": rows[0]["total_s"],
         "last_job_chunks": rows[0]["chunks"],
     }
+
+
+# --- Batch upload staging -----------------------------------------------------
+# "Here are 40 case files" is the real workload (DESIGN-NOTES F gap 1), not one
+# document at a time. A batch upload is a TWO-STEP, no-JS-required flow:
+#
+#   1. POST /batch with N files -- each is run through extract.extract() and
+#      staged here as a row, accepted or refused, WITHOUT yet becoming a job
+#      (a job needs a workflow `kind`, which the operator has not chosen yet).
+#   2. The review page renders one row per staged document with a tick box per
+#      workflow. Confirming turns each ticked (document, workflow) pair into a
+#      real job via create_job().
+#
+# Kept as its own table rather than reusing `jobs` so a refused file (bad PDF,
+# unsupported format) can be shown to the operator without ever being a job.
+
+BATCH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS batch_documents (
+    id          TEXT PRIMARY KEY,
+    batch_id    TEXT NOT NULL,
+    filename    TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    preview     TEXT NOT NULL,
+    status      TEXT NOT NULL,  -- 'ready' (extracted, awaiting workflow ticks)
+                                 -- or 'refused' (extraction failed -- see error)
+    error       TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_batch_documents_batch
+    ON batch_documents (batch_id);
+"""
+
+
+def init_batch_documents(path):
+    conn = _connect(path)
+    try:
+        conn.executescript(BATCH_SCHEMA)
+    finally:
+        conn.close()
+
+
+def create_batch(path, records):
+    """Stage a batch of uploaded documents. records: list of dicts with
+    filename, text, preview, status ('ready'/'refused'), error.
+
+    Returns the new batch_id. IDs are assigned here so the caller never has to
+    invent them, matching create_job()'s pattern.
+    """
+    init_batch_documents(path)
+    batch_id = uuid.uuid4().hex[:12]
+    conn = _connect(path)
+    try:
+        now = _now()
+        conn.executemany(
+            "INSERT INTO batch_documents "
+            "(id, batch_id, filename, text, preview, status, error, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [(uuid.uuid4().hex[:12], batch_id, r["filename"], r.get("text", ""),
+              r.get("preview", ""), r["status"], r.get("error"), now)
+             for r in records],
+        )
+    finally:
+        conn.close()
+    return batch_id
+
+
+def get_batch(path, batch_id):
+    """All staged documents for a batch, in upload order."""
+    init_batch_documents(path)
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM batch_documents WHERE batch_id=? ORDER BY rowid",
+            (batch_id,)).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]

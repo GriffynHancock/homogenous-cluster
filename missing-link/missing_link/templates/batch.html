@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Batch review{% endblock %}
+{% block sub %}Batch <code>{{ batch_id }}</code> —
+  {{ docs | selectattr("status", "equalto", "ready") | list | length }} accepted,
+  {{ docs | selectattr("status", "equalto", "refused") | list | length }} refused{% endblock %}
+{% block body %}
+
+<p class="hint">Tick which workflow(s) to run on each accepted document, add any
+  per-workflow instructions below, then confirm. Refused files are listed with
+  the reason and will not be queued — fix them and upload separately if needed.</p>
+
+<form method="post" action="/batch/{{ batch_id }}/confirm">
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>File</th><th>Preview</th><th>Status</th><th>Workflows</th></tr></thead>
+  <tbody>
+  {% for d in docs %}
+    {% if d.status == "ready" %}
+    <tr>
+      <td>{{ d.filename }}</td>
+      <td class="preview">{{ d.preview }}{% if d.preview|length >= 200 %}…{% endif %}</td>
+      <td><span class="badge done">ready</span></td>
+      <td class="wf-cell">
+        {% for k in kinds %}
+          <label><input type="checkbox" name="wf_{{ d.id }}" value="{{ k }}"> {{ k }}</label>
+        {% endfor %}
+      </td>
+    </tr>
+    {% else %}
+    <tr class="refused-row">
+      <td>{{ d.filename }}</td>
+      <td colspan="2"><span class="badge failed">refused</span>
+        <span class="reason">{{ d.error }}</span></td>
+      <td>—</td>
+    </tr>
+    {% endif %}
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<fieldset>
+  <legend>Optional instructions per workflow</legend>
+  <p class="hint">Applied to every job of that workflow created from this batch
+    — e.g. "focus on financial figures" for a report, or "list only dates and
+    obligations" for Q&amp;A. Leave blank to use the default prompt as-is.</p>
+  {% for k in kinds %}
+    <label for="instruction_{{ k }}">Instructions for “{{ k }}” jobs</label>
+    <textarea name="instruction_{{ k }}" id="instruction_{{ k }}"
+      placeholder="Optional guidance for the {{ k }} workflow…"></textarea>
+  {% endfor %}
+</fieldset>
+
+<button type="submit">Create jobs for ticked workflows</button>
+</form>
+{% endblock %}

@@ -38,18 +38,18 @@ PROMPTS = {
     "summarise": (
         "Summarise the following text. Be faithful to the source: do not add "
         "facts, opinions or conclusions that are not present in it. If the text "
-        "is inconclusive, say so.\n\n---\n{document}\n---\n\nSummary:"
+        "is inconclusive, say so.{instruction}\n\n---\n{document}\n---\n\nSummary:"
     ),
     "report": (
         "Using only the material below, draft a clear, well-structured report. "
         "Do not introduce facts that are not present in the source. Mark any "
-        "gaps explicitly rather than filling them.\n\n"
+        "gaps explicitly rather than filling them.{instruction}\n\n"
         "---\n{document}\n---\n\nReport:"
     ),
     "qa": (
         "Read the following material and extract the facts it contains that a "
         "reader would most likely need. Quote figures exactly. Do not "
-        "speculate.\n\n---\n{document}\n---\n\nKey facts:"
+        "speculate.{instruction}\n\n---\n{document}\n---\n\nKey facts:"
     ),
 }
 
@@ -58,18 +58,18 @@ REDUCE_PROMPTS = {
         "Below are summaries of consecutive sections of one document. Combine "
         "them into a single coherent summary. Remove repetition caused by "
         "overlapping sections. Do not add anything not present in the "
-        "sections.\n\n---\n{summaries}\n---\n\nCombined summary:"
+        "sections.{instruction}\n\n---\n{summaries}\n---\n\nCombined summary:"
     ),
     "report": (
         "Below are drafted sections of one report, in order. Combine them into "
         "a single coherent report, removing repetition introduced by "
-        "overlapping sections. Do not add new material.\n\n"
+        "overlapping sections. Do not add new material.{instruction}\n\n"
         "---\n{summaries}\n---\n\nCombined report:"
     ),
     "qa": (
         "Below are fact lists extracted from consecutive sections of one "
         "document. Combine them into a single deduplicated list, preserving "
-        "figures exactly.\n\n---\n{summaries}\n---\n\nCombined facts:"
+        "figures exactly.{instruction}\n\n---\n{summaries}\n---\n\nCombined facts:"
     ),
 }
 
@@ -167,15 +167,29 @@ def chunk_document(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKEN
     return chunks
 
 
-def build_prompt(kind, document):
-    return PROMPTS[kind].format(document=document)
+def _instruction_clause(instruction):
+    """Turn an optional per-job operator instruction into a prompt fragment.
+
+    Returns "" when there is none, so PROMPTS/REDUCE_PROMPTS render byte-for-byte
+    identical to before this existed -- the existing tests assert exact prompt
+    text and must keep passing unchanged.
+    """
+    if not instruction or not instruction.strip():
+        return ""
+    return f" Additional instructions from the operator for this job: {instruction.strip()}"
 
 
-def build_reduce_prompt(kind, summaries):
+def build_prompt(kind, document, instruction=None):
+    return PROMPTS[kind].format(document=document,
+                                instruction=_instruction_clause(instruction))
+
+
+def build_reduce_prompt(kind, summaries, instruction=None):
     joined = "\n\n".join(
         f"[Section {i + 1}]\n{s}" for i, s in enumerate(summaries)
     )
-    return REDUCE_PROMPTS[kind].format(summaries=joined)
+    return REDUCE_PROMPTS[kind].format(summaries=joined,
+                                       instruction=_instruction_clause(instruction))
 
 
 class LlamaClient:
@@ -386,24 +400,26 @@ def _strip_think(text):
 
 
 def summarise(kind, document, base_url, client,
-              max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS):
+              max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS,
+              instruction=None):
     """Map-reduce over the document. Returns the final text."""
     chunks = chunk_document(document)
 
     # A single chunk needs no reduce step. Running one anyway would cost a
     # second multi-minute inference pass to summarise a single summary.
     if len(chunks) == 1:
-        return client.complete(build_prompt(kind, chunks[0]), max_tokens=max_tokens)
+        return client.complete(build_prompt(kind, chunks[0], instruction),
+                               max_tokens=max_tokens)
 
     partials = [
-        client.complete(build_prompt(kind, c), max_tokens=max_tokens)
+        client.complete(build_prompt(kind, c, instruction), max_tokens=max_tokens)
         for c in chunks
     ]
     # The reduce step must cover every chunk summary, so it legitimately needs a
     # bigger budget than any single map step. Using the same value is how you
     # get a truncated final answer on a long document.
     return client.complete(
-        build_reduce_prompt(kind, partials), max_tokens=reduce_max_tokens)
+        build_reduce_prompt(kind, partials, instruction), max_tokens=reduce_max_tokens)
 
 
 def count_chunks(document):
@@ -434,7 +450,12 @@ def run_one(db_path, base_url, client=None):
         n_chunks = count_chunks(job["document"])
         # summarise_traced keeps each chunk's identity and offsets, so the final
         # output stays traceable to spans of the source. See "Provenance" above.
-        result, chunk_records = summarise_traced(job["kind"], job["document"], client)
+        # job.get() rather than job["instruction"]: older rows created before
+        # this column existed, and FakeClient-driven tests that build a job dict
+        # by hand, must not KeyError here.
+        result, chunk_records = summarise_traced(
+            job["kind"], job["document"], client,
+            instruction=job.get("instruction"))
         db.save_chunk_summaries(db_path, job["id"], chunk_records)
         db.complete_job(db_path, job["id"], result, {
             "total_s": round(time.monotonic() - started, 2),
@@ -574,13 +595,18 @@ def chunk_spans(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
 
 
 def summarise_traced(kind, document, client,
-                     max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS):
+                     max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS,
+                     instruction=None):
     """Map-reduce that RETAINS provenance.
 
     Returns (final_text, chunk_records) where each record is
     {"index", "start", "end", "summary"} -- enough to show a reader which span of
     the source produced which part of the output, and enough to score each chunk
     summary against its own chunk rather than against the whole document.
+
+    `instruction` is an optional per-job operator note (see build_prompt) applied
+    to every map call and to the reduce call, so guidance like "focus on the
+    financial terms" shapes both the per-chunk summaries and how they are combined.
     """
     chunks = chunk_spans(document)
     if not chunks:
@@ -588,7 +614,8 @@ def summarise_traced(kind, document, client,
 
     records = []
     for ch in chunks:
-        summary = client.complete(build_prompt(kind, ch["text"]), max_tokens=max_tokens)
+        summary = client.complete(build_prompt(kind, ch["text"], instruction),
+                                  max_tokens=max_tokens)
         records.append({"index": ch["index"], "start": ch["start"],
                         "end": ch["end"], "summary": summary})
 
@@ -596,6 +623,6 @@ def summarise_traced(kind, document, client,
         return records[0]["summary"], records
 
     final = client.complete(
-        build_reduce_prompt(kind, [r["summary"] for r in records]),
+        build_reduce_prompt(kind, [r["summary"] for r in records], instruction),
         max_tokens=reduce_max_tokens)
     return final, records

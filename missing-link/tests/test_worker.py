@@ -62,6 +62,52 @@ def test_reduce_prompt_includes_every_summary():
         assert s in p
 
 
+# --- optional per-job operator instruction -----------------------------------
+
+def test_build_prompt_without_instruction_is_unchanged():
+    """No instruction must produce byte-identical output to before this existed."""
+    assert worker.build_prompt("summarise", "x", instruction=None) == \
+        worker.build_prompt("summarise", "x")
+    assert worker.build_prompt("summarise", "x", instruction="   ") == \
+        worker.build_prompt("summarise", "x")
+
+
+def test_build_prompt_injects_instruction():
+    p = worker.build_prompt("summarise", "MY DOC", instruction="Focus on dates.")
+    assert "Focus on dates." in p
+    assert "MY DOC" in p
+
+
+def test_build_reduce_prompt_injects_instruction():
+    p = worker.build_reduce_prompt("report", ["a", "b"], instruction="Keep it short.")
+    assert "Keep it short." in p
+
+
+def test_summarise_traced_passes_instruction_to_every_call():
+    client = FakeClient()
+    doc = "word " * 20000  # forces map + reduce
+    worker.summarise_traced("summarise", doc, client, instruction="Focus on risk.")
+    assert client.prompts, "expected at least one call"
+    assert all("Focus on risk." in p for p in client.prompts), \
+        "instruction must reach every map call and the reduce call"
+
+
+def test_run_one_reads_instruction_from_the_job(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "hello world", instruction="Be terse.")
+    client = FakeClient()
+    assert worker.run_one(dbpath, "http://x", client) is True
+    assert db.get_job(dbpath, job_id)["status"] == "done"
+    assert all("Be terse." in p for p in client.prompts)
+
+
+def test_run_one_works_without_an_instruction_column_value(dbpath):
+    """A job created with no instruction (the common case) must not KeyError."""
+    db.create_job(dbpath, "summarise", "hello world")
+    client = FakeClient()
+    assert worker.run_one(dbpath, "http://x", client) is True
+    assert db.list_jobs(dbpath)[0]["status"] == "done"
+
+
 # --- chunking ---------------------------------------------------------------
 
 def test_short_document_is_one_chunk():

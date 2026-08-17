@@ -28,10 +28,18 @@
   {% if job.total_s %}<tr><th>Wall clock</th><td>{{ "%.1f s"|format(job.total_s) }}</td></tr>{% endif %}
 </table></div>
 
+{% if job.instruction %}
+  <h3>Operator instructions</h3>
+  <pre>{{ job.instruction }}</pre>
+{% endif %}
+
 {% if job.status == "failed" %}
   <h3>Error</h3><pre>{{ job.error }}</pre>
 {% elif job.status == "done" %}
-  <h3>Result <a href="/jobs/{{ job.id }}/result" style="font-size:.8rem">(plain text)</a></h3>
+  <h3>Result <span style="font-weight:400;color:var(--mut);font-size:.8rem">—
+    <a href="/jobs/{{ job.id }}/text">copy box</a> ·
+    <a href="/jobs/{{ job.id }}/result">plain text</a> ·
+    <a href="/api/jobs/{{ job.id }}">JSON</a></span></h3>
   <pre>{{ job.result }}</pre>
 {% endif %}
 

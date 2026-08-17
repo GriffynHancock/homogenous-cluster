@@ -1,16 +1,33 @@
 {% extends "base.html" %}
 {% block body %}
-<form method="post" action="/jobs" enctype="multipart/form-data">
-  <label for="kind">Task</label>
-  <select name="kind" id="kind">
-    {% for k in kinds %}<option value="{{ k }}">{{ k }}</option>{% endfor %}
-  </select>
-  <label for="upload">Document file</label>
-  <input type="file" name="upload" id="upload">
-  <label for="document">…or paste text</label>
-  <textarea name="document" id="document" placeholder="Paste the document here."></textarea>
-  <button type="submit">Queue it</button>
-</form>
+
+<fieldset>
+  <legend>Batch upload — multiple files, pick workflows per file</legend>
+  <form method="post" action="/batch" enctype="multipart/form-data">
+    <label for="files">Document files (select several at once)</label>
+    <input type="file" name="files" id="files" multiple required>
+    <p class="hint">Each file is checked and previewed on the next page, where
+      you tick which workflow(s) — summarise / report / Q&amp;A — to run on
+      each one. A refused file (e.g. a scanned PDF with no text layer) does not
+      block the rest of the batch.</p>
+    <button type="submit">Upload &amp; review</button>
+  </form>
+</fieldset>
+
+<fieldset>
+  <legend>Quick single document</legend>
+  <form method="post" action="/jobs" enctype="multipart/form-data">
+    <label for="kind">Task</label>
+    <select name="kind" id="kind">
+      {% for k in kinds %}<option value="{{ k }}">{{ k }}</option>{% endfor %}
+    </select>
+    <label for="upload">Document file</label>
+    <input type="file" name="upload" id="upload">
+    <label for="document">…or paste text</label>
+    <textarea name="document" id="document" placeholder="Paste the document here."></textarea>
+    <button type="submit">Queue it</button>
+  </form>
+</fieldset>
 
 <p style="color:var(--mut);font-size:.85rem">
   {{ backlog[0] }} waiting, {{ backlog[1] }} running.
