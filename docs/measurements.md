@@ -413,6 +413,67 @@ threatens the project is TTFT (89 s on a *4B* model), not this one.
 
 ---
 
-## Model A: gpt-oss-120b, single node
+## Model A: gpt-oss-120b, single node — AND the MoE efficiency answer
 
-Pending — download in progress.
+**Date:** 2026-08-17 | **Node:** node1 | **Threads:** 4 | **Build:** b10369
+**Model:** gpt-oss-120b F16 (native MXFP4), 60.87 GiB, 116.83B total / 5.1B active
+
+| Metric | Value |
+|---|---:|
+| pp512 (t/s) | 16.03 ± 0.55 |
+| pp2048 (t/s) | 15.88 ± 0.01 |
+| tg128 (t/s) | **6.05 ± 0.00** |
+
+### Sparse MoE runs at 61% of memory bandwidth, not 99%
+
+This settles the top open question in `STATUS.md`, and it is a **downgrade**.
+
+| Quantity | Value |
+|---|---:|
+| Model size / params | 65.36 GB / 116.8B → 0.559 bytes/param |
+| Bytes read per token (5.1B active) | 2.85 GB |
+| **Predicted** at dense efficiency (28.2 GB/s) | 9.88 tok/s |
+| **Measured** | **6.05 tok/s** |
+| **Implied bandwidth** | **17.3 GB/s** |
+| **Efficiency vs STREAM** | **61%** (dense Qwen3-4B was ~99%) |
+
+**Sparsity costs ~39% of achievable bandwidth.** The cause is locality: a dense
+model reads its weights as one contiguous sweep, whereas an MoE gathers a
+scattered subset of experts per token, defeating prefetch and wasting part of
+every cache line and DRAM burst.
+
+**So the `tok/s ≈ bandwidth / bytes_per_token` rule needs an architecture
+factor:**
+
+```
+dense MoE-free : tok/s ≈ 28.2 / bytes_per_token     (measured 99% efficient)
+sparse MoE     : tok/s ≈ 17.3 / bytes_per_token     (measured 61% efficient)
+```
+
+### Revised predictions — every earlier MoE figure was ~1.6× optimistic
+
+| Model | GB/token | Old (dense-eff) | **Revised (MoE-adjusted)** |
+|---|---:|---:|---:|
+| gpt-oss-120b MXFP4 | 2.85 | 9.9 | **6.05 ← measured** |
+| Qwen3-Next-80B-A3B Q8 | 3.18 | 8.9 | **~5.4** |
+| **Kimi K2 IQ4_XS (7 nodes)** | 16.0 | 1.76 | **~1.08** |
+| Kimi K2 UD-IQ2_M (7 nodes) | 9.9 | 2.84 | **~1.74** |
+
+**Kimi K2 at ~1.08 tok/s** still clears the overnight bar — ~39,000 tokens in
+10 hours — but the margin is thinner than the earlier estimate implied. Treat
+this as provisional across models: gpt-oss has 128 experts with `top_k=4`,
+while Kimi K2 has 384 with `top_k=8`, and a more scattered gather could be
+worse. **Re-measure once Model B is on disk; do not quote 1.08 as measured.**
+
+### Prefill: worse in absolute terms, but flat with length
+
+15.88 t/s at 2048 tokens versus 24.84 for the 4B model — more active params to
+compute, and prefill is compute-bound. But note it barely degrades with length
+(16.03 → 15.88, −1%), where the dense 4B fell 33.0 → 28.3 (−14%). For a large
+MoE, weight reading dominates attention, so long contexts cost comparatively
+less than the spec's "58% loss from 512 to 32K" warning suggests.
+
+**Practical consequence:** a 4K-token chunk costs ~258 s of prefill (4.3 min).
+A 50K-token document (14 chunks) is **~60 min of prefill plus ~20 min of
+generation — roughly 80 minutes single-node.** Comfortably inside an overnight
+window, which is the gate that matters (F19).

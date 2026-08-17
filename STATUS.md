@@ -142,10 +142,12 @@ argument: run what no single machine could hold, at any speed.
 
 **Still open:**
 
-- [ ] **Does the ~99% bandwidth efficiency hold for sparse MoE?** Measured on a
-      dense 4B model. MoE reads scattered experts with worse locality.
-      gpt-oss-120b and Qwen3-Next are downloading and will answer this
-      directly. **Every Kimi K2 estimate depends on it.**
+- [x] **ANSWERED: no. Sparse MoE reaches 61% of STREAM, not 99%** (F24).
+      Measured on gpt-oss-120b: 6.05 tok/s against 9.88 predicted at dense
+      efficiency. Scattered expert gathers defeat prefetch. **Every MoE
+      estimate in this repo was ~1.6x optimistic and has been revised** —
+      Kimi K2 IQ4_XS drops from 1.76 to **~1.08 tok/s**, which still clears
+      the overnight bar (~39,000 tokens in 10 h) with less margin.
 - [ ] Confirm nodes 2–7 hardware. **If any have more cores they will be faster
       at generation despite identical RAM**, and `--tensor-split` should then
       weight by measured bandwidth rather than RAM (F12).

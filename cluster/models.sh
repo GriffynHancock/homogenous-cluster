@@ -26,7 +26,11 @@ MANIFEST="${MANIFEST:-cluster/models.json}"
 
 # Measured on node 1. Re-measure per node: memory bandwidth, not RAM, sets
 # generation speed, and it varies with core count (FINDINGS F12).
+# Dense models reach ~99% of STREAM; sparse MoE reached only 61% (measured on
+# gpt-oss-120b: 6.05 tok/s against 9.88 predicted). Scattered expert gathers
+# defeat prefetch. Using the dense figure for an MoE overstates speed by ~1.6x.
 BANDWIDTH_GBS="${BANDWIDTH_GBS:-28.2}"
+MOE_BANDWIDTH_GBS="${MOE_BANDWIDTH_GBS:-17.3}"
 # Fraction of a node's SHARE that rpc-server -c writes to disk (tensors >=10 MiB).
 #
 # Measured 0.76 on Qwen3-4B (817 MB + 1.1 GB across two workers with separate
@@ -111,10 +115,11 @@ cmd_plan() {
     echo "note: planning for $n_nodes nodes; nodes.env lists $inventory." >&2
     echo "      override with FLEET_NODES=<n>." >&2; echo >&2
   fi
-  jq -r --arg bw "$BANDWIDTH_GBS" --arg cr "$CACHE_RATIO" --arg n "$n_nodes" '
+  jq -r --arg bw "$BANDWIDTH_GBS" --arg moebw "$MOE_BANDWIDTH_GBS" \
+        --arg cr "$CACHE_RATIO" --arg n "$n_nodes" '
     . as $m
     | ($m.active_params * $m.bytes_per_weight / 1e9) as $bpt
-    | ($bw|tonumber) as $bw
+    | (if ($m.moe // false) then ($moebw|tonumber) else ($bw|tonumber) end) as $bw
     | ($n|tonumber) as $n
     | "Model:                 \($m.id)  (\($m.role))",
       "Total size:            \(($m.bytes/1e9)|floor) GB",
@@ -128,10 +133,10 @@ cmd_plan() {
       "  layer range in RAM; only the SELECTED experts are read per token.",
       "  Total params set RAM. Active params set speed.",
       "",
-      "Predicted generation:  \(($bw/$bpt)*100|round/100) tok/s   (at \($bw) GB/s)",
-      "  Prediction is bandwidth/bytes-per-token. Reliable because generation",
-      "  measures at ~99% of STREAM -- but that was on a DENSE model; sparse",
-      "  MoE has worse locality, so treat MoE figures as an upper bound."
+      "Predicted generation:  \(($bw/$bpt)*100|round/100) tok/s   (at \($bw) GB/s effective)",
+      "  Sparse MoE reaches only 61% of STREAM (17.3 of 28.2 GB/s), measured on",
+      "  gpt-oss-120b. Dense models reach ~99%. Scattered expert gathers defeat",
+      "  prefetch. Re-measure per model -- expert count and top_k both matter."
   ' <<<"$m"
 }
 

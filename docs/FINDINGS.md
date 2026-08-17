@@ -836,6 +836,70 @@ using measured bandwidth (F11).
 
 ---
 
+## F24. Sparse MoE reaches only 61% of memory bandwidth. Every MoE estimate was ~1.6× optimistic.
+
+**CONFIRMED by measurement.** This answers the top open question in `STATUS.md`
+and revises every prediction in this repo downward.
+
+gpt-oss-120b F16 (native MXFP4), single node, `-t 4`:
+
+| Metric | Value |
+|---|---:|
+| pp512 / pp2048 | 16.03 / 15.88 t/s |
+| tg128 | **6.05 t/s** |
+| Bytes read per token (5.1B active × 0.559 B/param) | 2.85 GB |
+| Predicted at dense efficiency | 9.88 t/s |
+| **Implied bandwidth** | **17.3 GB/s** |
+| **Efficiency vs STREAM (28.2)** | **61%** |
+
+F11 measured **~99%** efficiency on a dense 4B model. **Sparsity costs ~39%.**
+The mechanism is locality: a dense model sweeps its weights contiguously, while
+an MoE gathers a scattered subset of experts per token — defeating hardware
+prefetch and wasting part of every cache line and DRAM burst. The bytes that
+*matter* are fewer, but the bytes actually *moved* per useful byte are more.
+
+**The sizing rule now needs an architecture term:**
+
+```
+dense       : tok/s ≈ 28.2 / bytes_per_token    (99% of STREAM)
+sparse MoE  : tok/s ≈ 17.3 / bytes_per_token    (61% of STREAM)
+```
+
+Validated both ways by `cluster/models.sh plan`: Qwen3-4B predicted 11.31 vs
+11.49 measured (1.6% error); gpt-oss predicted 6.4 vs 6.05 measured (6%).
+
+**Revised predictions:**
+
+| Model | Old | **Revised** |
+|---|---:|---:|
+| Qwen3-Next-80B-A3B Q8 | 8.9 | **~5.4** |
+| **Kimi K2 IQ4_XS (7 nodes)** | 1.76 | **~1.08** |
+| Kimi K2 UD-IQ2_M (7 nodes) | 2.84 | **~1.74** |
+
+**Kimi K2 at ~1.08 tok/s still clears the overnight bar** — ~39,000 tokens in
+10 hours — but with less margin than assumed. **Provisional across models:**
+gpt-oss has 128 experts at `top_k=4`; Kimi K2 has 384 at `top_k=8`, and a more
+scattered gather could be worse still. Re-measure when Model B lands; do not
+quote 1.08 as measured.
+
+### A genuinely good surprise: MoE prefill barely degrades with context
+
+| Model | pp512 | pp2048 | Change |
+|---|---:|---:|---:|
+| Qwen3-4B (dense) | 33.04 | 28.33 | **−14%** |
+| gpt-oss-120b (MoE) | 16.03 | 15.88 | **−1%** |
+
+The spec warns of "~58% prefill loss from 512 to 32K context" as a reason to
+chunk. **On a large MoE that effect is far weaker**, because weight reading
+dominates attention. Chunking is still right — for "lost in the middle" (F19)
+and because prefill is 79% of document wall-clock — but *this particular*
+argument for it is much weaker on the models we actually intend to run.
+
+Composed from these rates, a 50K-token document is **~60 min prefill +
+~20 min generation ≈ 80 min single-node** — well inside an overnight window.
+
+---
+
 ## F9. Operational notes for the bring-up scripts
 
 **CONFIRMED by direct observation on node 1.**

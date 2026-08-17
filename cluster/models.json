@@ -44,7 +44,8 @@
       "held_by": [
         "node1"
       ],
-      "notes": "Smoke-test model. Reasoning model -- budget max_tokens for thinking or it returns empty content (FINDINGS F21)."
+      "notes": "Smoke-test model. Reasoning model -- budget max_tokens for thinking or it returns empty content (FINDINGS F21).",
+      "moe": false
     },
     {
       "id": "gpt-oss-120b-f16",
@@ -62,7 +63,8 @@
       "held_by": [
         "node1"
       ],
-      "notes": "Model A -- single-node speed reference. Native MXFP4; the F16 GGUF keeps MXFP4 MoE weights."
+      "notes": "Model A -- single-node speed reference. Native MXFP4; the F16 GGUF keeps MXFP4 MoE weights.",
+      "moe": true
     },
     {
       "id": "qwen3-next-80b-q8",
@@ -79,7 +81,8 @@
       "bytes_per_weight": 1.06,
       "reasoning_model": false,
       "held_by": [],
-      "notes": "Interim large model while the coordinator disk is too small for Model B. Only 3B active, so the fastest large model this hardware can run."
+      "notes": "Interim large model while the coordinator disk is too small for Model B. Only 3B active, so the fastest large model this hardware can run.",
+      "moe": true
     },
     {
       "id": "kimi-k2-iq4xs",
@@ -93,7 +96,8 @@
       "bytes_per_weight": 0.5,
       "reasoning_model": false,
       "held_by": [],
-      "notes": "Model B -- the thesis. NOT YET FETCHED: needs 547 GB and the coordinator has 431 GB free (FINDINGS F16). Run the coordinator on whichever node gets the big disk."
+      "notes": "Model B -- the thesis. NOT YET FETCHED: needs 547 GB and the coordinator has 431 GB free (FINDINGS F16). Run the coordinator on whichever node gets the big disk.",
+      "moe": true
     }
   ]
 }
