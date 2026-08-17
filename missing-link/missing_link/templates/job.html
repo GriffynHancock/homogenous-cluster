@@ -18,6 +18,19 @@
       so this comes from benchmark figures, not from observed runs.
     {%- endif %}</span></p>
   {% endif %}
+  {% if job.status == "running" and job.cancel_requested %}
+  <p style="color:var(--mut)">Stop requested — this will take effect at the
+  next chunk boundary, not immediately (an in-flight request to the model
+  cannot be interrupted). Chunks already completed are kept and will not be
+  redone if this job is resumed.</p>
+  {% else %}
+  <form method="post" action="/jobs/{{ job.id }}/cancel">
+    <button type="submit">{{ "Cancel" if job.status == "pending" else "Stop" }}</button>
+  </form>
+  {% endif %}
+{% elif job.status == "cancelled" %}
+  <p style="color:var(--mut)">Cancelled{% if job.chunks %} after completing {{ job.chunks }}
+  chunk{{ "s" if job.chunks != 1 }}{% endif %}. Not an error — this was requested.</p>
 {% endif %}
 
 <div class="tbl-wrap"><table>

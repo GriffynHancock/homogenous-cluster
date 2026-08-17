@@ -212,6 +212,26 @@ class LlamaClient:
         # /props on first use. Lazy rather than in __init__ so constructing a
         # client never does I/O and never fails because a node is down.
         self._reasoning = None
+        # /props itself, cached so _detect_reasoning_kwargs and model_name()
+        # share one HTTP round trip instead of each fetching it independently.
+        self._props_cache = None
+
+    def _props(self):
+        """Fetch and cache GET /props. {} on any failure.
+
+        A node that will not answer /props is a problem for the caller to
+        discover on the actual completion request, not here -- so failure
+        here is silent and the caller gets an empty dict, never an exception.
+        """
+        if self._props_cache is not None:
+            return self._props_cache
+        try:
+            req = urllib.request.Request(f"{self.base_url}/props")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self._props_cache = json.load(r)
+        except Exception:
+            self._props_cache = {}
+        return self._props_cache
 
     def _detect_reasoning_kwargs(self):
         """Ask the server which model it is serving, once, and map to a knob.
@@ -224,19 +244,20 @@ class LlamaClient:
         """
         if self._reasoning is not None:
             return self._reasoning
-        name = ""
-        try:
-            req = urllib.request.Request(f"{self.base_url}/props")
-            with urllib.request.urlopen(req, timeout=10) as r:
-                props = json.load(r)
-            name = props.get("model_name") or props.get("model_path") or ""
-        except Exception:
-            # A node that will not answer /props is a problem for the caller to
-            # discover on the actual request, not here. No kwargs is the safe
-            # default: it never silently misleads.
-            name = ""
-        self._reasoning = reasoning_kwargs_for(name)
+        self._reasoning = reasoning_kwargs_for(self.model_name())
         return self._reasoning
+
+    def model_name(self):
+        """The model this server is currently serving, per its own /props.
+
+        "" if /props could not be reached -- callers (run_one's resumability
+        check) must treat that the same as "unknown", not as a match against
+        anything. This is also what makes resuming a job safe: chunk summaries
+        are persisted alongside the model that produced them, and a resume is
+        only trusted when this matches the recorded value exactly.
+        """
+        props = self._props()
+        return props.get("model_name") or props.get("model_path") or ""
 
     def assert_reachable(self, timeout=20):
         """Raise unless the server answers /health promptly."""
@@ -291,6 +312,25 @@ class EmptyCompletion(RuntimeError):
 
 class BackendUnavailable(RuntimeError):
     """The inference server is not answering. Distinct from a bad completion."""
+
+
+class JobCancelled(RuntimeError):
+    """Raised when a cooperative stop request is observed between chunks.
+
+    HOW FAR "stop a running job" ACTUALLY GOES, stated plainly rather than
+    overclaimed: there is no way to interrupt an in-flight HTTP call to
+    llama-server from here. That request keeps running server-side regardless
+    of what the client does -- closing the socket does not reliably stop
+    generation, and llama-server exposes no cancellation endpoint. So a stop
+    request cannot preempt whichever chunk is currently being summarised.
+
+    What IS achievable, and is what this implements: the flag is checked
+    BETWEEN chunks (and once more before the reduce step), so a stop takes
+    effect at the next chunk boundary rather than waiting out the rest of a
+    multi-hour document. Chunks already completed are not lost -- they were
+    persisted as they finished (see save_chunk_summaries) -- so a stopped job
+    can be resumed later exactly like a crashed one.
+    """
 
 
 class TruncatedCompletion(RuntimeError):
@@ -427,7 +467,19 @@ def count_chunks(document):
 
 
 def run_one(db_path, base_url, client=None):
-    """Process one job. Returns True if a job was handled, False if idle."""
+    """Process one job. Returns True if a job was handled, False if idle.
+
+    RESUMABILITY (Part 1). Previously, save_chunk_summaries was called exactly
+    once, after summarise_traced returned -- i.e. after the WHOLE document
+    (every map chunk, plus reduce) had finished. A job killed mid-document
+    (OOM, power cut, an operator stop) lost every completed chunk summary with
+    it: a 40-chunk document that died at chunk 39 restarted from zero on the
+    next claim. Chunks are now persisted one at a time as they complete (see
+    _persist_chunk below), and a job that already has persisted chunks for it
+    resumes from them instead of redoing that work -- safe because map outputs
+    are independent (chunk N's summary does not depend on chunk M's), PROVIDED
+    the same model produced them (see the model check below).
+    """
     from missing_link import db
 
     job = db.claim_next_pending(db_path)
@@ -438,6 +490,16 @@ def run_one(db_path, base_url, client=None):
         client = LlamaClient(base_url)
 
     started = time.monotonic()
+    current_model = None       # resolved below; closed over by _persist_chunk
+    completed_chunks = [0]     # mutable counter closed over by _persist_chunk
+
+    def _persist_chunk(record):
+        db.save_chunk_summaries(db_path, job["id"], [record], model=current_model)
+        completed_chunks[0] += 1
+
+    def _should_stop():
+        return db.is_cancel_requested(db_path, job["id"])
+
     try:
         # A wedged llama-server accepts TCP and never answers. Observed
         # 2026-08-17: a client disconnecting mid-generation left the server alive
@@ -447,16 +509,67 @@ def run_one(db_path, base_url, client=None):
         probe = getattr(client, "assert_reachable", None)
         if probe is not None:
             probe()
+
+        # Identify the current model so a resume can be checked for safety.
+        # getattr keeps FakeClient (and any other injected client) working
+        # without a model_name() method -- and simply never resumes, which is
+        # the safe default (see below).
+        model_fn = getattr(client, "model_name", None)
+        if model_fn is not None:
+            try:
+                current_model = model_fn()
+            except Exception:
+                current_model = None
+
         n_chunks = count_chunks(job["document"])
+
+        prior = db.get_chunk_summaries(db_path, job["id"])
+        resume_records = None
+        if prior:
+            recorded_model = db.get_recorded_model(db_path, job["id"])
+            # The tie goes to caution: only resume when BOTH the recorded and
+            # current model are known AND equal. An unknown current model
+            # (no model_name(), or /props unreachable) or an unknown recorded
+            # model (rows saved before this column existed) means the match
+            # cannot be POSITIVELY confirmed -- and mixing chunk summaries
+            # produced by two different models into one reduce step is exactly
+            # the kind of silent-mixing failure this project keeps getting
+            # burned by (F21, F25). Chosen response is "discard and restart"
+            # rather than "refuse": an unattended overnight queue should not
+            # need an operator to unstick a job just because the server was
+            # restarted onto a different model, and restarting the map phase
+            # is always correct, just slower than a true resume.
+            if recorded_model and current_model and recorded_model == current_model:
+                resume_records = [
+                    {"index": r["idx"], "start": r["start_char"],
+                     "end": r["end_char"], "summary": r["summary"]}
+                    for r in prior
+                ]
+                completed_chunks[0] = len(resume_records)
+            else:
+                db.delete_chunk_summaries(db_path, job["id"])
+
+        if _should_stop():
+            raise JobCancelled("stop requested before any work began")
+
         # summarise_traced keeps each chunk's identity and offsets, so the final
         # output stays traceable to spans of the source. See "Provenance" above.
         # job.get() rather than job["instruction"]: older rows created before
         # this column existed, and FakeClient-driven tests that build a job dict
         # by hand, must not KeyError here.
+        #
+        # No trailing save_chunk_summaries: on_chunk_done persists each chunk AS
+        # IT COMPLETES. Persisting only after the whole document finished is
+        # exactly the bug that made a 40-chunk job dying at chunk 39 restart from
+        # zero -- and it is not hypothetical, job 06af2911d7fc lost 10m55s of a
+        # 97299-character document with zero chunk_summaries rows to show for it.
         result, chunk_records = summarise_traced(
             job["kind"], job["document"], client,
-            instruction=job.get("instruction"))
-        db.save_chunk_summaries(db_path, job["id"], chunk_records)
+            instruction=job.get("instruction"),
+            resume_records=resume_records,
+            on_chunk_done=_persist_chunk,
+            should_stop=_should_stop,
+        )
         db.complete_job(db_path, job["id"], result, {
             "total_s": round(time.monotonic() - started, 2),
             "chunks": n_chunks,
@@ -465,14 +578,45 @@ def run_one(db_path, base_url, client=None):
             # The schema has reserved this column since the beginning and nothing
             # ever filled it, which mattered because prefill is ~79% of document
             # wall-clock on this hardware -- the metric most worth tracking.
-            # getattr keeps FakeClient (and any other injected client) working.
             "ttft_s": _first_prefill_s(getattr(client, "timings_log", None)),
+        })
+    except JobCancelled:
+        # Not an error -- see the docstring on JobCancelled for how far a stop
+        # actually goes. Chunks completed before the stop are already
+        # persisted (via _persist_chunk), so this job is resumable later
+        # exactly like a crashed one.
+        db.finish_cancelled(db_path, job["id"], {
+            "total_s": round(time.monotonic() - started, 2),
+            "chunks": completed_chunks[0],
         })
     except Exception as exc:  # noqa: BLE001 -- a failed job must not kill the worker
         # Record and move on. One bad document must not stall every job behind
         # it in a queue whose jobs take hours.
         db.fail_job(db_path, job["id"], f"{type(exc).__name__}: {exc}")
+
+    # Part 3: documented hook point for a future notification integration.
+    # Deliberately fired here, after the terminal status is committed, so a
+    # future webhook/email body can be built from the job's final state.
+    notify_completion(db.get_job(db_path, job["id"]))
     return True
+
+
+def notify_completion(job):
+    """Hook point for a future completion notification (email, webhook, ...).
+
+    A NO-OP TODAY, deliberately: CLAUDE.md rules out adding an SMTP dependency
+    or any outbound network call from this project. What Missing Link offers
+    instead, right now, is dependency-free and already wired up: the `seen_at`
+    column (db.mark_seen / db.mark_all_seen / db.count_unseen) that lets the
+    UI show returning users what finished while they were away, without any
+    notification channel at all.
+
+    When a real integration is wanted, it plugs in HERE: called from run_one
+    with the finished job's full row (id, kind, status, result or error, timing)
+    every time a job reaches done/failed/cancelled. Receiving the whole row
+    rather than just an id means a webhook payload or email template has
+    everything it needs without a second database read.
+    """
 
 
 def run_forever(db_path, base_url, poll_s=5.0):
@@ -596,8 +740,9 @@ def chunk_spans(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
 
 def summarise_traced(kind, document, client,
                      max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS,
-                     instruction=None):
-    """Map-reduce that RETAINS provenance.
+                     instruction=None,
+                     resume_records=None, on_chunk_done=None, should_stop=None):
+    """Map-reduce that RETAINS provenance, and can RESUME a partial run.
 
     Returns (final_text, chunk_records) where each record is
     {"index", "start", "end", "summary"} -- enough to show a reader which span of
@@ -607,20 +752,63 @@ def summarise_traced(kind, document, client,
     `instruction` is an optional per-job operator note (see build_prompt) applied
     to every map call and to the reduce call, so guidance like "focus on the
     financial terms" shapes both the per-chunk summaries and how they are combined.
+    It is part of what makes a resumed chunk reusable or not: see run_one, which
+    owns the higher-level safety question.
+    resume_records: chunk records already produced by an earlier, interrupted
+        attempt at this SAME document. A chunk whose index has an entry here,
+        AND whose start/end still match the current chunking of the document,
+        is reused instead of re-sent to the model. This is sound (not just
+        convenient) because map outputs are independent -- chunk N's summary
+        never depends on chunk M's -- so it is fine for some summaries in one
+        reduce step to come from an earlier process than others. The
+        start/end check is a defensive guard against the (currently
+        impossible, but cheap to guard) case of CHUNK_TOKENS/OVERLAP_TOKENS
+        changing between the two runs, which would shift chunk boundaries and
+        make a stale record wrong even at the same index. Caller (run_one) is
+        responsible for the higher-level question of whether resuming is safe
+        AT ALL -- i.e. whether the same MODEL produced these records; see
+        run_one and db.get_recorded_model.
+    on_chunk_done: optional callback(record), invoked right after each NEWLY
+        computed chunk (not a resumed one) completes. This is the hook that
+        makes resumability possible in the first place -- run_one uses it to
+        persist progress to the database one chunk at a time, rather than only
+        after summarise_traced returns. See run_one for what that used to mean
+        for a job killed mid-document.
+    should_stop: optional callable, checked before each chunk that would
+        require a real model call (not before a resumed/free one) and once
+        more before the reduce step. If it returns True, raises JobCancelled
+        immediately rather than starting that call -- see JobCancelled for
+        exactly how far this goes.
+>>>>>>> worktree-agent-a2c3ef4fcf6c9806f
     """
     chunks = chunk_spans(document)
     if not chunks:
         raise ValueError("document contains no words")
 
+    resume_by_index = {r["index"]: r for r in (resume_records or [])}
     records = []
     for ch in chunks:
+        cached = resume_by_index.get(ch["index"])
+        if (cached is not None
+                and cached["start"] == ch["start"] and cached["end"] == ch["end"]):
+            records.append(cached)
+            continue
+        if should_stop is not None and should_stop():
+            raise JobCancelled(
+                f"stop requested before chunk {ch['index'] + 1}/{len(chunks)}")
         summary = client.complete(build_prompt(kind, ch["text"], instruction),
                                   max_tokens=max_tokens)
-        records.append({"index": ch["index"], "start": ch["start"],
-                        "end": ch["end"], "summary": summary})
+        record = {"index": ch["index"], "start": ch["start"],
+                  "end": ch["end"], "summary": summary}
+        records.append(record)
+        if on_chunk_done is not None:
+            on_chunk_done(record)
 
     if len(records) == 1:
         return records[0]["summary"], records
+
+    if should_stop is not None and should_stop():
+        raise JobCancelled("stop requested before the reduce step")
 
     final = client.complete(
         build_reduce_prompt(kind, [r["summary"] for r in records], instruction),
