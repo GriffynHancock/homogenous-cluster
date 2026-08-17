@@ -3,7 +3,7 @@
 **Turning the old computers an organisation already owns into a private LLM
 cluster — for the work it legally cannot send offsite.**
 
-**Now:** build a 7-node cluster that does real work on real sensitive documents.
+**Now:** build an N-node cluster that does real work on real sensitive documents.
 
 **Later:** package what that teaches into a Claude Skill, so an organisation
 without a specialist can do the same thing with whatever hardware it has.
@@ -46,7 +46,8 @@ Two technical facts do most of the work:
 
 ## Running the cluster
 
-Clone onto node 1 (the master) and drive it from there:
+Clone onto the **coordinator** — the node that will run `llama-server` — and
+drive everything from there:
 
 ```bash
 sudo apt update && sudo apt install -y git curl
@@ -56,20 +57,63 @@ cd homogenous-cluster
 claude                  # then: "read STATUS.md and continue the plan"
 ```
 
+**The coordinator should be whichever machine has the most free disk**, not
+node 1 by convention. Only the coordinator needs a full copy of the model on
+disk — worker nodes never read model files at all, they receive tensors over
+the network and keep a local cache.
+
+### Adding more nodes
+
+Run this **on the coordinator** and paste its output into the new machine:
+
+```bash
+./provisioning/join-node.sh
+```
+
+It prints the exact commands with the coordinator's real SSH key and LAN IP
+filled in — generated rather than documented, because a key copied by hand into
+a README is wrong the moment anyone redeploys, and fails confusingly when it is.
+
+Then, back on the coordinator:
+
+```bash
+ssh <new-ip> 'lscpu -p=Core,Socket | grep -v "^#" | sort -u | wc -l; free -m'
+# characterise it FIRST -- do not assume nodes match. Core count is a
+# bandwidth spec, not just a compute spec.
+
+sudo ./provisioning/setup.sh <hostname>   # idempotent
+./provisioning/distribute.sh              # asserts version, libc AND ISA
+./cluster/install-services.sh
+./bench/two-node-smoke.sh <new-ip>        # multi-worker RPC gate
+```
+
+**The 1 → 2 transition is where all the risk lives.** RPC only enters the
+picture at two nodes; version, libc and ISA lockstep only start to matter then;
+upstream bugs triggered by two or more workers only become possible then. Test
+all of it at two machines — nothing new appears at the tenth.
+
 ## Reading order
 
 | File | What it gives you |
 |---|---|
-| `STATUS.md` | **Start here.** Current phase, decisions, open questions, log |
+| `STATUS.md` | **Start here.** Current phase, next tasks, open questions, log |
+| `docs/FINDINGS.md` | **Read second.** What running this on real hardware taught us — including several things the plan and spec got *wrong* |
+| `docs/measurements.md` | Every measured number. No performance claim may be quoted from anywhere else |
 | `CLAUDE.md` | The argument, conventions, standing constraints |
-| `docs/superpowers/specs/` | Design, and which alternatives were rejected and why |
-| `docs/superpowers/specs/2026-08-11-skill-direction.md` | The long-term skill (direction only, not started) |
-| `docs/superpowers/plans/` | Task-by-task implementation |
-| `docs/measurements.md` | Every measured number (created during Task 1) |
+| `docs/MODEL-SELECTION.md` | Which model to run and why — criteria derived from measurement |
+| `docs/DESIGN-NOTES.md` | Analysed-but-not-built ideas, with the numbers |
+| `docs/UPSTREAM-PATCHES.md` | Corrections still to fold back into the plan and spec |
+| `docs/superpowers/specs/` | Original design, and which alternatives were rejected and why |
+| `docs/superpowers/plans/` | Task-by-task implementation — **now partly superseded by FINDINGS** |
 
 The specs record rejected approaches — GPU sharding on 2 GB cards, Exo,
 prima.cpp, distributed-llama, `dd` cloning — with the evidence for each.
 Re-proposing them wastes a cycle.
+
+**`FINDINGS.md` outranks the plan where they disagree.** The plan was written
+before any hardware existed; several of its "settled" constraints turned out to
+be misread sources, and one of its benchmark methods was measuring nothing at
+all.
 
 ## What this becomes
 
@@ -115,7 +159,29 @@ organisation's to answer, ideally with someone qualified.
 
 ## Status
 
-**Cluster:** planning complete, first node set up. This is slightly outdated work.
+**Cluster:** first node fully provisioned, built and measured. Phase 0 complete
+— the measurement gate passed. `llama.cpp` and `ik_llama.cpp` both built and
+verified, models fetched, and the async job runner (Missing Link) built and
+tested. Second node not yet joined.
+
+**What measurement changed.** Several things the plan treated as settled did not
+survive contact with hardware:
+
+- **Replication beats sharding by a factor of N.** Sharding one model across
+  every node buys capacity, not speed — nodes run sequentially, so utilisation
+  is 1/S. Running an independent copy per node scales linearly, and the document
+  workload is embarrassingly parallel. The architecture is now
+  replication-first.
+- **Sparse MoE reaches only ~61% of memory bandwidth**, against ~99% for dense
+  models. Every MoE performance estimate was ~1.6× optimistic.
+- **`ik_llama.cpp` is +52% on prefill and −14% on generation** — a net +22% for
+  document work, since prefill dominates. That explains the split evidence
+  online: both camps are right, and which matters depends on your workload.
+- **Faithfulness now leads model selection.** The originally chosen frontier
+  model has the worst measured hallucination rate of any candidate checked,
+  against a project whose whole premise is legally sensitive documents.
+
+Full detail in `docs/FINDINGS.md`; every number in `docs/measurements.md`.
 
 **Skill:** not started, and deliberately so — it gets written once the cluster
-has produced real measurements to base its advice on.
+has produced real measurements to base its advice on. It now has some.
