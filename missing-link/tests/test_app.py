@@ -84,3 +84,143 @@ def test_health_reports_counts(client):
     h = client.get("/health").json()
     assert h["ok"] is True
     assert h["counts"]["pending"] == 1
+
+
+# --- navigation: every route reachable by clicking ---------------------------
+
+def test_index_has_nav_links_to_every_top_level_page(client):
+    r = client.get("/")
+    assert 'href="/"' in r.text
+    assert 'href="/health"' in r.text
+    assert 'href="/api/jobs"' in r.text
+
+
+def test_index_has_batch_upload_form(client):
+    r = client.get("/")
+    assert 'action="/batch"' in r.text
+    assert "multiple" in r.text
+
+
+# --- batch upload -------------------------------------------------------------
+
+def test_batch_upload_accepts_good_and_refuses_bad_without_failing_the_batch(client):
+    files = [
+        ("files", ("doc1.txt", b"Plain text content, easily long enough to preview.",
+                    "text/plain")),
+        ("files", ("image.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF", "image/jpeg")),
+    ]
+    r = client.post("/batch", files=files, follow_redirects=False)
+    assert r.status_code == 303
+    batch_url = r.headers["location"]
+
+    review = client.get(batch_url)
+    assert review.status_code == 200
+    assert "doc1.txt" in review.text
+    assert "image.jpg" in review.text
+    # The refused file's reason must be legible on the page, not just a status.
+    assert "not supported" in review.text or "JPEG" in review.text
+    # The accepted file gets tick boxes; the refused one does not.
+    assert 'type="checkbox"' in review.text
+
+
+def test_batch_view_404_for_unknown_batch(client):
+    assert client.get("/batch/nonexistent").status_code == 404
+
+
+def test_batch_confirm_creates_a_job_per_ticked_workflow_with_instruction(client):
+    files = [("files", ("doc.txt", b"Some document text to summarise later.",
+                        "text/plain"))]
+    r = client.post("/batch", files=files, follow_redirects=False)
+    batch_id = r.headers["location"].rsplit("/", 1)[-1]
+
+    doc_id = db_module_doc_id(client, batch_id)
+    data = {f"wf_{doc_id}": ["summarise", "qa"],
+            "instruction_summarise": "Focus on dates.",
+            "instruction_qa": ""}
+    r = client.post(f"/batch/{batch_id}/confirm", data=data, follow_redirects=False)
+    assert r.status_code == 303
+
+    jobs = client.get("/api/jobs").json()
+    assert len(jobs) == 2
+    kinds = {j["kind"] for j in jobs}
+    assert kinds == {"summarise", "qa"}
+    summarise_job = next(j for j in jobs if j["kind"] == "summarise")
+    full = client.get(f"/api/jobs/{summarise_job['id']}").json()
+    assert full["instruction"] == "Focus on dates."
+    qa_job = next(j for j in jobs if j["kind"] == "qa")
+    full_qa = client.get(f"/api/jobs/{qa_job['id']}").json()
+    assert full_qa["instruction"] is None, "blank instruction box must store as None"
+
+
+def test_batch_confirm_404_for_unknown_batch(client):
+    r = client.post("/batch/nonexistent/confirm", data={})
+    assert r.status_code == 404
+
+
+def test_batch_confirm_400_when_nothing_ticked(client):
+    files = [("files", ("doc.txt", b"Some document text.", "text/plain"))]
+    r = client.post("/batch", files=files, follow_redirects=False)
+    batch_id = r.headers["location"].rsplit("/", 1)[-1]
+    r = client.post(f"/batch/{batch_id}/confirm", data={})
+    assert r.status_code == 400
+
+
+def db_module_doc_id(client, batch_id):
+    """Pull the first document id out of the rendered review page's checkboxes."""
+    import re
+    review = client.get(f"/batch/{batch_id}")
+    m = re.search(r'name="wf_([a-f0-9]+)"', review.text)
+    assert m, "expected at least one ticked-workflow checkbox on the review page"
+    return m.group(1)
+
+
+# --- output page: raw text box ------------------------------------------------
+
+def test_job_text_page_404_for_missing_job(client):
+    assert client.get("/jobs/nonexistent/text").status_code == 404
+
+
+def test_job_text_page_409_while_pending(client):
+    r = client.post("/jobs", data={"kind": "summarise", "document": "x"},
+                    follow_redirects=False)
+    job_id = r.headers["location"].rsplit("/", 1)[-1]
+    assert client.get(f"/jobs/{job_id}/text").status_code == 409
+
+
+def test_job_text_page_shows_result_in_a_textarea(client, monkeypatch):
+    from missing_link import db as db_mod, worker
+
+    r = client.post("/jobs", data={"kind": "summarise", "document": "x"},
+                    follow_redirects=False)
+    job_id = r.headers["location"].rsplit("/", 1)[-1]
+
+    class FakeClient:
+        def complete(self, prompt, max_tokens=512):
+            return "the final summary text"
+
+    import os
+    assert worker.run_one(os.environ["MISSING_LINK_DB"], "http://x", FakeClient()) is True
+
+    r = client.get(f"/jobs/{job_id}/text")
+    assert r.status_code == 200
+    assert "<textarea" in r.text
+    assert "the final summary text" in r.text
+
+
+def test_job_page_links_to_text_and_json_views_once_done(client):
+    from missing_link import worker
+    import os
+
+    r = client.post("/jobs", data={"kind": "summarise", "document": "x"},
+                    follow_redirects=False)
+    job_id = r.headers["location"].rsplit("/", 1)[-1]
+
+    class FakeClient:
+        def complete(self, prompt, max_tokens=512):
+            return "done"
+
+    worker.run_one(os.environ["MISSING_LINK_DB"], "http://x", FakeClient())
+
+    r = client.get(f"/jobs/{job_id}")
+    assert f"/jobs/{job_id}/text" in r.text
+    assert f"/api/jobs/{job_id}" in r.text

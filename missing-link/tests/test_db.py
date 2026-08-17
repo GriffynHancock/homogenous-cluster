@@ -111,6 +111,39 @@ def test_claim_is_atomic_under_concurrency(dbpath):
     assert len(set(claimed)) == 20, "a job was claimed more than once"
 
 
+def test_create_job_stores_instruction(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "a", instruction="Focus on dates.")
+    assert db.get_job(dbpath, job_id)["instruction"] == "Focus on dates."
+
+
+def test_create_job_instruction_defaults_to_none(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "a")
+    assert db.get_job(dbpath, job_id)["instruction"] is None
+
+
+def test_create_batch_and_get_batch(dbpath):
+    records = [
+        {"filename": "a.txt", "text": "hello", "preview": "hello",
+         "status": "ready", "error": None},
+        {"filename": "b.jpg", "text": "", "preview": "",
+         "status": "refused", "error": "JPEG image is not supported"},
+    ]
+    batch_id = db.create_batch(dbpath, records)
+    docs = db.get_batch(dbpath, batch_id)
+    assert len(docs) == 2
+    assert docs[0]["filename"] == "a.txt"
+    assert docs[0]["status"] == "ready"
+    assert docs[1]["status"] == "refused"
+    assert docs[1]["error"] == "JPEG image is not supported"
+    # Every document gets its own id, distinct from the shared batch id.
+    assert docs[0]["id"] != docs[1]["id"]
+    assert docs[0]["batch_id"] == batch_id
+
+
+def test_get_batch_unknown_id_returns_empty(dbpath):
+    assert db.get_batch(dbpath, "nonexistent") == []
+
+
 def test_requeue_stale_running_jobs(dbpath):
     """A job left 'running' by a crashed worker must be recoverable.
 

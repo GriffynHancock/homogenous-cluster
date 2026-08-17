@@ -24,6 +24,15 @@ DB_PATH = os.environ.get("MISSING_LINK_DB", "/opt/missing-link/jobs.sqlite")
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8080")
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
+# The preview a non-specialist gets per uploaded document, in the batch review
+# table. A PDF page-1 thumbnail was considered and rejected: pypdf (already a
+# dependency) does not rasterise, and adding an imaging stack (pypdfium2,
+# pdf2image + poppler, etc.) to summarise text is a heavy dependency for a
+# cosmetic feature. First-N-characters is free, works for every accepted
+# format uniformly, and is often more informative than a page image for prose
+# documents. See the report for this trade-off spelled out.
+PREVIEW_CHARS = 200
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -53,7 +62,7 @@ def index(request: Request):
         request, "index.html",
         {"jobs": db.list_jobs(DB_PATH), "kinds": sorted(worker.PROMPTS),
          "rate": _rate_note(), "backlog": db.pending_chunk_backlog(DB_PATH),
-         "tput": db.throughput_stats(DB_PATH)},
+         "tput": db.throughput_stats(DB_PATH), "active": "home"},
     )
 
 
@@ -81,6 +90,88 @@ async def submit(kind: str = Form(...),
 
     job_id = db.create_job(DB_PATH, kind, text)
     return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+
+@app.post("/batch")
+async def batch_upload(files: list[UploadFile] = File(...)):
+    """Stage a batch of documents for review, one row per file.
+
+    Deliberately does NOT create jobs yet -- a job needs a workflow (`kind`)
+    and the operator has not chosen one per file yet. Each file is extracted
+    independently and one bad file (a scanned PDF, a JPEG) is recorded as
+    'refused' with an actionable reason rather than failing the whole batch;
+    see extract.py for why extraction refuses rather than guessing.
+    """
+    records = []
+    for f in files:
+        if not f.filename:
+            continue
+        raw = await f.read()
+        try:
+            text = extract.extract(raw, f.filename).strip()
+            if not text:
+                raise extract.ExtractionError("no text after extraction")
+            records.append({
+                "filename": f.filename, "text": text,
+                "preview": text[:PREVIEW_CHARS], "status": "ready", "error": None,
+            })
+        except extract.ExtractionError as exc:
+            records.append({
+                "filename": f.filename, "text": "", "preview": "",
+                "status": "refused", "error": str(exc),
+            })
+
+    if not records:
+        raise HTTPException(400, "no files supplied")
+
+    batch_id = db.create_batch(DB_PATH, records)
+    return RedirectResponse(f"/batch/{batch_id}", status_code=303)
+
+
+@app.get("/batch/{batch_id}", response_class=HTMLResponse)
+def batch_view(request: Request, batch_id: str):
+    docs = db.get_batch(DB_PATH, batch_id)
+    if not docs:
+        raise HTTPException(404, "no such batch")
+    return TEMPLATES.TemplateResponse(
+        request, "batch.html",
+        {"batch_id": batch_id, "docs": docs, "kinds": sorted(worker.PROMPTS)})
+
+
+@app.post("/batch/{batch_id}/confirm")
+async def batch_confirm(request: Request, batch_id: str):
+    """Turn ticked (document, workflow) pairs into real jobs.
+
+    Field names are generated per-row by batch.html (`wf_<doc_id>`, one value
+    per ticked workflow), so this reads the raw form rather than declaring
+    fixed FastAPI parameters -- the set of documents is only known at request
+    time. `instruction_<kind>` carries the optional per-workflow guidance from
+    the boxes below the table, applied to every job of that kind in this batch.
+    """
+    docs = db.get_batch(DB_PATH, batch_id)
+    if not docs:
+        raise HTTPException(404, "no such batch")
+
+    form = await request.form()
+    instructions = {
+        kind: (form.get(f"instruction_{kind}") or "").strip() or None
+        for kind in worker.PROMPTS
+    }
+
+    created = []
+    for doc in docs:
+        if doc["status"] != "ready":
+            continue
+        for kind in form.getlist(f"wf_{doc['id']}"):
+            if kind not in worker.PROMPTS:
+                continue
+            job_id = db.create_job(DB_PATH, kind, doc["text"], instructions[kind])
+            created.append(job_id)
+
+    if not created:
+        raise HTTPException(400, "no workflow was ticked for any accepted document")
+
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/api/jobs")
@@ -139,6 +230,24 @@ def job_result(job_id: str):
     if job["status"] != "done":
         raise HTTPException(409, f"job is {job['status']}")
     return job["result"]
+
+
+@app.get("/jobs/{job_id}/text", response_class=HTMLResponse)
+def job_text(request: Request, job_id: str):
+    """The result in a plain <textarea>, for one-click select-all-and-copy.
+
+    Distinct from /jobs/{id}/result (a bare text/plain body, useful for curl or
+    piping) and from job.html's rendered <pre> (useful for reading). This page
+    exists purely so a human can click into a box, Ctrl+A, Ctrl+C, and paste the
+    summary into an email or case file without the browser chrome around a raw
+    text/plain response getting in the way.
+    """
+    job = db.get_job(DB_PATH, job_id)
+    if job is None:
+        raise HTTPException(404, "no such job")
+    if job["status"] != "done":
+        raise HTTPException(409, f"job is {job['status']}")
+    return TEMPLATES.TemplateResponse(request, "output.html", {"job": job})
 
 
 @app.get("/health")

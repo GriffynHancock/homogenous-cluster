@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Output — {{ job.id }}{% endblock %}
+{% block sub %}Job <code>{{ job.id }}</code> — {{ job.kind }} —
+  <a href="/jobs/{{ job.id }}">back to job page</a>{% endblock %}
+{% block body %}
+
+<p class="hint">Raw result text. Click inside the box, select all
+  (Ctrl/Cmd+A) and copy (Ctrl/Cmd+C) to paste it elsewhere.</p>
+
+<textarea class="output-box" readonly>{{ job.result }}</textarea>
+
+<p class="hint">Also available as
+  <a href="/jobs/{{ job.id }}/result">plain text</a> or
+  <a href="/api/jobs/{{ job.id }}">JSON</a>.</p>
+{% endblock %}
