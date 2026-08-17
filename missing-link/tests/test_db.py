@@ -414,3 +414,138 @@ def test_delete_chunk_summaries_removes_all_rows_for_the_job(dbpath):
     assert len(db.get_chunk_summaries(dbpath, job_id)) == 1
     db.delete_chunk_summaries(dbpath, job_id)
     assert len(db.get_chunk_summaries(dbpath, job_id)) == 0
+
+
+# --- The check-then-ALTER race (F20's shape, arriving through a new door) ----
+#
+# `model` was added to chunk_summaries by the RESUMABILITY branch, as a lazy
+# check-then-ALTER migration run from inside every chunk read and write. R
+# concurrent workers arrived on the FAN-OUT branch. Neither branch's tests
+# could catch the combination, because neither branch contained the other's
+# code -- so the first thing that would have exercised it is the live
+# /opt/missing-link/jobs.sqlite, which does not yet have the column, on the
+# first document to be chunked after deployment. The loser of the race raises
+# OperationalError, run_one's broad except turns that into a FAILED job, and a
+# multi-hour overnight summarisation is gone.
+#
+# Both tests below start from a database that GENUINELY lacks the column --
+# built with the pre-resumability schema, not by dropping a column from the
+# current one -- because the window closes for good once the ALTER succeeds
+# once. Both fail reliably against the pre-fix code (20/20 runs) and pass
+# reliably against the fix (20/20).
+
+_PRE_MIGRATION_CHUNK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chunk_summaries (
+    job_id     TEXT NOT NULL,
+    idx        INTEGER NOT NULL,
+    start_char INTEGER NOT NULL,
+    end_char   INTEGER NOT NULL,
+    summary    TEXT NOT NULL,
+    PRIMARY KEY (job_id, idx)
+);
+"""
+
+
+@pytest.fixture
+def pre_migration_dbpath():
+    """A jobs.sqlite in the state the deployed one is in: no `model` column.
+
+    WAL, like every database this module opens -- the journal mode changes the
+    lock timing enough to matter to the race being tested here.
+    """
+    import sqlite3
+    fd, path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(_PRE_MIGRATION_CHUNK_SCHEMA)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(chunk_summaries)")]
+    conn.close()
+    assert "model" not in cols, f"fixture is not pre-migration: {cols}"
+    yield path
+    os.unlink(path)
+
+
+def _run_concurrently(fn, n_workers=5):
+    """Run fn(i) on n_workers threads released together. Returns exceptions."""
+    import threading
+    barrier = threading.Barrier(n_workers)
+    errors = []
+    lock = threading.Lock()
+
+    def work(i):
+        barrier.wait()   # maximise the overlap rather than hoping for it
+        try:
+            fn(i)
+        except Exception as exc:                     # noqa: BLE001 -- recording
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(i,)) for i in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return errors
+
+
+def test_concurrent_chunk_writes_survive_a_pending_migration(pre_migration_dbpath):
+    """The real deploy path: init_db once, then R workers writing chunks.
+
+    This is what a restart of missing-link.service against the live database
+    does. init_db must leave the schema fully migrated, so that the write path
+    -- which R workers run concurrently -- performs no migration at all.
+    """
+    path = pre_migration_dbpath
+    db.init_db(path)                                  # lifespan does this once
+
+    errors = _run_concurrently(lambda i: db.save_chunk_summaries(
+        path, f"job{i}",
+        [{"index": 0, "start": 0, "end": 10, "summary": f"summary {i}"}],
+        model="model-A"))
+
+    assert not errors, f"concurrent chunk writes raised: {errors!r}"
+    for i in range(5):
+        rows = db.get_chunk_summaries(path, f"job{i}")
+        assert len(rows) == 1, f"job{i} lost its chunk: {rows!r}"
+        assert rows[0]["model"] == "model-A"
+
+
+def test_concurrent_init_chunks_does_not_raise_duplicate_column(pre_migration_dbpath):
+    """The safety net, tested directly.
+
+    init_db is the only production caller now, and it runs once at startup --
+    but tests call init_chunks directly, two PROCESSES can still overlap on a
+    service restart, and the next person to add a column will not read this
+    file first. So _add_missing_columns must be safe on its own terms, not
+    merely never called concurrently.
+    """
+    import sqlite3
+    path = pre_migration_dbpath
+
+    errors = _run_concurrently(lambda i: db.init_chunks(path))
+
+    assert not errors, f"concurrent init_chunks raised: {errors!r}"
+    conn = sqlite3.connect(path)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(chunk_summaries)")]
+    conn.close()
+    assert "model" in cols, f"migration did not run: {cols}"
+
+
+def test_add_missing_columns_still_raises_on_anything_but_a_duplicate(dbpath):
+    """The narrow catch must not have become a broad one.
+
+    Swallowing OperationalError as a CLASS would hide a missing table, a
+    corrupt file or a disk-full write behind a silently-unmigrated schema --
+    the "degrade instead of refuse" failure this project has hit four times
+    (F21, F34, F36, F38). Only the exact duplicate-column message is absorbed.
+    """
+    import sqlite3
+    conn = sqlite3.connect(dbpath)
+    conn.row_factory = sqlite3.Row
+    try:
+        with pytest.raises(sqlite3.OperationalError) as caught:
+            db._add_missing_columns(conn, "no_such_table", [("model", "TEXT")])
+    finally:
+        conn.close()
+    assert "duplicate column" not in str(caught.value).lower()

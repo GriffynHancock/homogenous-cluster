@@ -75,10 +75,43 @@ _CHUNK_NEW_COLUMNS = [
 
 
 def _add_missing_columns(conn, table, coldefs):
+    """Additive, idempotent schema upgrade. Safe to call concurrently.
+
+    The PRAGMA and the ALTER are two separate statements in two separate
+    transactions, so this is a CHECK-THEN-ACT: two callers can both read "the
+    column is missing" and both then try to add it, and the loser gets
+    `OperationalError: duplicate column name: X`. That was harmless while the
+    runner was single-worker, and stopped being harmless the moment there was
+    one worker per inference endpoint -- run_one's broad except turns the
+    OperationalError into a FAILED job, i.e. a whole night of cluster work
+    thrown away by a schema upgrade that had in fact succeeded. Same shape as
+    F20: a race a single-threaded test suite cannot see, on a queue whose jobs
+    cost hours.
+
+    The primary defence is that this now runs ONCE at startup (see init_db)
+    rather than on every chunk write. This handler is the belt to that's braces
+    -- two PROCESSES racing startup are still possible (a systemd restart
+    overlapping the outgoing process), and tests call these helpers directly.
+
+    The catch is deliberately narrow: only the exact "duplicate column name:
+    <this column>" message is swallowed, and only for the column we were just
+    trying to add. Everything else -- a missing table, a locked database, a
+    disk-full write -- re-raises untouched. A handler that swallowed
+    OperationalError as a CLASS would be the "degrade instead of refuse"
+    pattern this project has been burned by four times (F21, F34, F36, F38).
+    """
     have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     for name, decl in coldefs:
-        if name not in have:
+        if name in have:
+            continue
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        except sqlite3.OperationalError as exc:
+            if str(exc).lower() != f"duplicate column name: {name}".lower():
+                raise
+            # Another caller added it between our PRAGMA and our ALTER. The
+            # column exists with the declaration we wanted, which is the whole
+            # postcondition of this function, so there is nothing to do.
 
 
 def _now():
@@ -98,6 +131,29 @@ def _connect(path):
 
 
 def init_db(path):
+    """Create or upgrade the ENTIRE schema. Call once, at process startup.
+
+    This is the single migration entry point: jobs, chunk_summaries and
+    batch_documents all get created and upgraded here, so that after one call
+    every table this module touches is present and current.
+
+    That is deliberate, and it is a change from how this worked. The chunk and
+    batch tables used to be initialised LAZILY, from inside each read and write
+    that used them (`init_chunks` at the top of save_chunk_summaries,
+    get_chunk_summaries, get_recorded_model, delete_chunk_summaries). Two
+    things were wrong with that once the runner grew one worker per inference
+    endpoint:
+
+    1. It put a schema migration on the hot path of every chunk write -- a
+       PRAGMA and a possible ALTER TABLE per chunk, so 26 pointless migrations
+       for a 26-chunk document.
+    2. It ran that migration CONCURRENTLY, from R workers at once, against a
+       check-then-ACT that cannot survive it. See _add_missing_columns.
+
+    Running it once, before any worker task is created (app.lifespan), removes
+    the concurrency from the migration entirely rather than merely surviving
+    it. _add_missing_columns is hardened too, but as a second line of defence.
+    """
     conn = _connect(path)
     try:
         # Tables, then missing columns, then indexes -- in that order, and as
@@ -111,12 +167,11 @@ def init_db(path):
         conn.executescript(INDEX_SCHEMA)
     finally:
         conn.close()
-
-
-def _ensure_column(conn, table, column, coltype):
-    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    # The other two tables are initialised through their own functions, which
+    # live next to their own schemas further down this file rather than being
+    # hoisted up here away from them.
+    init_chunks(path)
+    init_batch_documents(path)
 
 
 def create_job(path, kind, document, instruction=None):
@@ -477,6 +532,11 @@ CREATE TABLE IF NOT EXISTS chunk_summaries (
 
 
 def init_chunks(path):
+    """Create/upgrade chunk_summaries. Called from init_db at startup ONLY.
+
+    Not called from the read/write helpers below any more -- see init_db for
+    why (a per-chunk migration that R concurrent workers raced).
+    """
     conn = _connect(path)
     try:
         conn.executescript(CHUNK_SCHEMA)
@@ -500,7 +560,6 @@ def save_chunk_summaries(path, job_id, records, model=None):
     LlamaClient.model_name()), so a later resume attempt can tell whether it is
     safe to reuse them -- see get_recorded_model.
     """
-    init_chunks(path)
     conn = _connect(path)
     try:
         conn.executemany(
@@ -513,7 +572,6 @@ def save_chunk_summaries(path, job_id, records, model=None):
 
 
 def get_chunk_summaries(path, job_id):
-    init_chunks(path)
     conn = _connect(path)
     try:
         rows = conn.execute(
@@ -535,7 +593,6 @@ def get_recorded_model(path, job_id):
     single unambiguous string is deliberate: worker.run_one's resume check
     wants a clean equality test, not a set to reason about.
     """
-    init_chunks(path)
     conn = _connect(path)
     try:
         rows = conn.execute(
@@ -559,7 +616,6 @@ def delete_chunk_summaries(path, job_id):
     is to wipe and restart the map phase cleanly rather than risk a silent mix
     (see the report for why "discard and restart" was picked over "refuse").
     """
-    init_chunks(path)
     conn = _connect(path)
     try:
         conn.execute("DELETE FROM chunk_summaries WHERE job_id=?", (job_id,))
@@ -628,6 +684,14 @@ CREATE INDEX IF NOT EXISTS idx_batch_documents_batch
 
 
 def init_batch_documents(path):
+    """Create batch_documents. Called from init_db at startup ONLY.
+
+    Unlike chunk_summaries this table has never needed an added column, so it
+    is pure CREATE ... IF NOT EXISTS and was never exposed to the race in
+    _add_missing_columns. It is hoisted anyway, for one initialisation path
+    rather than two conventions, and so the FIRST column added to it does not
+    quietly reintroduce the bug.
+    """
     conn = _connect(path)
     try:
         conn.executescript(BATCH_SCHEMA)
@@ -642,7 +706,6 @@ def create_batch(path, records):
     Returns the new batch_id. IDs are assigned here so the caller never has to
     invent them, matching create_job()'s pattern.
     """
-    init_batch_documents(path)
     batch_id = uuid.uuid4().hex[:12]
     conn = _connect(path)
     try:
@@ -662,7 +725,6 @@ def create_batch(path, records):
 
 def get_batch(path, batch_id):
     """All staged documents for a batch, in upload order."""
-    init_batch_documents(path)
     conn = _connect(path)
     try:
         rows = conn.execute(
