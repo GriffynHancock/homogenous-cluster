@@ -1477,3 +1477,60 @@ success.
 - **Verify the knob per model family, by measurement.** F27 said re-verify
   coherence per model; this extends it to control flags. The test is cheap: one
   tight-budget request with and without the kwarg.
+
+---
+
+## F36. llama-server can hang ALIVE, and `Restart=always` cannot see it. A client disconnecting mid-generation is enough.
+
+**CONFIRMED by direct observation, 2026-08-17.** Found while checking whether a
+PDF job had completed.
+
+**Symptoms:** the job sat in `running` for seven minutes with the model server at
+**load 0.11** — idle. No error in any log. `GET /slots` returned **HTTP 000** (no
+response). A trivial new completion request **timed out after 85 s with HTTP 000**.
+The process was alive, `systemctl is-active` said `active`, and it was accepting
+TCP connections — it simply never answered. `systemctl restart llama-server@8080`
+fixed it instantly (healthy in ~10 s, then HTTP 200 in 5.7 s), which proves it was
+**wedged rather than slow**.
+
+**Cause:** a `systemctl restart missing-link` while a job was mid-generation. The
+server logged `srv stop: cancel task, id_task = 220` and a `CLOSE-WAIT` socket was
+left behind. So **the trigger is an ordinary operational action** — a deploy, a
+config reload, a worker OOM — not an exotic fault.
+
+**Why this is worse than a crash, and it compounds three ways:**
+
+1. **`Restart=always` is useless here.** The process never exited. systemd cannot
+   distinguish "serving" from "hung" without an explicit liveness probe.
+2. **The worker would have waited an hour.** `DEFAULT_TIMEOUT_S = 3600`, correctly
+   set high because real jobs take minutes — but against a dead backend that is
+   sixty minutes of a job frozen in `running`, which is exactly the invisible work
+   F20's `requeue_running()` exists to prevent.
+3. **`_worker_loop` had NO exception handling at all.** Any exception escaping
+   `run_one` would kill the asyncio task **silently** — an unretrieved task
+   exception prints nothing — stopping the queue forever with no log line. That
+   was a separate latent bug found in the same investigation.
+
+**Fixes, all three layers:**
+
+- **`_worker_loop` guards every iteration**, logs the failure, backs off
+  progressively, and **never exits**. A queue that can die silently is not a queue.
+- **`LlamaClient.assert_reachable()`** probes `/health` with a 20 s timeout before
+  the worker commits to a job, raising `BackendUnavailable` with the remedy in the
+  message. A wedged backend now produces a **failed job in 20 s** instead of a
+  frozen one for an hour.
+- **`cluster/llama-watchdog.sh` + a systemd timer** probe `/health` every minute
+  and restart the unit after **two** consecutive failures. Two, not one, because
+  restarting a healthy server costs a multi-minute 65 GB reload (F3). It no-ops
+  when the unit is already inactive, so it never fights `Restart=always`.
+
+**This is the "agent appliance" argument in miniature, and it validates the
+constraint `CLAUDE.md` states:** liveness cannot be judged from inside the thing
+being judged. The watchdog is a separate process precisely because the failure
+mode was "the server is up and lying." Note the operator has relaxed the appliance
+to on-node hosting, which is fine for *triage* — but this finding is the concrete
+reason the *liveness* half still wants an outside observer.
+
+**Generalisation for the skill:** any health check that only asks "is the process
+running?" will report green through this failure. **Probe the API, with a timeout,
+from outside the process.**

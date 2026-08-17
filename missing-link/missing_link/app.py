@@ -160,7 +160,26 @@ async def _worker_loop():
     HTTP call in a thread keeps the event loop free to serve the status page,
     which matters because a job holds that thread for hours.
     """
+    # EVERY iteration is guarded. Without this, any exception escaping run_one
+    # kills this asyncio task SILENTLY -- an unretrieved task exception prints
+    # nothing -- and the queue then stops forever with the current job frozen in
+    # 'running'. Observed 2026-08-17: a job sat 'running' for seven minutes with
+    # the model server idle and not one line in the log.
+    #
+    # run_one already turns per-job failures into failed jobs. This catches the
+    # rest: a corrupt database, a disk-full write, a bug in the queue itself.
+    consecutive_errors = 0
     while True:
-        did_work = await asyncio.to_thread(worker.run_one, DB_PATH, LLAMA_URL)
+        try:
+            did_work = await asyncio.to_thread(worker.run_one, DB_PATH, LLAMA_URL)
+            consecutive_errors = 0
+        except Exception as exc:  # noqa: BLE001 -- the loop must never die
+            consecutive_errors += 1
+            print(f"[worker] iteration failed ({consecutive_errors}): "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            # Back off so a persistent fault does not spin the CPU, but never
+            # give up: the whole point of a queue is that it keeps trying.
+            await asyncio.sleep(min(60, 5 * consecutive_errors))
+            continue
         if not did_work:
             await asyncio.sleep(5)

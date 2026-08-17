@@ -224,6 +224,24 @@ class LlamaClient:
         self._reasoning = reasoning_kwargs_for(name)
         return self._reasoning
 
+    def assert_reachable(self, timeout=20):
+        """Raise unless the server answers /health promptly."""
+        try:
+            req = urllib.request.Request(f"{self.base_url}/health")
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if r.status != 200:
+                    raise BackendUnavailable(
+                        f"{self.base_url}/health returned {r.status}")
+        except BackendUnavailable:
+            raise
+        except Exception as exc:
+            raise BackendUnavailable(
+                f"{self.base_url} did not answer /health within {timeout}s "
+                f"({type(exc).__name__}: {exc}). The server may be wedged -- a "
+                f"client disconnecting mid-generation can leave it alive but "
+                f"serving nothing. Try: sudo systemctl restart llama-server@8080"
+            ) from exc
+
     def complete(self, prompt, max_tokens=MAP_MAX_TOKENS):
         body_dict = {
             "messages": [{"role": "user", "content": prompt}],
@@ -255,6 +273,10 @@ class LlamaClient:
 
 class EmptyCompletion(RuntimeError):
     """The model returned no usable text."""
+
+
+class BackendUnavailable(RuntimeError):
+    """The inference server is not answering. Distinct from a bad completion."""
 
 
 class TruncatedCompletion(RuntimeError):
@@ -401,6 +423,14 @@ def run_one(db_path, base_url, client=None):
 
     started = time.monotonic()
     try:
+        # A wedged llama-server accepts TCP and never answers. Observed
+        # 2026-08-17: a client disconnecting mid-generation left the server alive
+        # but serving nothing, and Restart=always cannot help because it has not
+        # crashed. Without this probe the worker would block for DEFAULT_TIMEOUT_S
+        # (an hour) against a dead backend, holding a job in 'running'.
+        probe = getattr(client, "assert_reachable", None)
+        if probe is not None:
+            probe()
         n_chunks = count_chunks(job["document"])
         # summarise_traced keeps each chunk's identity and offsets, so the final
         # output stays traceable to spans of the source. See "Provenance" above.

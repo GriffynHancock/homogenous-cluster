@@ -24,7 +24,7 @@ real hardware.** Full detail and caveats in `docs/measurements.md`.
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **35 findings** from running this on real
+1. **Read `docs/FINDINGS.md`.** **36 findings** from running this on real
    hardware. Several correct the plan or the spec — **and F28 corrects this file
    and F23.** Do not trust the original plan's numbers over these.
 2. `docs/measurements.md` is the only place performance numbers may be quoted

@@ -465,3 +465,32 @@ def test_rate_is_recency_weighted_not_a_plain_average(dbpath):
     assert n == 5
     plain_mean = (100 + 100 + 100 + 100 + 400) / 5      # == 160
     assert rate > plain_mean, "recent slowdown must be weighted UP, got %.1f" % rate
+
+
+# --- backend wedged: alive, accepting TCP, serving nothing -------------------
+# Observed 2026-08-17. A client disconnecting mid-generation left llama-server
+# hung: /slots returned nothing, a trivial request timed out at 85s, and
+# Restart=always could not help because the process had not crashed.
+
+def test_unreachable_backend_fails_the_job_not_the_worker(dbpath):
+    """A wedged server must produce a FAILED job with an actionable message,
+    not a job frozen in 'running' for the full hour-long timeout."""
+    class WedgedClient(FakeClient):
+        def assert_reachable(self, timeout=20):
+            raise worker.BackendUnavailable(
+                "http://x did not answer /health within 20s. The server may be "
+                "wedged. Try: sudo systemctl restart llama-server@8080")
+
+    job_id = db.create_job(dbpath, "summarise", "a document")
+    assert worker.run_one(dbpath, "http://x", WedgedClient()) is True
+    job = db.get_job(dbpath, job_id)
+    assert job["status"] == "failed"
+    assert "wedged" in job["error"]
+    assert "systemctl restart" in job["error"], "must tell the operator what to DO"
+
+
+def test_client_without_a_health_probe_still_works(dbpath):
+    """Injected clients need not implement assert_reachable."""
+    db.create_job(dbpath, "summarise", "a document")
+    assert worker.run_one(dbpath, "http://x", FakeClient()) is True
+    assert db.list_jobs(dbpath)[0]["status"] == "done"
