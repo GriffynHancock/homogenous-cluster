@@ -900,6 +900,84 @@ Composed from these rates, a 50K-token document is **~60 min prefill +
 
 ---
 
+## F25. Kimi K2 has the WORST measured hallucination rate of any model checked. Model B needs reconsidering.
+
+**REPORTED** (Vectara hallucination leaderboard, `vectara/hallucination-leaderboard`,
+updated 2026-05-11, 7,700+ articles across news/legal/medical/finance/education).
+Not independently verified here — but decision-relevant enough to raise before
+further investment.
+
+The project's stated requirement is unambiguous: *"legally sensitive documents
+where a hallucinated fact is a serious failure"*, faithfulness over style.
+Against that requirement, the chosen Model B is the worst available option:
+
+| Model | Hallucination | Active | tok/s (est) | Disk @IQ4_XS | Licence |
+|---|---:|---:|---:|---:|---|
+| **Kimi K2-Instruct** | **17.9% — worst of all** | 32B | 1.02 | 546 GB (needs new drive) | custom |
+| **DeepSeek-V3.2** | **5.3–6.3%** | 37B | 0.88 | **363 GB — fits today** | **MIT** |
+| **GLM-4.6** | **9.5%** | 32B | **1.02** | **189 GB — fits easily** | **MIT** |
+| GLM-4.5-Air | 9.3% | 12B | 2.72 | 58 GB | MIT |
+| gpt-oss-120b | 14.2% | 5.1B | 6.40 | 61 GB | Apache-2.0 |
+| Mistral-large-2411 | 4.5% | — | — | — | — |
+| Finix S1 32B | **1.8% (best listed)** | ? | ? | ? | ? |
+
+**Kimi K2 is dominated on every axis except raw capability benchmarks:**
+
+- **GLM-4.6** matches its speed exactly (32B active), has **half** the
+  hallucination rate, is **MIT** rather than a custom licence, and needs
+  **189 GB instead of 546 GB** — it fits the existing disk with room to spare,
+  which would make the whole F16 disk blocker disappear.
+- **DeepSeek-V3.2** has **~3× better faithfulness**, is MIT, and also fits
+  today at 363 GB, for a ~14% speed cost (0.88 vs 1.02 tok/s).
+
+### Why this matters more for us than the leaderboard implies
+
+The Vectara benchmark measures **single-document** grounded summarisation. Our
+workload is **map-reduce**, and that likely **amplifies** the problem: a
+fabricated fact in a chunk summary becomes *source material* for the reduce
+step, where it is indistinguishable from genuine content. Errors do not just
+persist, they get laundered into the final output. **Faithfulness matters more
+in our pipeline than in the benchmark that produced these numbers, not less.**
+
+### Caveats, stated honestly
+
+- Figures are **REPORTED** from the leaderboard, not measured here.
+- The benchmark is single-doc; transfer to map-reduce is **inferred**, not shown.
+- Only **Kimi K2-Instruct** is listed. `K2-Instruct-0905` and `K2-Thinking` are
+  not, and may differ.
+- **There is a real capability/faithfulness trade-off.** Kimi K2-Thinking scores
+  84.5 GPQA-Diamond; the smaller alternatives score lower on reasoning. If the
+  workload needs frontier reasoning, that argues back toward K2.
+- Task 14's evaluation harness exists precisely to settle this **on our own
+  documents**. These numbers should redirect the shortlist, not replace the
+  measurement.
+
+### Recommendation
+
+**Do not fetch Kimi K2 yet.** Re-open the Model B decision with GLM-4.6 and
+DeepSeek-V3.2 as the leading candidates. GLM-4.6 in particular looks strictly
+better for this project: same speed, half the hallucination, permissive licence,
+and **it removes the need for the new coordinator drive entirely.**
+
+---
+
+## F26. Kimi K3 exists, and is firmly out of scope
+
+**CONFIRMED** (`moonshotai/Kimi-K3` on HuggingFace, weights pushed 2026-07-27):
+**2.78T total, 104B active**, 1M context, custom licence. GGUF quants exist
+(`unsloth/Kimi-K3-GGUF`) at **1.51 TB** for UD-Q4_K_XL; the smallest 1-bit quant
+is still 466 GB.
+
+**104B active is ~3.25× Kimi K2's 32B**, so on this hardware it would read
+~3.25× the bytes per token — roughly **0.3 tok/s**, before the size problem.
+At 1.51 TB it also exceeds the ~692 GB pooled RAM budget by more than 2×.
+
+**Not a candidate.** Worth recording so the question is not re-opened: newer and
+larger is actively worse here, because active parameters — not capability — set
+speed.
+
+---
+
 ## F9. Operational notes for the bring-up scripts
 
 **CONFIRMED by direct observation on node 1.**

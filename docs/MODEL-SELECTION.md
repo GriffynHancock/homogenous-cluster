@@ -117,9 +117,50 @@ Disk cost per node for Triage + Workhorse + Draft is well under 200 GB of the
 431 available, leaving room to hold two candidate workhorses and A/B them
 without re-downloading.
 
-**Selection is currently blocked on benchmark research** covering summarisation
-faithfulness, long-context performance, and open-vs-closed comparison. Criteria
-above are settled; names are not.
+## Benchmark research (2026-08-17) — the shortlist, with faithfulness first
+
+Hallucination rates are **REPORTED** from the Vectara leaderboard (7,700+
+news/legal/medical/finance articles, updated 2026-05-11). See F25 for caveats.
+
+| Model | Halluc. | Total | Active | tok/s | Disk @IQ4 | Licence | Slot |
+|---|---:|---:|---:|---:|---:|---|---|
+| **GLM-4.6** | **9.5%** | 357B | 32B | 1.02 | **189 GB** | MIT | **frontier — leading candidate** |
+| **DeepSeek-V3.2** | **5.3–6.3%** | 685B | 37B | 0.88 | 363 GB | MIT | frontier — most faithful |
+| Kimi K2-Instruct | **17.9% worst** | 1.03T | 32B | 1.02 | 546 GB | custom | **reconsider** |
+| **GLM-4.5-Air** | **9.3%** | 110B | 12B | 2.72 | **58 GB** | MIT | **workhorse — faithful** |
+| gpt-oss-120b | 14.2% | 117B | 5.1B | **6.40** | 61 GB | Apache | workhorse — fastest |
+| Qwen3-Next-80B-A3B | unknown | 81B | **3B** | **10.9** | 93 GB (Q8) | Apache | workhorse — cheapest/token |
+| Kimi K3 | — | 2.78T | 104B | ~0.3 | 1.5 TB | custom | **out of scope** (F26) |
+
+### The workhorse trade-off is now explicit
+
+| | gpt-oss-120b | GLM-4.5-Air |
+|---|---:|---:|
+| Speed | **6.40 tok/s** | 2.72 tok/s |
+| Hallucination | 14.2% | **9.3%** |
+| Licence | Apache-2.0 | MIT |
+
+**2.4× slower for ~1.5× more faithful.** For legally sensitive documents run
+overnight — where nobody is waiting and a fabricated fact is the failure that
+matters — that trade looks worth taking. **Both fit on one node, so both can be
+replicated ×7 and A/B'd on real documents.** Hold both on disk (119 GB of 431)
+and let Task 14 decide on our own corpus rather than on a public leaderboard.
+
+### Open gaps from the research
+
+- **GLM-5 / 5.1 / 5.2** (753B, MIT, GPQA 91.2 — the strongest open reasoner)
+  publishes **no active-parameter count anywhere found.** That single number
+  decides whether it is usable here. Worth a dedicated check.
+- **Finix S1 32B** has the best listed hallucination rate (**1.8%**) but was not
+  characterised — architecture, active params and GGUF availability all unknown.
+  If it is MoE and small, it could be ideal.
+- **No public summarisation-specific open-vs-closed leaderboard exists.** The
+  gap is demonstrated to have narrowed on *coding* benchmarks, **not** on
+  faithful summarisation. On the one faithfulness comparison that does exist,
+  closed models lead by ~4–7× (Gemini-2.0-Flash 0.7%, GPT-4o 1.5% against the
+  best open model found at 5.3%). **Do not claim the gap has closed for our
+  workload** — producing that comparison is precisely the contribution Task 14
+  was scoped to make.
 
 ---
 
