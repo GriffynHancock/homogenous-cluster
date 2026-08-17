@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from missing_link import db, worker
+from missing_link import db, extract, worker
 
 DB_PATH = os.environ.get("MISSING_LINK_DB", "/opt/missing-link/jobs.sqlite")
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8080")
@@ -66,9 +66,13 @@ async def submit(kind: str = Form(...),
     text = document
     if upload is not None and upload.filename:
         raw = await upload.read()
-        # Documents come from scanners and Windows desktops; latin-1 and cp1252
-        # are common. Never fail a multi-hour job on a stray byte.
-        text = raw.decode("utf-8", errors="replace")
+        # PDFs, docx and images all used to arrive here and be decoded as UTF-8
+        # with errors="replace", producing mojibake that was then summarised and
+        # stored as a successful job. See missing_link/extract.py.
+        try:
+            text = extract.extract(raw, upload.filename)
+        except extract.ExtractionError as exc:
+            raise HTTPException(400, str(exc))
 
     text = text.strip()
     if not text:

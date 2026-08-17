@@ -13,3 +13,7 @@ httpx==0.28.1
 jinja2==3.1.6
 pytest==9.1.1
 python-multipart==0.0.32
+# PDF text extraction. Uploads used to be decoded as UTF-8 with errors="replace",
+# which turned every PDF into mojibake that was then summarised and stored as a
+# successful job. See missing_link/extract.py.
+pypdf==6.16.1
