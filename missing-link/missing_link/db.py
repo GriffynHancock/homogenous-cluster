@@ -70,6 +70,29 @@ _JOBS_NEW_COLUMNS = [
     # throughput, and "which one" is exactly what ENDPOINT_STATE (in-memory,
     # cleared once the worker moves on) cannot answer after the fact.
     ("endpoint", "TEXT"),
+    # How many times this job has been STARTED (incremented by
+    # claim_next_pending, so a claim that ends in a crashed worker counts too,
+    # not only a clean transient failure). Bounds worker.MAX_ATTEMPTS: a job
+    # whose backend keeps dying is retried a few times and then fails FOR
+    # GOOD, with an error that says so. Without a persisted counter a retry
+    # loop is unbounded, which on an unattended overnight queue is worse than
+    # not retrying at all.
+    ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+    # Earliest time this job may be claimed again, ISO-8601 UTC, NULL for a
+    # job that has never been retried. This is the BACKOFF, and it is stored
+    # on the row rather than slept on in the worker deliberately: a sleeping
+    # worker cannot run anybody else's job, so a permanently-dead backend
+    # would starve the whole queue. A timestamp lets the retried job wait
+    # while every other pending job keeps moving. See claim_next_pending.
+    ("retry_after", "TEXT"),
+    # How many persisted chunk summaries the CURRENT attempt reused instead of
+    # recomputing (0 when it started from scratch). Written once per attempt by
+    # worker.run_one, after the model/instruction resume check has decided. It
+    # is the evidence for the only thing that makes a retry worth doing at all
+    # -- that it resumes rather than restarts -- and without it the job page
+    # can only guess (chunk rows are deleted when the resume is rejected, so
+    # "chunks exist" is not the same claim).
+    ("resumed_chunks", "INTEGER"),
 ]
 _CHUNK_NEW_COLUMNS = [
     # Which model produced this row, from LlamaClient.model_name() (/props).
@@ -261,6 +284,20 @@ def claim_next_pending(path):
     all default to priority 0). This is the ONE place ordering is decided, so
     a reorder takes effect "from the next claim" automatically -- a job
     already claimed and running is not touched.
+
+    RETRY BACKOFF is applied HERE, as a `retry_after` predicate, not as a sleep
+    in the worker: a job requeued after a transient backend failure (see
+    schedule_retry) is simply invisible to the claim until its timestamp
+    passes, so the queue keeps serving every other job in the meantime. A
+    worker that slept instead would hand a dead backend the power to stall
+    jobs that had nothing to do with it.
+
+    `attempts` is incremented as part of the same atomic claim, so it counts
+    STARTS rather than clean failures -- a claim whose worker is then OOM-killed
+    and requeued by requeue_running has still consumed an attempt, which is
+    what bounds a crash loop as well as a retry loop. The returned dict carries
+    the POST-increment value (the row was read before the UPDATE), because
+    worker.run_one's retry decision is about the attempt it is currently on.
     """
     conn = _connect(path)
     try:
@@ -268,14 +305,17 @@ def claim_next_pending(path):
         try:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE status='pending' "
-                "ORDER BY priority ASC, created_at ASC, rowid ASC LIMIT 1"
+                "  AND (retry_after IS NULL OR retry_after <= ?) "
+                "ORDER BY priority ASC, created_at ASC, rowid ASC LIMIT 1",
+                (_now(),),
             ).fetchone()
             if row is None:
                 conn.execute("ROLLBACK")
                 return None
             started = _now()
             conn.execute(
-                "UPDATE jobs SET status='running', started_at=? WHERE id=?",
+                "UPDATE jobs SET status='running', started_at=?, "
+                "attempts=attempts+1, retry_after=NULL WHERE id=?",
                 (started, row["id"]),
             )
             conn.execute("COMMIT")
@@ -288,6 +328,8 @@ def claim_next_pending(path):
     job = dict(row)
     job["status"] = "running"
     job["started_at"] = started
+    job["attempts"] = (row["attempts"] or 0) + 1
+    job["retry_after"] = None
     return job
 
 
@@ -311,6 +353,51 @@ def fail_job(path, job_id, error):
             "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
             (error, _now(), job_id),
         )
+    finally:
+        conn.close()
+
+
+def schedule_retry(path, job_id, error, retry_at):
+    """Return ONE job to 'pending' for another attempt after `retry_at`.
+
+    The mechanism half of the retry; the POLICY -- which failures are worth
+    retrying at all, how many times, and how long to wait -- lives in
+    worker.classify_failure / worker.retry_delay_seconds, so that this module
+    stays a job store and the question "is this failure the document's fault or
+    the cluster's?" stays in one place.
+
+    Distinct from requeue_running(), which is a blanket startup sweep for jobs
+    stranded by a dead PROCESS. This is per-job, deliberate, and carries a
+    timestamp.
+
+    `error` is kept on the row rather than cleared, so a job sitting in
+    'pending' awaiting a retry still says WHY -- otherwise the most alarming
+    state in the system (the backend died mid-document) would look identical to
+    a job that has simply never run. started_at/finished_at are cleared so the
+    next attempt's elapsed time is that attempt's, not a blend of two.
+    """
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "UPDATE jobs SET status='pending', error=?, retry_after=?, "
+            "started_at=NULL, finished_at=NULL WHERE id=?",
+            (error, retry_at, job_id),
+        )
+    finally:
+        conn.close()
+
+
+def record_resume(path, job_id, n_reused):
+    """Record how many persisted chunk summaries THIS attempt reused.
+
+    Called once per attempt by worker.run_one, with 0 when the attempt is
+    starting the map phase from scratch -- explicitly, so a value left over
+    from an earlier attempt cannot be read as this one's.
+    """
+    conn = _connect(path)
+    try:
+        conn.execute("UPDATE jobs SET resumed_chunks=? WHERE id=?",
+                     (int(n_reused), job_id))
     finally:
         conn.close()
 

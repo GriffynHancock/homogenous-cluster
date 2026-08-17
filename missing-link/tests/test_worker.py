@@ -528,9 +528,17 @@ def test_rate_is_recency_weighted_not_a_plain_average(dbpath):
 # hung: /slots returned nothing, a trivial request timed out at 85s, and
 # Restart=always could not help because the process had not crashed.
 
-def test_unreachable_backend_fails_the_job_not_the_worker(dbpath):
-    """A wedged server must produce a FAILED job with an actionable message,
-    not a job frozen in 'running' for the full hour-long timeout."""
+def test_unreachable_backend_does_not_freeze_or_kill_the_worker(dbpath):
+    """A wedged server must leave an actionable message and a job that is not
+    frozen in 'running' for the full hour-long timeout.
+
+    The TERMINAL half of this assertion moved on 2026-08-18: a wedged backend
+    is a TRANSIENT failure (worker.classify_failure), so the job now returns to
+    'pending' for a bounded, backed-off retry instead of failing outright --
+    the watchdog restarts llama-server minutes later and the job should pick
+    itself back up rather than wait for a human. The exhaustion path (retried
+    MAX_ATTEMPTS times, then failed for good) is covered in tests/test_retry.py.
+    """
     class WedgedClient(FakeClient):
         def assert_reachable(self, timeout=20):
             raise worker.BackendUnavailable(
@@ -540,7 +548,8 @@ def test_unreachable_backend_fails_the_job_not_the_worker(dbpath):
     job_id = db.create_job(dbpath, "summarise", "a document")
     assert worker.run_one(dbpath, "http://x", WedgedClient()) is True
     job = db.get_job(dbpath, job_id)
-    assert job["status"] == "failed"
+    assert job["status"] == "pending"
+    assert job["retry_after"] is not None, "a retry must be backed off, not immediate"
     assert "wedged" in job["error"]
     assert "systemctl restart" in job["error"], "must tell the operator what to DO"
 
