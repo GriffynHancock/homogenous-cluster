@@ -1,4 +1,101 @@
-# Design notes: two proposed speedups
+# Design notes: proposed speedups
+
+---
+
+## C. Replicate the model on every node (data parallelism) — the biggest available win
+
+**The idea:** rather than sharding one model across seven nodes, put a **full
+copy on each node** and run seven independent servers.
+
+**This is only possible for models that fit on one node** — gpt-oss-120b is
+61 GB against 125 GB of RAM, so it fits with 56 GB to spare. Kimi K2 at 547 GB
+cannot, and must still be sharded. So this is not a replacement for Model B; it
+is a third configuration.
+
+### Why it wins so heavily on *this* workload
+
+The spec says *"pooling buys capacity, not speed — 7 nodes ≈ 1 node with 7× the
+RAM."* **That is true for one request, and the project's actual workload is not
+one request.** Map-reduce over a 50K-token document is ~14 **independent** chunk
+summaries — embarrassingly parallel. What matters is aggregate throughput, not
+single-stream latency.
+
+| | Sharded (Kimi K2 × 7) | **Replicated (gpt-oss on each)** |
+|---|---|---|
+| Per-node footprint | 78 GB share | full 61 GB copy |
+| Generation | 1.08 tok/s total | 6.05 × 7 = **42 tok/s aggregate** |
+| Prefill | ~2.3 tok/s total | 15.88 × 7 = **111 tok/s aggregate** |
+| Concurrent seats | 1 | **7** |
+| RPC overhead | −39.4% prefill, −5.2% gen | **none** |
+| Node utilisation | 1/7 (sequential) | **7/7** |
+| **50K-token document** | **~80 min** | **~12 min** |
+
+**~7× on the workload that actually matters**, with no new hardware and no RPC
+overhead at all — each node runs standalone at full speed.
+
+### What it costs
+
+Model quality. Kimi K2 is a 1T-parameter frontier-class model; gpt-oss-120b is
+not. The real choice is:
+
+- **one frontier model, slowly, one job at a time**, versus
+- **seven good models, fast, in parallel.**
+
+For overnight document processing at volume, replication looks clearly better.
+For work that genuinely needs frontier reasoning, it does not.
+
+### Recommendation
+
+Add **"Model A replicated ×7"** as a third measured configuration rather than
+replacing Model B. The A-vs-B comparison is the stated deliverable, but
+A-replicated is plausibly the most *useful* configuration, and it does not
+weaken the thesis — 7 × gpt-oss-120b is still work the organisation could not
+otherwise do on its own hardware.
+
+**It also simplifies operations enormously:** no RPC, no `--tensor-split`, no
+version-lockstep across nodes, no exposure to upstream bug #26500 (F2), and a
+node failure costs 1/7 of throughput instead of taking the whole cluster down.
+Missing Link's queue would simply fan jobs out to seven independent endpoints —
+a much smaller change than it sounds, since the worker already isolates the
+task profile from the queue.
+
+**Caveat to measure:** each node needs its own copy on disk (61 GB × 7). At
+21 MB/s from HuggingFace that is prohibitive; `cluster/models.sh pull` over LAN
+makes it ~10 min per node.
+
+---
+
+## Prefill: what is left after measurement
+
+Prefill is 79% of document wall-clock, so it is the right thing to attack.
+Most of the obvious levers are already eliminated **by measurement**:
+
+| Lever | Status |
+|---|---|
+| `-t` thread count | **Saturated at 4 physical cores** (F10) |
+| `-ub` ubatch size | **No effect** — 27.18 / 26.60 / 27.61 at 512/1024/2048 (F18) |
+| Batching prefill | Dense CPU data shows prefill flat across batch sizes |
+| BIOS / uncore / power | **Already at maximum** — uncore 2800/2800, EPB 0 (F12) |
+| GPU offload | Quadro P600 has 2 GB; cannot hold meaningful layers |
+| More RAM channels | **Already 4/4 populated at rated speed** (F12) |
+
+What genuinely remains:
+
+1. **Data parallelism** (section C) — ~7×, by far the largest.
+2. **`-fa` flash attention** — untested on this build; may reduce attention
+   memory traffic.
+3. **KV cache quantisation** (`-ctk q8_0`) — helps at long context.
+4. **`ik_llama.cpp`** — optimised CPU kernels, particularly for MoE and
+   quantised types. Prefill is compute-bound, which is exactly what it targets.
+   Still the open A/B in `STATUS.md`, and now the only remaining *software*
+   lever with real upside.
+5. **Smaller chunks** — prefill cost is roughly linear in tokens, so this does
+   not reduce total work, but it does improve parallel granularity across a
+   replicated fleet.
+
+---
+
+## Two proposed speedups (analysed 2026-08-17)
 
 Analysis of two ideas raised 2026-08-17. Both are sound in principle; they differ
 enormously in cost. Numbers use node 1's measured 28.2 GB/s and Kimi K2 IQ4_XS
