@@ -14,3 +14,7 @@ provisioning/tskey*
 # project. Every agent should READ it; nobody should commit it.
 network.md
 llama.log
+
+# Agent worktrees and local Claude state. Never commit: the worktrees are
+# embedded git repos and committing gitlinks pollutes the repo and confuses merges.
+.claude/
