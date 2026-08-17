@@ -141,6 +141,93 @@ MAP_MAX_TOKENS = 1024
 REDUCE_MAX_TOKENS = 2048
 
 
+# --- Guidance length guard ----------------------------------------------------
+# Operator guidance -- typed, or extracted from an uploaded file (a style
+# guide, a report template, a question list) -- is embedded via `{instruction}`
+# in build_prompt/build_reduce_prompt (_instruction_clause). That means it is
+# repeated on EVERY map call, once per chunk, not once per document -- so it
+# must fit, alongside ONE chunk and the model's own output, inside a single
+# llama-server SLOT, not inside the whole context window. A 40-page style
+# guide "multiplied across 26 chunks" does not cost 26x the tokens (each
+# request is independent), but it DOES have to fit in the slot 26 times over,
+# and if it does not fit even once, every one of those 26 requests either
+# errors or (worse) silently drops the start of the chunk to make room.
+#
+# n_ctx_slot is NOT `-c / --parallel` by assumption -- CLAUDE.md is explicit
+# that this must be read from the server's own startup log, not inferred:
+#   journalctl -u llama-server@8080 | grep n_ctx_slot
+# Confirmed on node 1, 2026-08-18 (most recent server startup, `-c 32768
+# --parallel 4`): id_slot 0-3 all report n_ctx_slot=8192.
+N_CTX_SLOT = 8192
+
+# The static template text around {document}/{instruction} in PROMPTS /
+# REDUCE_PROMPTS -- roughly 35-45 words per kind (~50-65 tokens at
+# WORDS_PER_TOKEN). Rounded up well past that so this guard never undercounts
+# and blames the wrong thing when a request is still rejected.
+_PROMPT_WRAPPER_TOKENS = 150
+
+# One slot must hold, at once: one chunk (CHUNK_TOKENS) + the guidance
+# (repeated on every map call) + the model's own answer (MAP_MAX_TOKENS) + the
+# wrapper text. Solve for the guidance budget, then keep the project's
+# standard 15% safety margin (CLAUDE.md: "leave 15% memory headroom... do not
+# spec configurations that fit only marginally") rather than spend the
+# arithmetic ceiling exactly -- KV growth and the reduce step (which embeds
+# the guidance once more, alongside every chunk summary) both draw on the same
+# slot.
+_INSTRUCTION_HEADROOM_TOKENS = (
+    N_CTX_SLOT - CHUNK_TOKENS - MAP_MAX_TOKENS - _PROMPT_WRAPPER_TOKENS)
+_ARCH_SAFETY_MARGIN = 0.85  # the standard 15% headroom above
+
+# WORDS_PER_TOKEN (0.70) IS UNDER MEASUREMENT AND KNOWN OPTIMISTIC, separately
+# from the architecture margin above -- do not read it as settled. A real PDF
+# measured ~0.62 words/token (STATUS.md), and the chunk-size sweep in flight on
+# node 2 is showing llama-server's own prompt_n running ~30% over what the
+# words-per-token estimate predicted for the same chunk. Since this guard
+# converts a word count to an assumed token count via WORDS_PER_TOKEN, an
+# optimistic WORDS_PER_TOKEN makes the guard let through MORE words than
+# actually fit -- the unsafe direction, for a check whose entire job is
+# refusing what does not fit. This factor is separate insurance against THAT,
+# not a substitute for the real fix: MAX_INSTRUCTION_WORDS is derived FROM
+# WORDS_PER_TOKEN below, so when the sweep lands a corrected (lower) value,
+# this guard tightens automatically without needing to change. Do not fold
+# this into _ARCH_SAFETY_MARGIN above -- they guard different things and
+# should be able to move independently (this one goes away once
+# WORDS_PER_TOKEN is corrected; the architecture one does not).
+_TOKENIZER_UNCERTAINTY_MARGIN = 0.75
+
+MAX_INSTRUCTION_TOKENS = int(
+    _INSTRUCTION_HEADROOM_TOKENS * _ARCH_SAFETY_MARGIN * _TOKENIZER_UNCERTAINTY_MARGIN)
+MAX_INSTRUCTION_WORDS = int(MAX_INSTRUCTION_TOKENS * WORDS_PER_TOKEN)
+
+
+class GuidanceTooLong(ValueError):
+    """Operator guidance (typed, or extracted from a file) would not fit in
+    one context slot alongside a document chunk and its output.
+
+    Refused, not truncated -- for the same reason extract.py refuses a file it
+    cannot read rather than degrading it (F38): a silently shortened style
+    guide is a plausible-looking input that quietly means something other than
+    what the operator gave it, and the operator has no way to notice.
+    """
+
+
+def check_instruction_length(instruction):
+    """Raise GuidanceTooLong if `instruction` would not fit the per-chunk
+    budget. No-op for empty/None guidance -- there is nothing to check."""
+    if not instruction or not instruction.strip():
+        return
+    words = len(instruction.split())
+    if words > MAX_INSTRUCTION_WORDS:
+        raise GuidanceTooLong(
+            f"guidance is about {words} words (~{int(words / WORDS_PER_TOKEN)} "
+            f"tokens); the limit is {MAX_INSTRUCTION_WORDS} words "
+            f"(~{MAX_INSTRUCTION_TOKENS} tokens) so it still fits in one "
+            f"context slot (n_ctx_slot={N_CTX_SLOT}) alongside a document "
+            f"chunk ({CHUNK_TOKENS} tokens) and its output ({MAP_MAX_TOKENS} "
+            "tokens) -- it is repeated on every chunk, not sent once. Shorten "
+            "it, or trim it down to the parts that matter most.")
+
+
 def chunk_document(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
     """Split text into overlapping chunks, measured in whitespace words."""
     if overlap_tokens >= chunk_tokens:
@@ -424,6 +511,29 @@ def _first_prefill_s(timings_log):
     return round(ms / 1000.0, 2) if isinstance(ms, (int, float)) else None
 
 
+def _last_timings(client):
+    """The server's own `timings` object for the MOST RECENT client.complete()
+    call, as {"prompt_n", "prompt_ms", "predicted_n", "predicted_ms"} (only
+    the keys actually present), or {} if the client never reported timings.
+
+    Used to attach per-chunk prefill/generation numbers to a chunk record as
+    it is produced -- see summarise_traced's map loop and chunk_rate_stats,
+    which derives live tok/s and a per-job ETA from these. Deliberately reads
+    only LlamaClient.timings_log (already populated from llama-server's own
+    response, never from wall-clock -- see LlamaClient.complete). {} rather
+    than raising for a client with no such attribute (FakeClient in most
+    tests) or with nothing logged yet.
+    """
+    log = getattr(client, "timings_log", None)
+    if not log:
+        return {}
+    t = log[-1]
+    if not isinstance(t, dict):
+        return {}
+    return {k: t[k] for k in ("prompt_n", "prompt_ms", "predicted_n", "predicted_ms")
+            if k in t}
+
+
 def _strip_think(text):
     """Remove <think>...</think>, including an unclosed trailing block."""
     out, i, low = [], 0, text.lower()
@@ -494,6 +604,12 @@ def run_one(db_path, base_url, client=None, on_claim=None):
         return False
     if on_claim is not None:
         on_claim(job)
+    # Persisted immediately, not just held in the in-memory ENDPOINT_STATE
+    # (app.py): that dict is cleared the moment this worker moves on, so a
+    # FAILED job would otherwise lose all record of which node it died on --
+    # and under fan-out, "which endpoint" is the difference between "1/R of
+    # throughput is gone" and "the whole cluster is mysteriously slower".
+    db.set_job_endpoint(db_path, job["id"], base_url)
 
     if client is None:
         client = LlamaClient(base_url)
@@ -503,7 +619,8 @@ def run_one(db_path, base_url, client=None, on_claim=None):
     completed_chunks = [0]     # mutable counter closed over by _persist_chunk
 
     def _persist_chunk(record):
-        db.save_chunk_summaries(db_path, job["id"], [record], model=current_model)
+        db.save_chunk_summaries(db_path, job["id"], [record], model=current_model,
+                                instruction=job.get("instruction"))
         completed_chunks[0] += 1
 
     def _should_stop():
@@ -548,7 +665,21 @@ def run_one(db_path, base_url, client=None, on_claim=None):
             # need an operator to unstick a job just because the server was
             # restarted onto a different model, and restarting the map phase
             # is always correct, just slower than a true resume.
-            if recorded_model and current_model and recorded_model == current_model:
+            model_ok = bool(recorded_model) and bool(current_model) \
+                and recorded_model == current_model
+            # SAME REASONING, for the operator's guidance rather than the
+            # model. `instruction` is embedded in every map call (build_prompt)
+            # exactly like the document chunk is, so it is just as capable of
+            # making two runs' chunk summaries incompatible. Unlike the model
+            # check, "no instruction" (None) is trusted when BOTH sides agree
+            # it is None -- that was already true of every job before this
+            # column existed, so it is not new information to distrust; what
+            # is untrustworthy is DISAGREEMENT or an unconfirmable record
+            # (get_recorded_instruction's first element being False).
+            instr_ok, recorded_instruction = db.get_recorded_instruction(
+                db_path, job["id"])
+            instruction_ok = instr_ok and recorded_instruction == job.get("instruction")
+            if model_ok and instruction_ok:
                 resume_records = [
                     {"index": r["idx"], "start": r["start_char"],
                      "end": r["end_char"], "summary": r["summary"]}
@@ -674,6 +805,102 @@ def estimate_seconds(document, seconds_per_chunk=None):
     if n > 1:
         total += seconds_per_chunk * 0.5
     return total, basis
+
+
+def remaining_seconds(n_chunks, chunks_done, reduce_pending,
+                      seconds_per_chunk=None, basis=None):
+    """Estimated seconds LEFT for a job already in flight. Returns (seconds, basis).
+
+    Distinct from estimate_seconds, which predicts a whole document from
+    scratch before it starts. This one is calibrated against progress already
+    made -- chunks_done comes from persisted chunk_summaries rows, which is
+    real per-chunk progress, not a guess -- for the live-progress poll (see
+    app.py's /jobs/{id}/progress).
+
+    `basis` labels WHICH rate the caller is passing, and must be preserved
+    through to display, never collapsed into a single "measured" bucket --
+    an inferred number must look inferred, and (per the operator's own
+    request) a rate calibrated on THIS job's own first couple of chunks is a
+    materially weaker claim than the cluster-wide average, which is in turn
+    weaker than nothing. Three tiers, caller's choice:
+      "job"      -- THIS job's own chunk timings (see chunk_rate_stats)
+      "measured" -- the cluster-wide average (db.seconds_per_chunk)
+      "estimate" -- the benchmark fallback constant (seconds_per_chunk=None
+                    always forces this, regardless of what basis was passed --
+                    there is nothing else it could mean).
+
+    reduce_pending: True once every map chunk is done but the reduce call (a
+    real, separately-timed inference call) has not returned yet -- there is no
+    finer-grained signal than that available from persisted state alone.
+    """
+    if seconds_per_chunk is None:
+        seconds_per_chunk, basis = FALLBACK_SECONDS_PER_CHUNK, "estimate"
+    elif basis is None:
+        basis = "measured"
+    remaining_chunks = max(n_chunks - chunks_done, 0)
+    total = remaining_chunks * seconds_per_chunk
+    if n_chunks > 1 and (remaining_chunks > 0 or reduce_pending):
+        total += seconds_per_chunk * 0.5
+    return total, basis
+
+
+# Below this many of THIS JOB's own chunks have real timings, its own rate is
+# too noisy to trust over the cluster-wide average -- the same min_samples
+# posture db.seconds_per_chunk takes for the cluster figure. A per-job rate
+# from one sample is just that one chunk's random variance, not a rate.
+MIN_JOB_TIMED_CHUNKS = 2
+
+
+def chunk_rate_stats(timings):
+    """Turn a job's OWN persisted per-chunk timings (db.get_chunk_timings)
+    into live-progress numbers. Returns None if there is nothing timed yet --
+    e.g. every chunk so far was resumed from an earlier run, or the client in
+    use does not report timings (tests' FakeClient) -- rather than fabricate a
+    rate from zero real samples.
+
+    PREFILL AND GENERATION ARE KEPT SEPARATE, deliberately, never blended into
+    one tok/s: they run at very different speeds on this hardware (measured:
+    prefill ~16-25 t/s, generation ~5-6 t/s; prefill is ~79% of document
+    wall-clock, F27), so a single blended number would be dominated by
+    whichever phase happened to be running when it was read, and would mean a
+    different thing every time it was sampled.
+
+    Returns a dict:
+      n_timed            -- how many of this job's chunks have real timings
+      last_prefill_tok_s / last_gen_tok_s  -- from the MOST RECENTLY
+          completed chunk only (there is no partial/in-flight number to show:
+          LlamaClient sends stream=false, so a number only exists once a call
+          returns)
+      avg_prefill_tok_s / avg_gen_tok_s    -- pooled across every timed chunk
+          so far (sum of tokens / sum of milliseconds, not a mean of ratios --
+          correct when chunks vary in size)
+      seconds_per_chunk   -- mean (prompt_ms + predicted_ms) per timed chunk,
+          for remaining_seconds's ETA math; None if nothing is timed
+    """
+    if not timings:
+        return None
+
+    def rate(n, ms):
+        return (n / (ms / 1000.0)) if n and ms else None
+
+    last = timings[-1]
+    total_prompt_n = sum(t.get("prompt_n") or 0 for t in timings)
+    total_prompt_ms = sum(t.get("prompt_ms") or 0 for t in timings)
+    total_pred_n = sum(t.get("predicted_n") or 0 for t in timings)
+    total_pred_ms = sum(t.get("predicted_ms") or 0 for t in timings)
+    per_chunk_s = [
+        ((t.get("prompt_ms") or 0) + (t.get("predicted_ms") or 0)) / 1000.0
+        for t in timings
+    ]
+
+    return {
+        "n_timed": len(timings),
+        "last_prefill_tok_s": rate(last.get("prompt_n"), last.get("prompt_ms")),
+        "last_gen_tok_s": rate(last.get("predicted_n"), last.get("predicted_ms")),
+        "avg_prefill_tok_s": rate(total_prompt_n, total_prompt_ms),
+        "avg_gen_tok_s": rate(total_pred_n, total_pred_ms),
+        "seconds_per_chunk": (sum(per_chunk_s) / len(per_chunk_s)) if per_chunk_s else None,
+    }
 
 
 def humanise_seconds(s):
@@ -808,6 +1035,15 @@ def summarise_traced(kind, document, client,
                                   max_tokens=max_tokens)
         record = {"index": ch["index"], "start": ch["start"],
                   "end": ch["end"], "summary": summary}
+        # The server's own timings for THIS call, if the client reports them --
+        # never fabricated, never derived from wall-clock (F17: a wall-clock
+        # TTFT once reported 0.015s against a real 89s, off by ~5800x, and
+        # survived because nothing cross-checked it against the server log).
+        # Absent for a resumed chunk (this branch never runs for one) and for
+        # any client that does not expose timings_log (e.g. FakeClient in most
+        # tests) -- record.get(...) downstream then sees None, not a fabricated
+        # zero, per this project's standing rule (ttft_s is None, not 0.0).
+        record.update(_last_timings(client))
         records.append(record)
         if on_chunk_done is not None:
             on_chunk_done(record)

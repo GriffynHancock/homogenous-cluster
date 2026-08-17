@@ -120,8 +120,44 @@ def index(request: Request):
     )
 
 
+async def _resolve_instruction(form, kind):
+    """Combine typed guidance with an optional guidance FILE, for one workflow.
+
+    Guidance -- typed or extracted from a file -- is embedded in every map and
+    reduce call for jobs of this kind (worker.build_prompt / build_reduce_prompt
+    via `{instruction}`). A guidance file therefore goes through the SAME
+    extract.extract() as a document upload: it sniffs magic bytes and REFUSES
+    what it cannot read rather than degrading it (F38 -- a PDF decoded as UTF-8
+    was silently summarised as binary and stored 'done'; a guidance file that
+    cannot be read must fail the same way a document that cannot be read does).
+
+    The combined text is then checked against worker.check_instruction_length
+    BEFORE it can reach a job: guidance is repeated on every map call, so an
+    oversized style guide must be refused with the limit named, not silently
+    truncated. Raises HTTPException(400) naming the workflow on either failure.
+    """
+    typed = (form.get(f"instruction_{kind}") or "").strip()
+    upload = form.get(f"guidance_file_{kind}")
+    file_text = ""
+    if upload is not None and getattr(upload, "filename", None):
+        raw = await upload.read()
+        try:
+            file_text = extract.extract(raw, upload.filename).strip()
+        except extract.ExtractionError as exc:
+            raise HTTPException(400, f"guidance file for '{kind}': {exc}")
+
+    combined = "\n\n".join(part for part in (typed, file_text) if part) or None
+    if combined:
+        try:
+            worker.check_instruction_length(combined)
+        except worker.GuidanceTooLong as exc:
+            raise HTTPException(400, f"guidance for '{kind}': {exc}")
+    return combined
+
+
 @app.post("/jobs")
-async def submit(kind: str = Form(...),
+async def submit(request: Request,
+                 kind: str = Form(...),
                  document: str = Form(""),
                  upload: UploadFile | None = File(None)):
     if kind not in worker.PROMPTS:
@@ -142,7 +178,13 @@ async def submit(kind: str = Form(...),
     if not text:
         raise HTTPException(400, "no document supplied")
 
-    job_id = db.create_job(DB_PATH, kind, text)
+    # Only the guidance box matching the chosen `kind` applies -- see
+    # _resolve_instruction and templates/index.html, which shows one box per
+    # workflow the same way the batch review page does.
+    form = await request.form()
+    instruction = await _resolve_instruction(form, kind)
+
+    job_id = db.create_job(DB_PATH, kind, text, instruction)
     return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
 
@@ -207,10 +249,8 @@ async def batch_confirm(request: Request, batch_id: str):
         raise HTTPException(404, "no such batch")
 
     form = await request.form()
-    instructions = {
-        kind: (form.get(f"instruction_{kind}") or "").strip() or None
-        for kind in worker.PROMPTS
-    }
+    instructions = {kind: await _resolve_instruction(form, kind)
+                    for kind in worker.PROMPTS}
 
     created = []
     for doc in docs:
@@ -264,6 +304,87 @@ def _estimate_for(job):
     return {"seconds": secs, "human": worker.humanise_seconds(secs), "basis": basis}
 
 
+def _progress_payload(job, chunks_done=None):
+    """Everything the job page's live-progress poll needs, from local reads
+    only. See the /jobs/{id}/progress route docstring for why "local reads
+    only" is load-bearing, not just an implementation detail.
+
+    `chunks_done`, if given, skips the chunk_summaries query -- job_view
+    already has the same rows (as `sections`) and would otherwise query them
+    twice per request for no reason.
+    """
+    document = job.get("document") or ""
+    n_chunks = worker.count_chunks(document) if document else 0
+    if chunks_done is None:
+        chunks_done = len(db.get_chunk_summaries(DB_PATH, job["id"]))
+    reduce_pending = (job["status"] == "running"
+                      and n_chunks > 1 and chunks_done >= n_chunks)
+
+    elapsed_s = None
+    if job.get("started_at"):
+        end_raw = job.get("finished_at") or datetime.now(timezone.utc).isoformat()
+        try:
+            elapsed_s = (datetime.fromisoformat(end_raw)
+                        - datetime.fromisoformat(job["started_at"])).total_seconds()
+        except ValueError:
+            elapsed_s = None  # malformed timestamp must not break the poll
+
+    # THREE-TIER rate, best available first, each labelled so the UI never
+    # shows a number without saying how sure it is (the operator's own
+    # standing complaint about this project: an inferred figure must look
+    # inferred). Preference order:
+    #   1. "job"      -- THIS job's own chunk timings, once there are enough
+    #                    of them (worker.MIN_JOB_TIMED_CHUNKS) to be more than
+    #                    one chunk's noise. Best predictor of what THIS job
+    #                    will do next -- it already reflects this document's
+    #                    actual chunk sizes and whatever this run's endpoint
+    #                    is currently doing.
+    #   2. "measured" -- the cluster-wide average (db.seconds_per_chunk),
+    #                    unchanged from before this job existed.
+    #   3. "estimate" -- the benchmark fallback constant, when neither of the
+    #                    above has enough samples yet.
+    job_timings = db.get_chunk_timings(DB_PATH, job["id"])
+    job_stats = worker.chunk_rate_stats(job_timings)
+    cluster_spc, _cluster_n = db.seconds_per_chunk(DB_PATH)
+
+    if job_stats and job_stats["n_timed"] >= worker.MIN_JOB_TIMED_CHUNKS \
+            and job_stats["seconds_per_chunk"]:
+        rate_spc, rate_basis = job_stats["seconds_per_chunk"], "job"
+    elif cluster_spc is not None:
+        rate_spc, rate_basis = cluster_spc, "measured"
+    else:
+        rate_spc, rate_basis = None, "estimate"
+
+    eta_seconds = eta_basis = eta_human = None
+    if job["status"] == "running":
+        eta_seconds, eta_basis = worker.remaining_seconds(
+            n_chunks, chunks_done, reduce_pending, rate_spc, rate_basis)
+        eta_human = worker.humanise_seconds(eta_seconds)
+
+    return {
+        "status": job["status"],
+        "chunks_done": chunks_done,
+        "chunks_expected": n_chunks,
+        "elapsed_s": elapsed_s,
+        "eta_seconds": eta_seconds,
+        "eta_human": eta_human,
+        "eta_basis": eta_basis,
+        # Prefill and generation tok/s, ALWAYS SEPARATE, never blended into
+        # one number -- see worker.chunk_rate_stats for why a blended figure
+        # would be meaningless on this hardware. Both None until this job has
+        # a real client.complete() timing to show (not before the first
+        # non-resumed chunk lands).
+        "tok_s": job_stats,
+        # Which endpoint (LLAMA_URLS entry) is/was running this job -- see the
+        # `endpoint` column and worker.run_one's set_job_endpoint call. Under
+        # fan-out this is the difference between "a node failed" and "it got
+        # slower" as the operator's only symptom.
+        "endpoint": job.get("endpoint"),
+        "error": job.get("error"),
+        "cancel_requested": bool(job.get("cancel_requested")),
+    }
+
+
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
 def job_view(request: Request, job_id: str):
     job = db.get_job(DB_PATH, job_id)
@@ -275,11 +396,40 @@ def job_view(request: Request, job_id: str):
     if job["status"] in ("done", "failed", "cancelled") and job["seen_at"] is None:
         db.mark_seen(DB_PATH, job_id)
         job = db.get_job(DB_PATH, job_id)
+    sections = db.get_chunk_summaries(DB_PATH, job_id)
     return TEMPLATES.TemplateResponse(
         request, "job.html",
         {"job": job,
-         "estimate": _estimate_for(job) if job["status"] in ("pending", "running") else None,
-         "sections": db.get_chunk_summaries(DB_PATH, job_id)})
+         "estimate": _estimate_for(job) if job["status"] == "pending" else None,
+         "sections": sections,
+         # Rendered server-side so the page is fully correct on first load and
+         # on every 15s no-JS refresh; the JS below only makes updates land
+         # sooner than that, it is never the only source of this data.
+         "progress": _progress_payload(job, chunks_done=len(sections))})
+
+
+@app.get("/jobs/{job_id}/progress")
+def job_progress(job_id: str):
+    """Cheap JSON for the job page's live-progress poll.
+
+    SQLITE READS ONLY -- this must NEVER call llama-server. Probing the
+    inference server from a status page is the exact mistake that just cost
+    this project a 97,299-character job: /health on this build queues behind
+    token generation (it posts a METRICS task onto the same queue
+    update_slots() drains), so a "cheap" liveness probe can itself hang for as
+    long as the job it is trying to report on, under load, with idle slots.
+    Everything below comes from the jobs row, the persisted chunk_summaries
+    count, and the self-calibrating rate in db.seconds_per_chunk -- no request
+    from this handler ever leaves the process.
+
+    Poll no faster than every 2-3 seconds (see templates/job.html) -- this is
+    plain `setInterval` + `fetch`, not a persistent connection, so a closed
+    browser tab costs nothing and nothing here can wedge.
+    """
+    job = db.get_job(DB_PATH, job_id)
+    if job is None:
+        raise HTTPException(404, "no such job")
+    return _progress_payload(job)
 
 
 @app.post("/jobs/{job_id}/cancel")

@@ -33,6 +33,19 @@
     <input type="file" name="upload" id="upload">
     <label for="document">…or paste text</label>
     <textarea name="document" id="document" placeholder="Paste the document here."></textarea>
+
+    <p class="hint">Optional guidance, one box per task — only the box for the
+      Task selected above is used. Type it, or upload a file instead (a house
+      style guide, a report template, a list of questions); a typed box and a
+      file for the same task are combined.</p>
+    {% for k in kinds %}
+      <label for="instruction_{{ k }}_single">Guidance for “{{ k }}”</label>
+      <textarea name="instruction_{{ k }}" id="instruction_{{ k }}_single"
+        placeholder="Optional guidance for the {{ k }} task…"></textarea>
+      <label for="guidance_file_{{ k }}_single">…or a guidance file for “{{ k }}”</label>
+      <input type="file" name="guidance_file_{{ k }}" id="guidance_file_{{ k }}_single">
+    {% endfor %}
+
     <button type="submit">Queue it</button>
   </form>
 </fieldset>

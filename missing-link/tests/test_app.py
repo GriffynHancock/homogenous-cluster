@@ -498,3 +498,258 @@ def test_worker_loop_backs_off_while_dead_and_resumes_without_failing_the_job(
         assert app_mod.ENDPOINT_STATE[url]["reachable"] is True
     finally:
         os.unlink(path)
+
+
+# --- guidance: text box + file upload, per workflow ----------------------------
+
+def test_submit_stores_typed_guidance_for_the_selected_kind(client):
+    r = client.post("/jobs", data={
+        "kind": "summarise", "document": "hello world",
+        "instruction_summarise": "Focus on dates.",
+        "instruction_report": "This box must be ignored.",
+    }, follow_redirects=False)
+    job_id = r.headers["location"].rsplit("/", 1)[-1]
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert job["instruction"] == "Focus on dates."
+
+
+def test_submit_with_blank_guidance_stores_none(client):
+    r = client.post("/jobs", data={"kind": "summarise", "document": "hello world"},
+                    follow_redirects=False)
+    job_id = r.headers["location"].rsplit("/", 1)[-1]
+    assert client.get(f"/api/jobs/{job_id}").json()["instruction"] is None
+
+
+def test_submit_accepts_a_guidance_file_and_extracts_it(client):
+    r = client.post("/jobs", data={"kind": "summarise", "document": "hello world"},
+                    files={"guidance_file_summarise":
+                          ("style.txt", b"Keep it under 3 sentences.", "text/plain")},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    job_id = r.headers["location"].rsplit("/", 1)[-1]
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert "Keep it under 3 sentences." in job["instruction"]
+
+
+def test_submit_combines_typed_guidance_and_guidance_file(client):
+    r = client.post("/jobs", data={
+        "kind": "summarise", "document": "hello world",
+        "instruction_summarise": "Focus on dates.",
+    }, files={"guidance_file_summarise":
+             ("style.txt", b"Use bullet points.", "text/plain")},
+                    follow_redirects=False)
+    job_id = r.headers["location"].rsplit("/", 1)[-1]
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert "Focus on dates." in job["instruction"]
+    assert "Use bullet points." in job["instruction"]
+
+
+def test_submit_refuses_an_unreadable_guidance_file(client):
+    """Same posture as a document upload (F38): a guidance file that cannot be
+    read is refused with a reason, never silently degraded."""
+    r = client.post("/jobs", data={"kind": "summarise", "document": "hello world"},
+                    files={"guidance_file_summarise":
+                          ("photo.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF", "image/jpeg")})
+    assert r.status_code == 400
+    assert "guidance file" in r.text
+
+
+def test_submit_refuses_oversized_guidance_naming_the_limit(client):
+    from missing_link import worker
+    too_long = "word " * (worker.MAX_INSTRUCTION_WORDS + 500)
+    r = client.post("/jobs", data={
+        "kind": "summarise", "document": "hello world",
+        "instruction_summarise": too_long,
+    })
+    assert r.status_code == 400
+    assert str(worker.MAX_INSTRUCTION_WORDS) in r.text
+
+
+def test_batch_confirm_combines_typed_guidance_and_guidance_file(client):
+    files = [("files", ("doc.txt", b"Some document text to summarise later.",
+                        "text/plain"))]
+    r = client.post("/batch", files=files, follow_redirects=False)
+    batch_id = r.headers["location"].rsplit("/", 1)[-1]
+    doc_id = db_module_doc_id(client, batch_id)
+
+    r = client.post(
+        f"/batch/{batch_id}/confirm",
+        data={f"wf_{doc_id}": ["summarise"], "instruction_summarise": "Be terse."},
+        files={"guidance_file_summarise":
+              ("style.txt", b"Use headings.", "text/plain")},
+        follow_redirects=False)
+    assert r.status_code == 303
+
+    jobs = client.get("/api/jobs").json()
+    job = client.get(f"/api/jobs/{jobs[0]['id']}").json()
+    assert "Be terse." in job["instruction"]
+    assert "Use headings." in job["instruction"]
+
+
+def test_batch_confirm_refuses_an_unreadable_guidance_file(client):
+    files = [("files", ("doc.txt", b"Some document text.", "text/plain"))]
+    r = client.post("/batch", files=files, follow_redirects=False)
+    batch_id = r.headers["location"].rsplit("/", 1)[-1]
+    doc_id = db_module_doc_id(client, batch_id)
+
+    r = client.post(
+        f"/batch/{batch_id}/confirm",
+        data={f"wf_{doc_id}": ["summarise"]},
+        files={"guidance_file_summarise":
+              ("photo.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF", "image/jpeg")})
+    assert r.status_code == 400
+
+
+def test_index_and_batch_pages_show_a_guidance_box_per_workflow(client):
+    r = client.get("/")
+    for k in ("summarise", "report", "qa"):
+        assert f'name="instruction_{k}"' in r.text
+        assert f'name="guidance_file_{k}"' in r.text
+
+    files = [("files", ("doc.txt", b"Some document text.", "text/plain"))]
+    br = client.post("/batch", files=files, follow_redirects=False)
+    batch_id = br.headers["location"].rsplit("/", 1)[-1]
+    review = client.get(f"/batch/{batch_id}")
+    for k in ("summarise", "report", "qa"):
+        assert f'name="instruction_{k}"' in review.text
+        assert f'name="guidance_file_{k}"' in review.text
+    # File inputs need a multipart form, or the browser silently drops them.
+    assert 'enctype="multipart/form-data"' in review.text
+
+
+# --- live progress polling endpoint (Feature 1) ---------------------------------
+
+def test_job_progress_404_for_missing_job(client):
+    assert client.get("/jobs/nonexistent/progress").status_code == 404
+
+
+def test_job_progress_reports_zero_of_n_for_a_fresh_pending_job(client):
+    job_id = _submit(client, doc="word " * 20000)  # multi-chunk document
+    r = client.get(f"/jobs/{job_id}/progress")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "pending"
+    assert body["chunks_done"] == 0
+    assert body["chunks_expected"] > 1
+    assert body["elapsed_s"] is None
+    assert body["endpoint"] is None
+
+
+def test_job_progress_reflects_persisted_chunks_and_endpoint_mid_run(client):
+    from missing_link import db
+
+    job_id = _submit(client, doc="word " * 20000)
+    from missing_link.app import DB_PATH
+    job = db.claim_next_pending(DB_PATH)
+    db.set_job_endpoint(DB_PATH, job_id, "http://node5:8080")
+    db.save_chunk_summaries(
+        DB_PATH, job_id,
+        [{"index": 0, "start": 0, "end": 10, "summary": "s0"}],
+        model="m")
+
+    body = client.get(f"/jobs/{job_id}/progress").json()
+    assert body["status"] == "running"
+    assert body["chunks_done"] == 1
+    assert body["chunks_expected"] > 1
+    assert body["endpoint"] == "http://node5:8080"
+    assert body["eta_seconds"] is not None
+    assert body["eta_basis"] in ("measured", "estimate")
+
+
+def test_job_progress_reports_tok_s_and_job_tier_eta_once_enough_chunks_are_timed(client):
+    """The operator's own request: once THIS job has enough of its own timed
+    chunks, the ETA must be calibrated on THIS job (basis 'job'), separate
+    from the cluster-wide average -- and prefill/generation tok/s must be
+    reported as two distinct numbers, never blended."""
+    from missing_link import db, worker
+    from missing_link.app import DB_PATH
+
+    job_id = _submit(client, doc="word " * 20000)
+    db.claim_next_pending(DB_PATH)
+    for i in range(worker.MIN_JOB_TIMED_CHUNKS):
+        db.save_chunk_summaries(
+            DB_PATH, job_id,
+            [{"index": i, "start": i * 10, "end": i * 10 + 10, "summary": f"s{i}",
+              "prompt_n": 4096, "prompt_ms": 4000.0,
+              "predicted_n": 200, "predicted_ms": 2000.0}],
+            model="m")
+
+    body = client.get(f"/jobs/{job_id}/progress").json()
+    assert body["eta_basis"] == "job"
+    assert body["tok_s"]["n_timed"] == worker.MIN_JOB_TIMED_CHUNKS
+    assert body["tok_s"]["last_prefill_tok_s"] == pytest.approx(4096 / 4.0)
+    assert body["tok_s"]["last_gen_tok_s"] == pytest.approx(200 / 2.0)
+    assert body["tok_s"]["last_prefill_tok_s"] != body["tok_s"]["last_gen_tok_s"]
+
+
+def test_job_progress_tok_s_is_none_before_any_chunk_is_timed(client):
+    job_id = _submit(client, doc="word " * 20000)
+    body = client.get(f"/jobs/{job_id}/progress").json()
+    assert body["tok_s"] is None
+
+
+def test_running_job_page_shows_chunk_progress_and_tok_s(client):
+    from missing_link import db, worker
+    from missing_link.app import DB_PATH
+
+    job_id = _submit(client, doc="word " * 20000)
+    db.claim_next_pending(DB_PATH)
+    for i in range(worker.MIN_JOB_TIMED_CHUNKS):
+        db.save_chunk_summaries(
+            DB_PATH, job_id,
+            [{"index": i, "start": i * 10, "end": i * 10 + 10, "summary": f"s{i}",
+              "prompt_n": 4096, "prompt_ms": 4000.0,
+              "predicted_n": 200, "predicted_ms": 2000.0}],
+            model="m")
+
+    r = client.get(f"/jobs/{job_id}")
+    assert r.status_code == 200
+    assert "Prefill" in r.text and "Generation" in r.text
+    assert "measured from this job's own chunks" in r.text
+
+
+def test_job_progress_endpoint_never_touches_llama_server(client, monkeypatch):
+    """The polling endpoint must read ONLY sqlite. Force any outbound HTTP
+    call to explode, so this test fails loudly if that constraint is ever
+    broken by a future edit."""
+    import urllib.request
+
+    def _boom(*a, **k):
+        raise AssertionError("job_progress must never make an HTTP request")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+
+    job_id = _submit(client, doc="word " * 20000)
+    r = client.get(f"/jobs/{job_id}/progress")
+    assert r.status_code == 200
+
+
+def test_running_job_page_renders_live_progress_box(client):
+    from missing_link import db
+    from missing_link.app import DB_PATH
+
+    job_id = _submit(client, doc="word " * 20000)
+    db.claim_next_pending(DB_PATH)
+    db.set_job_endpoint(DB_PATH, job_id, "http://node6:8080")
+
+    r = client.get(f"/jobs/{job_id}")
+    assert r.status_code == 200
+    assert 'id="live-progress"' in r.text
+    assert "http://node6:8080" in r.text
+    assert f"/jobs/{job_id}/progress" in r.text  # reachable by clicking
+
+
+def test_failed_job_page_shows_error_prominently_with_endpoint(client):
+    from missing_link import db
+    from missing_link.app import DB_PATH
+
+    job_id = _submit(client)
+    db.claim_next_pending(DB_PATH)
+    db.set_job_endpoint(DB_PATH, job_id, "http://node7:8080")
+    db.fail_job(DB_PATH, job_id, "BackendUnavailable: did not answer /health")
+
+    r = client.get(f"/jobs/{job_id}")
+    assert r.status_code == 200
+    assert "This job failed" in r.text
+    assert "http://node7:8080" in r.text
+    assert "BackendUnavailable" in r.text

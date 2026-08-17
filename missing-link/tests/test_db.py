@@ -406,6 +406,110 @@ def test_init_chunks_upgrades_a_pre_existing_chunk_summaries_table():
         os.unlink(path)
 
 
+# --- chunk-summary instruction identity (guidance/resume soundness) -----------
+# Mirrors the get_recorded_model tests above: `instruction` shapes the map
+# prompt exactly as much as the model does, so it needs the same "only trust a
+# resume when this is confirmed" treatment -- see worker.run_one.
+
+def test_get_recorded_instruction_with_no_chunks_is_unconfirmed(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "a")
+    ok, instruction = db.get_recorded_instruction(dbpath, job_id)
+    assert ok is False
+    assert instruction is None
+
+
+def test_get_recorded_instruction_returns_the_common_value(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "a")
+    db.save_chunk_summaries(
+        dbpath, job_id, [{"index": 0, "start": 0, "end": 1, "summary": "s"}],
+        model="model-A", instruction="Focus on dates.")
+    ok, instruction = db.get_recorded_instruction(dbpath, job_id)
+    assert ok is True
+    assert instruction == "Focus on dates."
+
+
+def test_get_recorded_instruction_none_is_confirmed_not_unknown(dbpath):
+    """Unlike a missing/unconfirmed model, a CONSISTENTLY recorded None means
+    "no guidance was given" -- that was already true of every job before this
+    column existed, so it must be trusted, not treated as untrustworthy the
+    way an unrecorded model is."""
+    job_id = db.create_job(dbpath, "summarise", "a")
+    db.save_chunk_summaries(
+        dbpath, job_id, [{"index": 0, "start": 0, "end": 1, "summary": "s"}],
+        model="model-A")  # instruction defaults to None
+    ok, instruction = db.get_recorded_instruction(dbpath, job_id)
+    assert ok is True
+    assert instruction is None
+
+
+def test_get_recorded_instruction_is_unconfirmed_when_rows_disagree(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "a")
+    db.save_chunk_summaries(
+        dbpath, job_id, [{"index": 0, "start": 0, "end": 1, "summary": "s0"}],
+        model="model-A", instruction="Focus on dates.")
+    db.save_chunk_summaries(
+        dbpath, job_id, [{"index": 1, "start": 1, "end": 2, "summary": "s1"}],
+        model="model-A", instruction="Focus on risk.")
+    ok, instruction = db.get_recorded_instruction(dbpath, job_id)
+    assert ok is False
+    assert instruction is None
+
+
+# --- endpoint attribution -------------------------------------------------------
+
+def test_set_job_endpoint_records_and_persists(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "a")
+    assert db.get_job(dbpath, job_id)["endpoint"] is None
+    db.set_job_endpoint(dbpath, job_id, "http://node2:8080")
+    assert db.get_job(dbpath, job_id)["endpoint"] == "http://node2:8080"
+
+
+# --- per-chunk timings (live tok/s, per-job ETA) --------------------------------
+
+def test_save_chunk_summaries_persists_timing_fields(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "a")
+    db.save_chunk_summaries(
+        dbpath, job_id,
+        [{"index": 0, "start": 0, "end": 1, "summary": "s",
+          "prompt_n": 4096, "prompt_ms": 4000.0,
+          "predicted_n": 200, "predicted_ms": 2000.0}],
+        model="model-A")
+    rows = db.get_chunk_timings(dbpath, job_id)
+    assert len(rows) == 1
+    assert rows[0]["prompt_n"] == 4096
+    assert rows[0]["prompt_ms"] == 4000.0
+    assert rows[0]["predicted_n"] == 200
+    assert rows[0]["predicted_ms"] == 2000.0
+
+
+def test_save_chunk_summaries_without_timings_leaves_them_null_not_zero(dbpath):
+    """A missing measurement must look missing -- NULL, never a fabricated
+    0 -- the same rule that already governs ttft_s (F17's lesson)."""
+    job_id = db.create_job(dbpath, "summarise", "a")
+    db.save_chunk_summaries(
+        dbpath, job_id, [{"index": 0, "start": 0, "end": 1, "summary": "s"}],
+        model="model-A")
+    # get_chunk_timings only returns TIMED rows (prompt_ms IS NOT NULL), so an
+    # untimed row must be absent, not present with fabricated zeros.
+    assert db.get_chunk_timings(dbpath, job_id) == []
+
+
+def test_get_chunk_timings_excludes_untimed_rows_and_orders_by_index(dbpath):
+    job_id = db.create_job(dbpath, "summarise", "a")
+    db.save_chunk_summaries(
+        dbpath, job_id,
+        [{"index": 1, "start": 10, "end": 20, "summary": "s1",
+          "prompt_n": 100, "prompt_ms": 1000.0,
+          "predicted_n": 10, "predicted_ms": 100.0}],
+        model="model-A")
+    db.save_chunk_summaries(
+        dbpath, job_id, [{"index": 0, "start": 0, "end": 10, "summary": "s0"}],
+        model="model-A")  # no timings -- must be excluded
+    rows = db.get_chunk_timings(dbpath, job_id)
+    assert len(rows) == 1
+    assert rows[0]["idx"] == 1
+
+
 def test_delete_chunk_summaries_removes_all_rows_for_the_job(dbpath):
     job_id = db.create_job(dbpath, "summarise", "a")
     db.save_chunk_summaries(
