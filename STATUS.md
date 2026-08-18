@@ -428,6 +428,74 @@ Vary the prompt between runs or you measure the prompt cache (F17).
 
 ## NEXT TASKS, in order
 
+### 0. THE CORPUS-DRIVEN BENCHMARK — the operator's stated priority for the next session
+
+**"this is a strong direction. this needs to be a large part of next session."** — the
+operator, 2026-08-18.
+
+**Why this is first, and it is not a preference.** Every measurement this project
+has made ran against whatever documents happened to have been submitted as jobs:
+two long narrative/devotional texts and a 2,202-character memo. **Three separate
+measurements were blocked or weakened by that, and only that:**
+
+- **Chunk-boundary severance returned 0 of 84 events and could not answer its own
+  question.** The only legal-styled document in the store is 2,202 characters —
+  too short to produce a single chunk boundary at any size — so it contributed
+  zero data points. The two documents long enough to produce boundaries are
+  narrative prose at 0.03–1.4% clause-marker density, 50–500× sparser. The zero
+  reflects the corpus, not the splitter. See `docs/chunk-boundary-measurement.md`.
+- **The entity signal's 15% → 8.5% false-positive rate is dominated by OCR damage
+  specific to that corpus.** The model correctly reconstructs transliterations
+  the source has mangled, and a faithful claim therefore looks unsupported.
+  `--entity-rules strict` measures **100% near-miss catch at 17.3% FP** and is
+  probably correct for this project's actual target material — clean digital
+  legal and standards text — but is **untested on clean source**. See
+  `docs/two-scope-and-entity-index.md`.
+- **The faithfulness cascade was validated on constructed fixtures** plus one
+  narrative corpus. Its hard tier keys on numbers and named entities, which is
+  exactly what legislative and standards material is dense in and devotional
+  prose is not.
+
+**So the corpus is the instrument, and it has been the limiting one.**
+
+**What now exists to support this** (all merged 2026-08-18): a corpus page
+(`/corpus`) that is deliberately NOT a job queue — uploading creates no job and
+consumes no cluster time — with per-document profiling that says whether a
+document can answer a given question at all: chunk count at the current
+`CHUNK_TOKENS`, clause-marker density, numeric density, and a plain-language
+usability verdict on the row. Plus HTML extraction (`legislation.gov.au` serves
+HTML, and raw markup made a real Act look like it had a 0.0455 marker rate
+against a true 0.1176 — the corpus page would have called it useless), RTF
+refusal, two-scope hard checking, and a canonical entity index.
+
+**The work:**
+
+1. **Load real material.** In flight at session end: Privacy Act 1988
+   compilations (several, deliberately), amending instruments, the ISM, and
+   NIST 800-series. `docs/corpus-selection.md` should carry a ranked shortlist —
+   **read it before assuming the operator's picks are the right ones.** The open
+   argument is that OAIC privacy determinations may be a better structural proxy
+   than the ISM, because they are published findings on real personal and health
+   information incidents, i.e. what a sensitive-sector office actually *writes*,
+   whereas the Act and the ISM are what it *reads*.
+2. **Re-run the blocked measurements against it.** Boundary severance is the
+   headline: the question is whether a word-count cut severs clause pairs on
+   material that actually contains them.
+3. **Settle `--entity-rules strict` on clean source.** It is the setting most
+   likely correct for production and the only reason it is not the default is
+   that nothing clean has been measured.
+4. **The revisions experiment, which is novel.** Several compilations of one Act
+   are near-identical documents differing in small, real ways. That is the only
+   clean way to test whether the checker distinguishes **a genuine difference
+   between two sources** from **a fabrication** — and `docs/market-research.md`
+   found **no mainstream tool handles disagreeing sources at all.** Nothing is
+   built for this yet; the corpus makes it possible.
+
+**Do not treat the corpus as test fixtures.** It is the measuring instrument,
+and this project's repeated lesson (F17, F31, F39, F40, F41) is that a confident
+result from a mis-specified instrument is worse than no result.
+
+
 ### 1. ~~Join node 2~~ — DONE 2026-08-17, except the replication measurement
 
 **Completed and verified by output:**
