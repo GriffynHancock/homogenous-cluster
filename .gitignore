@@ -25,3 +25,9 @@ llama.log
 !.claude/settings.json
 !.claude/hooks/
 .claude/hook-audit.log
+
+# Benchmark output. Gitignored because the corpus files embed the OPERATOR'S
+# REAL DOCUMENT TEXT -- chunk text and summaries of actual sensitive material --
+# and this repository is published. The measurements derived from these runs
+# belong in docs/measurements.md; the raw content must never leave the box.
+bench/out/
