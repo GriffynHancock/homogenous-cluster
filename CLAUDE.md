@@ -81,6 +81,44 @@ So: when a choice is open, **run the experiment rather than picking a default**,
 and record the result in `docs/measurements.md`.
 
 
+## The model is one component, not the system
+
+**The operator's framing, and it should shape every design decision here:** think of
+this as an NLP pipeline. The LLM is a *model*. It can be made to emit things that
+are simply **inputs for scripts**. It needs a great deal of software around it to
+manage it. It is one part of the system — one that happens to also be able to act
+as a junior engineer on its own plumbing.
+
+That is not a metaphor, it is a build rule, and it decides arguments:
+
+- **Prefer deterministic code to model judgement wherever the work is computable.**
+  A number either appears in the source span or it does not; that is `in`, not
+  inference. Ask the model for the thing only it can do — reading prose — and let
+  code do arithmetic, lookup, matching and bookkeeping.
+- **Never ask the model where something came from.** Hand it a label and ask it to
+  repeat the label; resolve the label to a span in code. Asking a model for a
+  location scores ~38% on the *easier* task of merely validating one.
+- **Model output is a protocol, not an answer.** It gets parsed, validated and
+  refused — which is why `extract_content` raises on empty and on truncated text,
+  why an invented `[Section 47]` is dropped rather than rendered, and why an
+  unrecognised failure is permanent rather than retried.
+- **Measure the model from outside as well as asking it.** `/health` is the
+  server's opinion of itself, delivered through the queue it is reporting on;
+  `Restart=always` trusts the process; a port check trusts the socket — and F40
+  showed forked abort children inherit that socket, defeating all three at once.
+  Progress, measured externally, is the only signal that cannot be faked.
+  **Treat disagreement between the model's self-report and an external measurement
+  as its own fault signal.**
+- **A cheap deterministic check that resolves most cases beats an expensive
+  probabilistic one that resolves all of them.** Escalate to the classifier only
+  where the cheap signals cannot decide, and label every signal by kind so a reader
+  can see *why* something was flagged.
+
+**The corollary for the skill:** what is being packaged is not "an LLM for
+documents". It is the software that makes one usable — the queue, the chunker, the
+guards, the watchdog, the provenance, the checker. The model is swappable. The
+scaffolding is the product.
+
 ## The argument
 
 **Data sovereignty is a hard constraint, not a preference.** Many Australian
