@@ -116,7 +116,10 @@ def index(request: Request):
          # costs 1/R of throughput rather than the job, so the operator needs to
          # see WHICH endpoint went away -- otherwise the only symptom is "it got
          # slower". See _endpoint_rows.
-         "endpoints": _endpoint_rows()},
+         "endpoints": _endpoint_rows(),
+         # Browser hint only -- see extract.ACCEPT_ATTR docstring. The server
+         # keeps validating whatever actually arrives regardless of this.
+         "accept": extract.ACCEPT_ATTR},
     )
 
 
@@ -231,7 +234,8 @@ def batch_view(request: Request, batch_id: str):
         raise HTTPException(404, "no such batch")
     return TEMPLATES.TemplateResponse(
         request, "batch.html",
-        {"batch_id": batch_id, "docs": docs, "kinds": sorted(worker.PROMPTS)})
+        {"batch_id": batch_id, "docs": docs, "kinds": sorted(worker.PROMPTS),
+         "accept": extract.ACCEPT_ATTR})
 
 
 @app.post("/batch/{batch_id}/confirm")
@@ -461,12 +465,20 @@ def job_view(request: Request, job_id: str):
     citations = None
     if job["status"] == "done" and job["result"] and len(sections) > 1:
         citations = worker.parse_section_citations(job["result"], sections)
+    # Full per-attempt failure history (see db.job_failures). Fetched for
+    # every status, not just 'done' -- a 'failed' job's page already shows
+    # job.error (the last attempt), but the history behind it is useful there
+    # too ("failed on the same endpoint three times" vs "three different
+    # ones"), and it is cheap: empty for the common case of a job that never
+    # failed an attempt.
+    failures = db.get_job_failures(DB_PATH, job_id)
     return TEMPLATES.TemplateResponse(
         request, "job.html",
         {"job": job,
          "estimate": _estimate_for(job) if job["status"] == "pending" else None,
          "sections": sections,
          "citations": citations,
+         "failures": failures,
          # Rendered server-side so the page is fully correct on first load and
          # on every 15s no-JS refresh; the JS below only makes updates land
          # sooner than that, it is never the only source of this data.

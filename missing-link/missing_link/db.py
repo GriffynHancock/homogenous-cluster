@@ -192,9 +192,10 @@ def _connect(path):
 def init_db(path):
     """Create or upgrade the ENTIRE schema. Call once, at process startup.
 
-    This is the single migration entry point: jobs, chunk_summaries and
-    batch_documents all get created and upgraded here, so that after one call
-    every table this module touches is present and current.
+    This is the single migration entry point: jobs, chunk_summaries,
+    batch_documents and job_failures all get created and upgraded here, so
+    that after one call every table this module touches is present and
+    current.
 
     That is deliberate, and it is a change from how this worked. The chunk and
     batch tables used to be initialised LAZILY, from inside each read and write
@@ -226,11 +227,12 @@ def init_db(path):
         conn.executescript(INDEX_SCHEMA)
     finally:
         conn.close()
-    # The other two tables are initialised through their own functions, which
+    # The other tables are initialised through their own functions, which
     # live next to their own schemas further down this file rather than being
     # hoisted up here away from them.
     init_chunks(path)
     init_batch_documents(path)
+    init_job_failures(path)
 
 
 def create_job(path, kind, document, instruction=None):
@@ -349,10 +351,15 @@ def complete_job(path, job_id, result, metrics):
 def fail_job(path, job_id, error):
     conn = _connect(path)
     try:
+        row = conn.execute(
+            "SELECT attempts, endpoint FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
         conn.execute(
             "UPDATE jobs SET status='failed', error=?, finished_at=? WHERE id=?",
             (error, _now(), job_id),
         )
+        if row is not None:
+            _record_job_failure(conn, job_id, row["attempts"], row["endpoint"], error)
     finally:
         conn.close()
 
@@ -375,16 +382,104 @@ def schedule_retry(path, job_id, error, retry_at):
     state in the system (the backend died mid-document) would look identical to
     a job that has simply never run. started_at/finished_at are cleared so the
     next attempt's elapsed time is that attempt's, not a blend of two.
+
+    Also appends a row to job_failures (see schema below) BEFORE clobbering
+    `jobs.error` with the next attempt's message. `jobs.error` only ever holds
+    the LATEST message -- complete_job leaves it in place rather than clearing
+    it, so a job that failed once and then succeeded still has *a* trail, but a
+    single string cannot say "failed on endpoint A twice then succeeded on B",
+    and a second failure on the same job overwrites the first without a copy.
+    job_failures is the append-only copy that survives both.
     """
     conn = _connect(path)
     try:
+        row = conn.execute(
+            "SELECT attempts, endpoint FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
         conn.execute(
             "UPDATE jobs SET status='pending', error=?, retry_after=?, "
             "started_at=NULL, finished_at=NULL WHERE id=?",
             (error, retry_at, job_id),
         )
+        if row is not None:
+            _record_job_failure(conn, job_id, row["attempts"], row["endpoint"], error)
     finally:
         conn.close()
+
+
+# --- failure history ----------------------------------------------------
+# `jobs.error` (above) has always held exactly one string: whatever the most
+# recent attempt said. That is enough for a job sitting in 'pending' awaiting
+# retry (there is only one live message) or a job that failed for good on its
+# LAST attempt. It loses information the moment a job has MORE than one
+# attempt worth recording -- a job that failed on endpoint A, retried, failed
+# on endpoint A again, then succeeded on B is a genuine cluster finding ("A is
+# flaky"), and the single-string column cannot express it: each retry
+# overwrites the last, and completion leaves whatever string happened to be
+# there. This table is the append-only copy: one row per failed attempt,
+# attempt number and endpoint recorded structurally rather than parsed back
+# out of prose, so it survives both the next retry's overwrite and the job's
+# eventual success.
+#
+# Written from INSIDE schedule_retry/fail_job (same connection, so a crash
+# between the two would have to land in a few milliseconds of gap between two
+# statements on one connection) rather than added as a new call site in
+# worker.py, which this task does not touch.
+JOB_FAILURES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS job_failures (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      TEXT NOT NULL,
+    attempt     INTEGER,
+    endpoint    TEXT,
+    error       TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_failures_job
+    ON job_failures (job_id, id);
+"""
+
+
+def init_job_failures(path):
+    """Create job_failures. Called from init_db at startup ONLY -- same
+    reasoning as init_chunks/init_batch_documents: a migration on every write
+    is both wasted work and a race between concurrent per-endpoint workers
+    (see _add_missing_columns' docstring). This table has no added columns
+    yet, so it is pure CREATE ... IF NOT EXISTS, like batch_documents.
+    """
+    conn = _connect(path)
+    try:
+        conn.executescript(JOB_FAILURES_SCHEMA)
+    finally:
+        conn.close()
+
+
+def _record_job_failure(conn, job_id, attempt, endpoint, error):
+    """Append one row. Takes an OPEN connection (not a path) because both
+    call sites (schedule_retry, fail_job) must log on the SAME connection as
+    the status UPDATE they accompany, not open a second one.
+    """
+    conn.execute(
+        "INSERT INTO job_failures (job_id, attempt, endpoint, error, occurred_at) "
+        "VALUES (?,?,?,?,?)",
+        (job_id, attempt, endpoint, error, _now()),
+    )
+
+
+def get_job_failures(path, job_id):
+    """This job's full failure history, oldest first. Empty for a job that
+    has never failed an attempt -- including every job that predates this
+    table, which is the correct answer for those too (there is nothing to
+    show, not "unknown").
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT attempt, endpoint, error, occurred_at FROM job_failures "
+            "WHERE job_id=? ORDER BY id", (job_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
 
 
 def record_resume(path, job_id, n_reused):

@@ -21,6 +21,26 @@ cannot.
 
 MIN_TEXT_CHARS = 200
 
+# What extract() actually accepts, expressed as an HTML <input accept="...">
+# value: PDF (with a text layer) or plain text -- any extension or none,
+# since plain text is recognised by the ABSENCE of a binary signature, not by
+# filename (see sniff()). .txt/.md/.csv are the extensions named in this
+# module's own refusal message below; listed here so the browser's file
+# picker and the refusal message agree on the same set.
+#
+# Extensions AND MIME types are both listed deliberately: per MDN, macOS and
+# Windows file pickers do not honour the same half of the attribute
+# consistently, and some Safari/WebKit versions have been reported to filter
+# inconsistently on extension alone (Apple Developer Forums thread 761110,
+# accept=".pdf,.hwp" filtered correctly on Mac but not iPad). Combining both
+# is the documented mitigation.
+#
+# This is a browser HINT ONLY -- see the caveat in app.py where this is
+# wired into templates. extract() itself performs no filename or
+# accept-based check; it sniffs bytes, so nothing here can become the real
+# filter by construction.
+ACCEPT_ATTR = ".pdf,application/pdf,.txt,text/plain,.md,text/markdown,.csv,text/csv"
+
 # Magic bytes. Cheap, and far more reliable than trusting a filename extension
 # from a Windows desktop.
 SIGNATURES = {

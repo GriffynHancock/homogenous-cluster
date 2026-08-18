@@ -53,8 +53,8 @@
     <label for="instruction_{{ k }}">Instructions for “{{ k }}” jobs</label>
     <textarea name="instruction_{{ k }}" id="instruction_{{ k }}"
       placeholder="Optional guidance for the {{ k }} workflow…"></textarea>
-    <label for="guidance_file_{{ k }}">…or a guidance file for “{{ k }}” jobs</label>
-    <input type="file" name="guidance_file_{{ k }}" id="guidance_file_{{ k }}">
+    <label for="guidance_file_{{ k }}">…or a guidance file for “{{ k }}” jobs (same formats: PDF or plain text)</label>
+    <input type="file" name="guidance_file_{{ k }}" id="guidance_file_{{ k }}" accept="{{ accept }}">
   {% endfor %}
 </fieldset>
 

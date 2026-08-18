@@ -219,6 +219,53 @@
   <pre>{{ job.instruction }}</pre>
 {% endif %}
 
+{% if failures %}
+  {# One row per failed ATTEMPT (not just the latest -- see db.job_failures).
+     Shown regardless of the job's current status: for a 'done' job this is
+     the whole point (a completed job that had trouble is otherwise
+     indistinguishable from one that never did); for 'pending'/'failed' it
+     adds the attempts BEFORE the one job.error already shows below. #}
+  <details {% if job.status == "done" %}open{% endif %}
+      style="border:1px solid var(--line);border-radius:8px;padding:.6rem 1rem;margin:.6rem 0 1.2rem">
+    <summary style="cursor:pointer;font-size:.85rem;color:var(--mut)">
+      {% if job.status == "done" %}
+        <strong style="color:var(--fg)">Succeeded after {{ failures|length }}
+        failed attempt{{ "s" if failures|length != 1 }}.</strong> What went wrong before it recovered:
+      {% else %}
+        Failure history — {{ failures|length }} failed attempt{{ "s" if failures|length != 1 }}
+      {% endif %}
+    </summary>
+    <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Attempt</th><th>Endpoint</th><th>When</th><th>Error</th></tr></thead>
+      <tbody>
+      {% for f in failures %}
+        <tr>
+          <td>{{ f.attempt if f.attempt is not none else "—" }}</td>
+          <td>{{ f.endpoint or "—" }}</td>
+          <td>{{ f.occurred_at[:19].replace("T"," ") if f.occurred_at else "—" }}</td>
+          <td style="font-size:.8rem">{{ f.error }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </details>
+{% elif job.status == "done" and job.error %}
+  {# A job completed before job_failures existed (attempts>1, error left on
+     the row by schedule_retry, no rows here to show) -- e.g. 6c0358825609 in
+     this cluster's own history, attempts=2/resumed_chunks=4 with no per-
+     attempt log because it ran before this table did. jobs.error is the
+     only surviving evidence for those; show it rather than showing nothing
+     just because the newer, richer table has no backfilled rows. #}
+  <div style="border:1px solid var(--line);border-radius:8px;padding:.6rem 1rem;margin:.6rem 0 1.2rem">
+    <p style="margin:0 0 .3rem;font-size:.85rem"><strong>This job had trouble before
+      completing.</strong> Recorded before per-attempt history existed, so only the
+      last message survives:</p>
+    <pre style="margin:0;font-size:.8rem">{{ job.error }}</pre>
+  </div>
+{% endif %}
+
 {% if job.status == "failed" %}
   <div style="border:1px solid #c0392b;border-radius:8px;padding:.9rem 1.1rem;
        margin:.6rem 0 1.2rem;background:color-mix(in srgb, #c0392b 8%, transparent)">

@@ -1,7 +1,7 @@
 # Homogenous Cluster - Heterogeneous Future
 
 **Turning the old computers an organisation already owns into a private LLM
-cluster — for the work it legally cannot send offsite.**
+cluster for the work it legally cannot send offsite.**
 
 **Now:** connect seven unused office machines into a single cluster that does
 real work on real sensitive documents.
@@ -9,66 +9,41 @@ real work on real sensitive documents.
 **Later:** package what that teaches into a Claude Skill, so an organisation
 without a specialist can do the same thing with whatever hardware it has.
 
-The cluster comes first, and not only for sequencing reasons — a skill that
-dispenses unmeasured advice would be worse than no skill at all. Everything it
-eventually recommends should trace back to something measured here.
-
 ---
 
 ## The problem
 
-Many Australian organisations in health, legal, education, government, and community services cannot send sensitive data offsite due to statutory or contractual constraints. Yet the tasks that would benefit most from AI—summarising case files, searching correspondence, and drafting from source documents—are precisely those involving protected data, leaving much of the workflow manual.
+Many Australian organisations in health, legal, education, government, etc. cannot send many documents off site through the open internet. 
+As a result, workflows involving AI like document summary and reasoning that would immediately benefit organisations are out of reach without significant spend on compute infrastructure or australian sovereign cloud services. These workflows are the low hanging fruit busywork that even people relatively against AI use can agree are beneficial, saving work hours.
 
-## The observation
+## The solution
 
-On-premises infrastructure is often prohibitively expensive to operate, with ongoing costs for power, cooling, security, maintenance, and specialist staff. But many organisations already have unused computers from recent refresh cycles; pooling this hardware into a secure or air-gapped local cluster could provide enough capacity to run language workloads without sending data elsewhere. Slow is acceptable when the alternative is work that never gets done.
+Repurpose decommissioned hardware that an organisation has used in previous installations (desktop workstations, laptops, etc.) to create local private inference appliances. That is to say a specialised compute cluster that allows the organisation to utilise these tools in their workflows. Things like document summary and document reasoning can be done overnight, so my thesis is that even 10 year old hardware would be beneficial to utilise. The goal here is not to use a chatbot, its to get LLMs to do slow work 24/7 that save work hours every day, preferably with $0 of additional hardware.
 
 ---
 
 ## The cluster — the immediate deliverable
 
-**Seven surplus desktops — ~128 GB DDR4 ECC each, roughly 900 GB of pooled
+**Seven Frankenstein's monster desktops — ~128 GB DDR4 ECC each, roughly 900 GB of pooled
 RAM — wired into one machine that can run models no single one of them could
 touch.** Fronted by **Missing Link**: an async job runner where slowness stops
 being a defect. Submit documents, collect results later.
 
-Every one of those machines was sitting in a store room. Acquisition cost:
-zero. They are already inventoried, already depreciated, already inside the
-building.
+These machines are made of the parts of many other machines sitting in a storeroom, 
+the cream of the crop components (if the crop is a dusty shelf). 
+Acquisition cost:
+zero. 
+They are already inventoried, already depreciated, already inside the
+building, just need them tested and tagged.
 
 This is the actual build, not a demo of a future product. It should do real
-work on real documents. The skill comes out of what it teaches.
+work on real documents. The skill comes out of what I learn.
 
-Three technical facts do most of the work. All three are now **measured on the
-hardware**, not taken from datasheets:
+There are two ways of running, to prioritise a smarter model running across more nodes, 
+or a lot of smaller models doing batch processing.
+And the setup and workflows are hardware agnostic and scale dynamically as nodes are added, changed and removed.
 
-1. **Active parameters set speed; total parameters set capacity.** Bytes read
-   per token ≈ active params × bits-per-weight; everything else is storage.
-   A sparse MoE model with 32B active parameters is tractable on system RAM
-   even at 550 GB total. A 70B dense model is not. This is also why *newer and
-   bigger* can be actively worse — a 2.8T model with 104B active runs ~3×
-   slower than a 1T model with 32B active.
-2. **Pooling buys capacity, not speed.** Split one model across the fleet and
-   the machines run in sequence per request. Seven machines behave like one
-   machine with seven times the RAM. That is the point: **it exists to hold
-   what one machine cannot.**
-3. **But running the same model on every machine buys speed, linearly.** When a
-   model does fit on one box, seven independent copies serve seven jobs at once
-   — and summarising a long document is dozens of independent chunk summaries,
-   so it parallelises perfectly. Measured: replication ≈ 7×, batching 1.79×,
-   pooling 1×.
-
-So the fleet has **two gears**. Pool the machines to reach a model nothing else
-in the building could run; replicate across them to chew through volume. Which
-gear you are in depends on one number — whether the model fits on a single node.
-
-**The design does not assume seven.** Two values describe any fleet: `S`
-machines per copy (`ceil(model_size / usable_RAM_per_node)`) and `R` independent
-copies (`floor(N / S)`), giving aggregate throughput ≈ `R ×` single-node. Seven
-is what this organisation had in the cupboard. The same build works with three,
-or twelve.
-
-## Running the cluster
+## Running the cluster (experimental, not the normal high security setup, this is for other tinkerers to try this out before i finish it.)
 
 Clone onto the **coordinator** — the node that will run `llama-server` — and
 drive everything from there:
@@ -111,10 +86,7 @@ sudo ./provisioning/setup.sh <hostname>   # idempotent
 ./bench/two-node-smoke.sh <new-ip>        # multi-worker RPC gate
 ```
 
-**The 1 → 2 transition is where all the risk lives.** RPC only enters the
-picture at two nodes; version, libc and ISA lockstep only start to matter then;
-upstream bugs triggered by two or more workers only become possible then. Test
-all of it at two machines — nothing new appears at the tenth.
+## --- Below is for LLM's to read. ---
 
 ## Reading order
 
