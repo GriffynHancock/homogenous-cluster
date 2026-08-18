@@ -5,10 +5,23 @@
 
 ## At a glance — read this before touching anything
 
+**Principle, stated so the next edit here doesn't reintroduce the bug that
+made it necessary: a handoff document must not assert state that a
+concurrent session can invalidate — it should say how to check.** An earlier
+version of this file said, as fact, "60 commits are unpushed... the repo has
+NOT been pushed as of this entry." That was true when the sentence was
+written and false minutes later, once a concurrent session pushed — the next
+reader had no way to know which. So: git push state, test counts, which
+service is running what, disk free and queue depth are given below as
+**commands to run**, not as facts asserted outright. Where a last-observed
+value is genuinely informative it is kept, but labelled with when it was
+observed and named plainly as a snapshot, not a fact.
+
 | | |
 |---|---|
 | **What this is** | An **N-node**, CPU-only llama.cpp cluster doing real work on real sensitive documents, fronted by **Missing Link** — an async job queue where slowness is not a defect. `CLAUDE.md` has the argument and the standing constraints. |
-| **What is running** | `llama-server` on **nodes 1 and 2**, `rpc-server@50052` on both, and **Missing Link** on the coordinator (node 1) — all as systemd units. N = 2. Details, and what was and was not re-verified this session, in the two sections below. |
+| **Check before trusting anything below** | **Push state:** `git fetch -q origin && echo "ahead: $(git log --oneline origin/main..HEAD \| wc -l)  behind: $(git log --oneline HEAD..origin/main \| wc -l)"`. **Test count:** `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1`. **Node 1 services:** `systemctl is-active llama-server@8080 missing-link rpc-server@50052`. **Node 2 services + engine:** `ssh debian1@<node2-ip> 'systemctl is-active llama-server@8080 rpc-server@50052; grep LLAMA_BIN /etc/default/llama-server'` — node 2's engine has flipped mid-session at least once (see "Where things stand" below); a stale reading of it is wrong, not just old. **Is fan-out actually in use:** `grep LLAMA_URLS /etc/default/missing-link` — the code fans out across R endpoints, but this variable has been observed unset (silent single-endpoint fallback) more often than set; the code being merged does not mean it is live. **Disk free:** `df -h /` on each node. |
+| **What is running** | `llama-server` on **nodes 1 and 2**, `rpc-server@50052` on both, and **Missing Link** on the coordinator (node 1) — all as systemd units. N = 2. This is the steady-state shape; use the row above to confirm it is actually true right now rather than trusting this sentence. |
 | **Which engine, and why** | **MAINLINE llama.cpp b10369** (`/opt/llama.cpp/bin`), fleet-wide. **Not ik_llama.cpp** — it was adopted on a prefill win (F27) and then dropped, because it fatal-errors on the 5th request of any `--parallel 4` job, i.e. on any document longer than four chunks, leaving a hang `Restart=always` cannot see (**F40**). ik stays installed at `/opt/ik_llama.cpp/bin` for the still-untested `--parallel 1` configurations only. **Do not point a serving node at it.** |
 | **Next task** | **§0, the corpus-driven benchmark** — the operator's stated priority. Re-run the three measurements that were blocked or weakened by the corpus (chunk-boundary severance, the entity signal's false-positive rate, the faithfulness cascade) against the real public documents now on the `/corpus` page — legislation, standards, regulator determinations — instead of the two narrative texts every earlier measurement had to use. Full brief under **NEXT TASKS, in order** below. |
 | **Never do this to the live services** | Do not stop, restart or reconfigure `llama-server`, `rpc-server@50052` or `missing-link` without first checking whether a job is running — a restart destroys that job's in-flight work, which is exactly how F39 lost 10m55s of completed work. Do not benchmark a node while it or its peer is doing real work. Never `pkill -f`; never `git add -A` — `.claude/hooks/cluster-guard.py` blocks both, and gates service control, `git push`, writes to `/opt/models`, and mutating SQL against the live job store. |
@@ -34,14 +47,17 @@ backend failure, live per-chunk telemetry with separate prefill/generation
 rates, per-workflow guidance (text or file), section-level citations on the
 reduce output, a revive route, a per-job failure-history table, and a
 deterministic faithfulness cascade, a corpus benchmark page and the
-provenance/licence gap it surfaced — **552 tests** (`cd missing-link &&
-.venv/bin/python -m pytest tests/ -q`, reproduced this session: 0 failures, 25s; up from 469 at
-the previous entry — the corpus feature added its own test files). **45
-findings** in `docs/FINDINGS.md` (F45 landed this session). **60 commits are
-unpushed to `origin/main`** (confirmed `git rev-list --count
-origin/main..main` after an explicit `fetch`, this session — up from the
-previous entry's 50; **the repo has NOT been pushed as of this entry**).
-**Repo:** https://github.com/GriffynHancock/homogenous-cluster
+provenance/licence gap it surfaced. **Test count and push state are
+deliberately not asserted here as current fact — see "Check before trusting
+anything below" in the at-a-glance table for the commands.** As last
+observed, 2026-08-18 afternoon: **552 tests** (`cd missing-link &&
+.venv/bin/python -m pytest tests/ -q`, 0 failures, 25s; up from 469 at the
+previous entry — the corpus feature added its own test files), **45
+findings** in `docs/FINDINGS.md` (F45 landed this session), and **60 commits
+ahead of `origin/main`**, none behind. That last figure is exactly the kind
+of claim that goes stale between sessions — it did, within the same day, and
+the correction is why push state is no longer stated as fact anywhere in
+this file. **Repo:** https://github.com/GriffynHancock/homogenous-cluster
 
 **THE REPLICATION MEASUREMENT IS DONE, AND IT PASSES.** Aggregate throughput
 across two independent `llama-server`s running gpt-oss-120b: **~1.8× on two nodes,
@@ -588,15 +604,15 @@ second replica, `10.10.0.39`)** — both provisioned, both serving.
 
 | Item | node 1 | node 2 |
 |---|---|---|
-| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` — **the ENGINE ACTUALLY SERVING (F40)**, confirmed this session from `/etc/default/llama-server`'s `LLAMA_BIN=` | **mainline, but this moved during this session — see the box below the table before trusting a snapshot of this row** |
-| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` — **kept installed, NOT the default any more.** Old config backed up at `/etc/default/llama-server.ik.bak` (confirmed on node 1 this session) | kept installed; **actually serving 16:29–18:24 this session** (see below) |
-| `rpc-server@50052` | active, `-t 4`, user `cluster` — confirmed by direct check this session | **active**, confirmed by direct SSH this session (`systemctl is-active` → `active`) — the chunk-size sweep that left it stopped is over |
-| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB), **Qwen3-Next-80B-A3B-Instruct UD-Q8_K_XL — download now COMPLETE, both shard files present, ~93 GB total** (confirmed by `ls` this session; the previous entry's "26%" is stale) | **gpt-oss-120b, md5-verified** (not re-checked) |
-| SSH | password auth still ON (no key installed until this session) | **key-only, hardened** |
-| Disk free | **248 GB** (`df -h /`, confirmed this session) | **375 GB** (`df -h /`, confirmed this session by direct SSH — down from the previous entry's 437 GB, consistent with the corpus/model activity recorded above) |
-| Missing Link | job store + worker + web API, fan-out across R endpoints (code merged but **`LLAMA_URLS` unset — only node 1 is actually used, confirmed this session from `/etc/default/missing-link`**, see task 2 above), queue control, resumable per-chunk persistence, automatic retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table, a corpus benchmark page — **552 tests**. Confirmed running the current code: `ActiveEnterTimestamp` **17:44:47** (confirmed this session — later than the previous entry's 11:53:31, i.e. the service was restarted again since then, consistent with the corpus feature going live) | n/a (coordinator only) |
-| Phase 0 gate | **PASSED** | — |
-| #26500 gate | **PASSED across both machines** (F31) | — |
+| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` — **the ENGINE ACTUALLY SERVING (F40)**. Snapshot, observed 2026-08-18 afternoon from `/etc/default/llama-server`'s `LLAMA_BIN=`. Re-check: `grep LLAMA_BIN /etc/default/llama-server` | **mainline as last observed, but this moved during the same session — see the box below the table, and re-check with `ssh debian1@<node2-ip> 'grep LLAMA_BIN /etc/default/llama-server'` before trusting this cell** |
+| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` — **kept installed, NOT the default any more.** Old config backed up at `/etc/default/llama-server.ik.bak` (snapshot, node 1, 2026-08-18 afternoon) | kept installed; **actually serving 16:29–18:24 on 2026-08-18** (see below) |
+| `rpc-server@50052` | snapshot 2026-08-18 afternoon: active, `-t 4`, user `cluster`. Re-check: `systemctl is-active rpc-server@50052` | snapshot 2026-08-18 afternoon: **active** (`systemctl is-active` → `active`) — the chunk-size sweep that left it stopped is over. Re-check: `ssh debian1@<node2-ip> 'systemctl is-active rpc-server@50052'` |
+| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB), **Qwen3-Next-80B-A3B-Instruct UD-Q8_K_XL — download COMPLETE as of 2026-08-18 afternoon**, both shard files present, ~93 GB total (`ls /opt/models`; the previous entry's "26%" is stale) | **gpt-oss-120b, md5-verified as of 2026-08-17** (not re-checked since) |
+| SSH | password auth still ON as of 2026-08-18 (no key installed until that session) | **key-only, hardened** |
+| Disk free | snapshot 2026-08-18 afternoon: **248 GB**. Re-check: `df -h /` | snapshot 2026-08-18 afternoon: **375 GB**, down from the previous entry's 437 GB, consistent with the corpus/model activity recorded above. Re-check: `ssh debian1@<node2-ip> 'df -h /'` |
+| Missing Link | job store + worker + web API, fan-out across R endpoints (code merged, but as of 2026-08-18 afternoon **`LLAMA_URLS` was unset — only node 1 actually used**; see task 2 above and re-check with `grep LLAMA_URLS /etc/default/missing-link`), queue control, resumable per-chunk persistence, automatic retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table, a corpus benchmark page. Test count and service-restart timestamp are snapshots, not facts — re-run `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1` and `systemctl show missing-link --property=ActiveEnterTimestamp` yourself; as last observed (2026-08-18 afternoon) these were **552 tests** and `ActiveEnterTimestamp` **17:44:47**, later than the previous entry's 11:53:31, i.e. the service had been restarted again since then, consistent with the corpus feature going live | n/a (coordinator only) |
+| Phase 0 gate | **PASSED**, 2026-08-12 — a one-time validation, not a live status | — |
+| #26500 gate | **PASSED across both machines** (F31), 2026-08-17 — a one-time validation, not a live status | — |
 
 **Node 2's engine changed while this session was checking it, and that is worth
 recording plainly rather than smoothing over.** Direct SSH checks, in order:
@@ -796,7 +812,7 @@ on a 131.8 GB node trivially and does not threaten the S=1 budget.
 | ISA | AVX2, FMA, F16C. **No AVX-512** | **identical** |
 | RAM | **131.8 GB** — 4 × 32 GB DDR4-2400, all four channels | **identical, confirmed by `dmidecode`** |
 | **Achievable bandwidth** | **28.4 GB/s** (STREAM, 2026-08-17 re-run; 28.2 on 08-12) | **27.9 GB/s** |
-| Disk | NVMe 477 GB — **367 GB free**, re-check `df -h /` | NVMe 477 GB — **437 GB free** |
+| Disk | NVMe 477 GB — **367 GB free as of 2026-08-17** (snapshot; superseded by the more recent 248 GB in "Where things stand" above). Re-check: `df -h /` | NVMe 477 GB — **437 GB free as of 2026-08-17** (snapshot; superseded by the more recent 375 GB above). Re-check: `ssh debian1@<node2-ip> 'df -h /'` |
 | Board | LENOVO 30B2S2E800 (ThinkStation P510) | **identical** |
 | Network | **100 Mb/s** (not gigabit — F28), `10.10.0.34/24` on `eno1` | **100 Mb/s**, `10.10.0.39/24` |
 | Hostname | `debian1` (inconsistent with `nodes.env`, left alone) | `node2` |

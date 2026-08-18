@@ -32,7 +32,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | File | What it is | Authority |
 |---|---|---|
-| `STATUS.md` | **Start here.** What is running right now, the next task, blockers. Its first screen is designed to be enough | current |
+| `STATUS.md` | **Start here.** What is running right now, the next task, blockers. Its **at-a-glance table**, near the top, is designed to carry every fact you need before touching anything — including the commands to check what is currently true, since a hand-edited status line goes stale the moment a concurrent session changes something. The rest of the file (over 1000 lines) is detail, not a second orientation pass you are expected to read cold | current |
 | `docs/FINDINGS.md` | Numbered findings from running this on hardware, incl. what the plan got **wrong**. **Indexed at the top** — scan the index, read the ones that touch your task | **outranks every other file** |
 | `docs/measurements.md` | Every measured number. **No performance claim may be quoted from anywhere else** | authoritative for numbers |
 | `network.md` | **Gitignored, site-specific.** IPs, node roles, ports, access. Read it; never commit it | current |
