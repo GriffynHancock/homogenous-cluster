@@ -3,6 +3,22 @@
 {% block sub %}Job <code>{{ job.id }}</code> — {{ job.kind }}
   <span class="badge {{ job.status }}">{{ job.status }}</span>{% endblock %}
 {% block body %}
+<style>
+  /* Section-level citation markers in the result. Deliberately quiet: per
+     arXiv:2501.01303 a citation raises perceived trust EVEN WHEN RANDOM, so a
+     marker that shouts is actively harmful here. It should look like a
+     footnote to follow, not a seal of approval. */
+  a.cite { display:inline-block; margin:0 .05rem; padding:0 .3rem; font-size:.72em;
+           vertical-align:.35em; line-height:1.5; border:1px solid var(--line);
+           border-radius:4px; text-decoration:none; color:var(--mut); }
+  a.cite:hover, a.cite:focus { color:var(--accent); border-color:var(--accent); }
+  .cite-note { border-left:3px solid var(--line); padding:.1rem 0 .1rem .9rem;
+               margin:.7rem 0 1.4rem; color:var(--mut); font-size:.85rem; }
+  .cite-note p { margin:.5rem 0; }
+  .cite-note code { font-size:.9em; }
+  .cite-drop { color:#b8860b; }
+  details:target { border-color:var(--accent) !important; }
+</style>
 {# "Retry now" / "Resume" -- an explicit OPERATOR OVERRIDE for a terminal job.
    Shared between the failed and cancelled branches below so the two states
    cannot drift into inconsistent copy. See app.py's _revive_preview and
@@ -223,7 +239,56 @@
     <a href="/jobs/{{ job.id }}/text">copy box</a> ·
     <a href="/jobs/{{ job.id }}/result">plain text</a> ·
     <a href="/api/jobs/{{ job.id }}">JSON</a></span></h3>
-  <pre>{{ job.result }}</pre>
+  {% if citations %}
+    {# Rendered from parsed segments rather than job.result whenever this was a
+       multi-chunk job, EVEN IF nothing resolved: the parser has already excised
+       any invented marker, and dumping the raw text instead would put
+       "[Section 47]" back on the page looking exactly like a citation. The raw
+       text is still available verbatim behind the copy box / plain text /
+       JSON links above -- this page shows what can be stood behind, those
+       show what the model actually wrote. #}
+    <pre>{% for seg in citations.segments %}{% if seg.kind == "text" %}{{ seg.text }}{% else %}<a class="cite" href="#section-{{ seg.section }}"
+      title="Section {{ seg.section }}, characters {{ seg.start }}–{{ seg.end }} of the source. The model said this paragraph drew on that section. Nothing has checked that the section supports it.">{{ seg.section }}</a>{% endif %}{% endfor %}</pre>
+
+    <div class="cite-note">
+      {% if citations.has_citations %}
+        <p><strong>What the numbers mean, and what they do not.</strong>
+        A number is the section the model said that paragraph drew on. It links to
+        that section below, and to the exact character range of the source it
+        covers. <strong>That is a claim about where the model looked — not a check
+        that the section actually supports the sentence.</strong> Nothing here has
+        verified it; only reading the section does that. Treat a number as "start
+        reading here", not as a guarantee.</p>
+      {% else %}
+        <p><strong>No citations in this result.</strong> The reduce step was asked
+        to tag each paragraph with the section it drew on, and this result carries
+        no usable tag. The summary is not wrong and is not incomplete — it is
+        simply unattributed, exactly as every result was before this feature
+        existed. To check a claim, use the section list below and find the span by
+        hand.</p>
+      {% endif %}
+      {% if citations.dropped_count %}
+        <p class="cite-drop"><strong>{{ citations.dropped_count }} marker{{ "s" if citations.dropped_count != 1 }} dropped.</strong>
+        The model cited
+        {% for d in citations.dropped %}<code>{{ d.marker }}</code>{% if d.count > 1 %} ×{{ d.count }}{% endif %}{% if not loop.last %}, {% endif %}{% endfor %},
+        but this document has {{ sections|length }} section{{ "s" if sections|length != 1 }}.
+        {{ "They were" if citations.dropped_count != 1 else "It was" }} removed rather
+        than linked: a link to a section that does not exist would point somewhere
+        real-looking and wrong, which is worse than no citation. A result that drops
+        many markers is worth looking at — the model is not following the labels it
+        was given.</p>
+      {% endif %}
+      {% if citations.unparsed_count %}
+        <p class="cite-drop">{{ citations.unparsed_count }} marker-shaped
+        phrase{{ "s were" if citations.unparsed_count != 1 else " was" }} left as plain
+        text, not in the <code>[Section N]</code> form and so not resolvable:
+        {% for u in citations.unparsed %}<code>{{ u.marker }}</code>{% if u.count > 1 %} ×{{ u.count }}{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}.
+        Left in place rather than deleted — it is the model's own text.</p>
+      {% endif %}
+    </div>
+  {% else %}
+    <pre>{{ job.result }}</pre>
+  {% endif %}
 {% endif %}
 
 {% if sections %}
@@ -232,7 +297,10 @@
   document is only usable if you can check it. Each section below records the exact
   character range of the original it came from.</p>
   {% for s in sections %}
-    <details style="border:1px solid var(--line);border-radius:6px;padding:.6rem;margin-bottom:.5rem">
+    {# id is what a [Section N] citation in the result links to. N is idx+1 --
+       the same binding parse_section_citations resolves through, so the link
+       target and the cited span are the same chunk by construction. #}
+    <details id="section-{{ s.idx + 1 }}" style="border:1px solid var(--line);border-radius:6px;padding:.6rem;margin-bottom:.5rem">
       <summary>Section {{ s.idx + 1 }}
         <code style="color:var(--mut);font-size:.8rem">chars {{ s.start_char }}–{{ s.end_char }}</code></summary>
       <p>{{ s.summary }}</p>
@@ -319,6 +387,26 @@
   // Belt-and-braces: stop even if the terminal-state check above never fires
   // (e.g. this tab is backgrounded through the actual completion).
   window.addEventListener("pagehide", function () { clearInterval(timer); });
+})();
+</script>
+{% endif %}
+
+{% if citations and citations.has_citations %}
+<script>
+// Progressive enhancement ONLY. Without it, clicking a citation still jumps to
+// the right <details> (it has the id, and :target highlights it) -- the reader
+// then clicks the disclosure triangle themselves. With it, the section is
+// already open when they arrive, which is the whole point of "get from a claim
+// to its source span". Nothing on this page depends on it running.
+(function () {
+  "use strict";
+  function openTarget() {
+    if (!window.location.hash) return;
+    var el = document.getElementById(window.location.hash.slice(1));
+    if (el && el.tagName === "DETAILS") { el.open = true; el.scrollIntoView(); }
+  }
+  window.addEventListener("hashchange", openTarget);
+  openTarget();
 })();
 </script>
 {% endif %}

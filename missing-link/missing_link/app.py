@@ -447,11 +447,26 @@ def job_view(request: Request, job_id: str):
         db.mark_seen(DB_PATH, job_id)
         job = db.get_job(DB_PATH, job_id)
     sections = db.get_chunk_summaries(DB_PATH, job_id)
+    # Section-level citations (Tier B, docs/citation-research.md). Resolved HERE,
+    # at render time, rather than stored: it is a regex over the result plus a
+    # dict lookup on offsets that are already persisted, so there is nothing to
+    # migrate, nothing to keep in sync, and jobs that finished before this
+    # existed render correctly as "no citations" instead of needing a backfill.
+    #
+    # Only for a multi-chunk job. A single-chunk document never runs a reduce
+    # step (summarise_traced returns the one map output directly), so it was
+    # never asked for markers and their absence says nothing about the model --
+    # a distinction the page has to make, or every short document looks like the
+    # model ignored the instruction.
+    citations = None
+    if job["status"] == "done" and job["result"] and len(sections) > 1:
+        citations = worker.parse_section_citations(job["result"], sections)
     return TEMPLATES.TemplateResponse(
         request, "job.html",
         {"job": job,
          "estimate": _estimate_for(job) if job["status"] == "pending" else None,
          "sections": sections,
+         "citations": citations,
          # Rendered server-side so the page is fully correct on first load and
          # on every 15s no-JS refresh; the JS below only makes updates land
          # sooner than that, it is never the only source of this data.
