@@ -18,6 +18,15 @@
 #   WATCHDOG_GRACE / _RPC_GRACE       unbroken suspect seconds before restarting
 #   WATCHDOG_HEARTBEAT_URL            optional POST target for the dead-man's switch
 #   WATCHDOG_DRY_RUN=1                decide and log, never restart
+#   WATCHDOG_NPROCS_LLAMA / _RPC      process-count baseline (default 2 / 1);
+#                                     the F40 abort-fork tripwire
+#   WATCHDOG_ABORT_GRACE              confirming seconds for an nprocs anomaly
+#                                     before restarting (default 90)
+#   WATCHDOG_SYNTH_ENABLE=0           disable the synthetic transaction (default on)
+#   WATCHDOG_SYNTH_INTERVAL_S         min seconds between synth attempts/unit (900)
+#   WATCHDOG_SYNTH_MAX_TOKENS         synth completion token budget (default 96)
+#   WATCHDOG_SYNTH_TIMEOUT_S          synth HTTP timeout, seconds (default 60)
+#   WATCHDOG_SYNTH_FAIL_STREAK        consecutive failed attempts before acting (2)
 #
 # ===========================================================================
 # WHY THIS EXISTS
@@ -155,6 +164,136 @@
 # discipline CLAUDE.md asks for between the queue and the task profiles.
 #
 # ---------------------------------------------------------------------------
+# 2026-08-18: WHY THE SERVER'S OWN OPINION OF ITSELF IS NOT ENOUGH, AND WHAT
+# WAS ADDED. Framed by the operator directly: "why are we depending so much
+# on the backend to report itself?" -- which is the disease behind every
+# incident logged above. `/health` is the server's opinion of itself, routed
+# through the very queue it is meant to be reporting on (F39); `Restart=
+# always` trusts the process table; a port check trusts the listen backlog --
+# and F40 showed all three defeated AT ONCE by one mechanism: a forked
+# ggml_abort() backtrace child that deadlocks, never exits, and INHERITS the
+# listening socket. Two things were added, cheapest first, both additive to
+# every check above rather than replacing any of them:
+#
+# 1. THE F40 TRIPWIRE (nprocs). Free -- it reads a number already being
+#    fetched for SRVPID discovery, no new probe, no new round trip. A forked
+#    child is a real process and gets its own entry in the unit's
+#    cgroup.procs; a thread never does. MEASURED baseline, both nodes,
+#    servers healthy and BUSY (400% of a core, so this is not an idle-only
+#    artefact): llama-server@.service = 2 procs (the `sh -c` wrapper + the
+#    server), rpc-server@.service = 1 proc (no wrapper). A count ABOVE
+#    baseline, confirmed on a second sample ABORT_GRACE seconds later
+#    (default 90s -- shorter than GRACE's 300s because this is structural
+#    evidence, not an absence-of-response inference), goes straight to
+#    WEDGED. CONFIRMED LIVE 2026-08-18: this is not an ik_llama.cpp-only
+#    hazard -- `/opt/llama.cpp/src/ggml/src/ggml.c` (the mainline binary this
+#    fleet now runs, per F40's own reversal) has the IDENTICAL
+#    fork()/waitpid(child_pid, NULL, 0) code at the same call site. Moving off
+#    ik_llama.cpp did not retire this risk; whatever next triggers a
+#    ggml_abort() on mainline can reproduce F40 exactly. This check is the
+#    fleet's only coverage for that until upstream changes the mechanism, and
+#    it is now the same check for BOTH llama-server and rpc-server, since
+#    both link the same libggml.
+#
+# 2. THE SYNTHETIC TRANSACTION (`synth`, llama-server only -- see the ladder
+#    note below for why rpc-server does not get one). A tiny real completion,
+#    issued by `llama-watchdog-agent.sh`'s `synth` verb against
+#    127.0.0.1:<port> only, content-validated with the SAME rules
+#    `missing_link/worker.py:extract_content` enforces on every real chunk --
+#    empty content is a failure (F21), non-empty content with
+#    finish_reason="length" is a failure (F34's truncation, not merely a
+#    formatting quirk), and a model that spent its whole budget on
+#    reasoning_content with nothing in content is the same failure by a
+#    different route. Ported deliberately rather than imported, so the agent
+#    stays a dependency-free script deployable to a bare node -- see the
+#    agent's own comment for the cost this seam carries. This is the one
+#    check nothing else in the ladder can substitute for: on MAINLINE,
+#    `/health` never touches the inference queue at all
+#    (`docs/watchdog-research.md` Q1) -- it is a lambda over a server-state
+#    variable, which is why it is cheap AND why answering proves nothing
+#    about whether a completion actually works. Only a live tokenizer ->
+#    queue -> compute -> detokenize -> response round trip can do that, and a
+#    listen backlog cannot fake generated text the way it can fake an open
+#    port.
+#
+#    ESCALATION LADDER (cheapest first, each rung reached only when the
+#    previous one is ambiguous or clean):
+#
+#      CPU progress -> nprocs tripwire -> /health -> synthetic transaction
+#
+#    The synthetic transaction sits behind /health deliberately: it is
+#    reached ONLY on the branch where the unit already looks perfectly
+#    healthy by every cheaper signal (idle, nprocs at baseline, /health
+#    answers) -- which is exactly the blind spot this closes, and exactly why
+#    it inherits F39's CPU-first discipline rather than adding a new one: it
+#    is NEVER issued while the CPU sample showed load, because that branch
+#    returns long before this code is reached.
+#
+#    COST AND RATE-LIMITING. A synthetic transaction competes with real work
+#    for one of four --parallel slots, so it is deliberately kept small and
+#    rare: WATCHDOG_SYNTH_INTERVAL_S (default 900s) bounds it to at most 4
+#    attempts/hour/unit, and WATCHDOG_SYNTH_MAX_TOKENS (default 96, sized
+#    against worker.py's OWN measured gpt-oss reasoning-token range of
+#    49-129 tokens) bounds each attempt's generation cost. From documented
+#    rates (F17/F24/F27) that is a WORST CASE of roughly 16s of one slot,
+#    every 15 minutes -- under 2% duty cycle on a quarter of the server's
+#    capacity. STATED AS AN ESTIMATE, NOT MEASURED: both fleet nodes were
+#    running real document jobs throughout this change (a hard constraint of
+#    the task that built it), so this has not yet been timed live. Run once a
+#    node is idle:
+#      curl -s -w '\ntotal=%{time_total}s\n' localhost:8080/v1/chat/completions \
+#        -H 'Content-Type: application/json' -d \
+#        '{"messages":[{"role":"user","content":"Reply with the single word: OK."}],"max_tokens":96,"reasoning_effort":"low"}'
+#    and separately time `/usr/local/sbin/llama-watchdog-agent synth 8080 96 60`
+#    to capture the SAME number this predicate would see.
+#
+#    FAILURE HANDLING mirrors the fail-safe rule everywhere else in this
+#    file: ONE failed transaction is SUSPECT, not WEDGED --
+#    WATCHDOG_SYNTH_FAIL_STREAK (default 2) CONSECUTIVE failed ATTEMPTS are
+#    required, and because attempts are already SYNTH_INTERVAL_S apart, that
+#    is a counter, not a wall-clock streak (a wall-clock streak would either
+#    never accumulate, since every intervening /health-OK tick would clear
+#    it, or take hours). An agent/SSH hop failure while ATTEMPTING the
+#    transaction is treated as no-evidence-either-way (like every other BLIND
+#    verdict in this file), never as a failed attempt, and does not consume
+#    the rate-limit stamp -- the next tick retries promptly.
+#
+#    INTERNAL-VS-EXTERNAL DISAGREEMENT (the operator's second framing:
+#    "measure externally as well as internally, and treat disagreement as its
+#    own fault signal"). Implemented for the STRICT direction only: the
+#    agent's `synth` verb compares curl's own wall-clock timer against the
+#    server's self-reported `timings.prompt_ms + timings.predicted_ms`. If
+#    the server's internal total EXCEEDS the external wall-clock time, that
+#    is a logical impossibility -- the internal clock covers a subset of what
+#    the external one covers, never a superset -- so it is unambiguous
+#    evidence the self-report cannot be trusted, and it is logged loudly on
+#    every occurrence. The OTHER direction (external much larger than
+#    internal) is reported as a number but NOT acted on: on this fleet it has
+#    too many innocent explanations to threshold without a measurement --
+#    queueing behind another slot, a cold prompt cache -- and CLAUDE.md's own
+#    rule is that a performance claim not in `docs/measurements.md` may not
+#    be quoted, let alone acted on. This is the cheap half of the operator's
+#    idea; the other half (a genuinely new anomaly-detection CLASS, not just
+#    a cheap add) is real and left as a documented direction, not built.
+#
+#    HONEST VERDICT ON rpc-server: NO synthetic transaction. Exercising it
+#    end to end needs a coordinator llama-server actually loaded with --rpc
+#    pointed at it, running a real graph across the wire -- and nothing in
+#    this fleet's current topology (replication, S=1, R=N) does that. Every
+#    real job runs entirely local to one node; rpc-server is kept alive and
+#    smoke-tested for the S>1 frontier-model case but is not on any path a
+#    real job takes. Standing up a coordinator+model on a watchdog's schedule
+#    just to host a health check would mean a second multi-minute model load
+#    (F3) and a shard group's worth of RAM, to protect a code path nothing
+#    currently uses -- expensive, fragile to version drift between the
+#    checker and whatever real topology eventually uses --rpc, and testing
+#    the wrong thing under time pressure. Per this project's own recorded
+#    judgement: monitoring weakly beats restarting dangerously, and inventing
+#    a check that cannot work honestly is worse than admitting the gap.
+#    rpc-server keeps the pre-existing weak TCP-accept check PLUS the new
+#    nprocs tripwire (#1 above) -- real, cheap, additive coverage for the
+#    specific F40 failure, without pretending it is a full transaction.
+# ---------------------------------------------------------------------------
 # RESTART ORDER AND PRECONDITIONS -- THE TRAP THIS MUST NOT WALK INTO
 #
 # **F36 was CAUSED by restarting `missing-link` while a job was mid-generation.**
@@ -278,6 +417,55 @@ ML_GRACE="${WATCHDOG_ML_GRACE:-300}"
 ML_STALL_S="${WATCHDOG_ML_STALL_S:-3600}"
 
 BUSY_PCT="${WATCHDOG_BUSY_PCT:-5}"
+
+# ---------------------------------------------------------------------------
+# 2026-08-18 ADDITIONS -- see the header section "SYNTHETIC TRANSACTION" below
+# for the full design. Two independent, additive checks; neither replaces
+# anything above, both slot into the SAME emit/streak/restart plumbing every
+# other check already uses.
+# ---------------------------------------------------------------------------
+
+# Process count baselines -- the F40 tripwire. MEASURED on both nodes,
+# 2026-08-18, servers healthy and BUSY (400% of a core): llama-server@.service
+# is 2 (the ExecStart=/bin/sh -c wrapper + the server); rpc-server@.service is
+# 1 (no shell wrapper). A forked ggml_abort() backtrace child is a REAL
+# process and adds to this count; a thread never does.
+NPROCS_BASELINE_LLAMA="${WATCHDOG_NPROCS_LLAMA:-2}"
+NPROCS_BASELINE_RPC="${WATCHDOG_NPROCS_RPC:-1}"
+
+# Grace for a CONFIRMED elevated process count. Shorter than GRACE (300s)
+# because this is structural evidence (a real extra PID exists), not an
+# absence-of-response inference -- but still not zero-grace, on the chance
+# something else this fleet has not yet seen also transiently forks. Two
+# ticks at the timers' 1-minute period is the practical minimum for "not a
+# single sample".
+ABORT_GRACE="${WATCHDOG_ABORT_GRACE:-90}"
+
+# --- Synthetic transaction (llama-server only; see predicate_llama) --------
+# Whether it runs at all. Default ON: it is the one check that closes the
+# "self-report says fine" blind spot, and it is rate-limited hard below.
+SYNTH_ENABLE="${WATCHDOG_SYNTH_ENABLE:-1}"
+
+# Minimum seconds between synthetic transactions AGAINST THE SAME UNIT. This
+# is the whole answer to "a synthetic transaction competes with real work":
+# at the default, it can run at most 4 times an hour, each occupying one of
+# four --parallel slots for single-digit seconds (see the agent's `synth`
+# verb comment for the cost estimate and its basis). It never runs unless the
+# CPU-first check already found the unit idle, so it also never competes with
+# an ACTUAL document chunk -- inherits the same ordering F39 established for
+# /health, one rung further out.
+SYNTH_INTERVAL_S="${WATCHDOG_SYNTH_INTERVAL_S:-900}"
+
+SYNTH_MAX_TOKENS="${WATCHDOG_SYNTH_MAX_TOKENS:-96}"
+SYNTH_TIMEOUT_S="${WATCHDOG_SYNTH_TIMEOUT_S:-60}"
+
+# Consecutive FAILED synthetic transactions (not wall-clock seconds -- each
+# attempt is already SYNTH_INTERVAL_S apart, so a wall-clock streak would
+# either never accumulate, because every intervening tick's /health-OK
+# verdict would clear it, or would take hours) before acting. 2 means the
+# earliest a restart fires from this evidence alone is the SECOND consecutive
+# failed transaction, at least SYNTH_INTERVAL_S after the first.
+SYNTH_FAIL_STREAK="${WATCHDOG_SYNTH_FAIL_STREAK:-2}"
 
 MAX_RESTARTS="${WATCHDOG_MAX_RESTARTS:-1}"
 FLEET_ALARM_PCT="${WATCHDOG_FLEET_ALARM_PCT:-50}"
@@ -457,6 +645,31 @@ streak_start() {          # $1=file -> echoes elapsed seconds
 }
 emit() { printf '%s|%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >> "$OUT"; }
 
+# ---------------------------------------------------------------------------
+# Attempt counters, for the synthetic transaction's fail streak. Deliberately
+# NOT wall-clock like streak_start(): synth attempts are already spaced
+# SYNTH_INTERVAL_S apart by the rate limiter, so "N consecutive failed
+# ATTEMPTS" is the meaningful unit, not "N unbroken seconds" -- a wall-clock
+# streak would either never accumulate (every intervening tick's healthy
+# /health verdict would clear it) or take hours to satisfy.
+# ---------------------------------------------------------------------------
+counter_bump() {          # $1=file -> echoes the NEW count
+  local n; n="$(cat "$1" 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  n=$((n + 1)); echo "$n" > "$1"; echo "$n"
+}
+counter_clear() { rm -f "$1"; }
+
+# due_for() -- has SYNTH_INTERVAL_S elapsed since the stamp file's recorded
+# time? Missing/unreadable stamp counts as "due" (first-ever check for a unit
+# should not wait a full interval).
+due_for() {               # $1=stamp file, $2=interval seconds
+  local now last; now="$(date +%s)"; last="$(cat "$1" 2>/dev/null)"
+  case "$last" in ''|*[!0-9]*) return 0 ;; esac
+  [ $(( now - last )) -ge "$2" ]
+}
+stamp_now() { date +%s > "$1"; }
+
 # ===========================================================================
 # PREDICATE: llama-server.  CPU-progress is decisive. Measured, see the header.
 # ===========================================================================
@@ -478,6 +691,37 @@ predicate_llama() {
     emit DOWN llama "$host" "$port" "$name" "active=${active} -- Restart=always owns this, watchdog stands off"
     return
   fi
+
+  # F40 TRIPWIRE. Checked before CPU/HTTP because it is structural evidence
+  # (a real extra PID exists), not an inference from silence, and it is
+  # cheap: nprocs0/nprocs1 came from the SAME probe call above, no extra
+  # round trip. A forked ggml_abort() backtrace child is a real process
+  # (threads never add to cgroup.procs) and, per the confirmed-live finding
+  # that mainline's ggml.c has the identical fork()/waitpid(NULL, 0)
+  # backtrace code as ik_llama.cpp, this is NOT a retired-engine concern --
+  # it can fire on whatever engine is currently deployed.
+  local af="${RUN_DIR}/streak-abort-llama-${host}-${port}"
+  local np0 np1 npmax
+  np0="$(field "$rec" nprocs0)"; np1="$(field "$rec" nprocs1)"
+  case "${np0}${np1}" in
+    ''|*[!0-9]*) rm -f "$af" ;;  # unmeasurable -- no evidence, not a fault
+    *)
+      npmax=$np0; [ "$np1" -gt "$npmax" ] && npmax=$np1
+      if [ "$npmax" -gt "$NPROCS_BASELINE_LLAMA" ]; then
+        local astreak; astreak="$(streak_start "$af")"
+        if [ "$astreak" -lt "$ABORT_GRACE" ]; then
+          emit SUSPECT llama "$host" "$port" "$name" \
+            "nprocs=${npmax} > baseline ${NPROCS_BASELINE_LLAMA} -- possible ggml_abort() fork signature (F40). streak=${astreak}s/${ABORT_GRACE}s. Holding for a confirming sample"
+          return
+        fi
+        rm -f "$af"
+        emit WEDGED llama "$host" "$port" "$name" \
+          "nprocs=${npmax} > baseline ${NPROCS_BASELINE_LLAMA} for ${astreak}s -- ggml_abort() fork signature (F40): a forked backtrace child is deadlocked and INHERITED the listening socket, so Restart=always and a port check both see a live, healthy-looking unit"
+        return
+      fi
+      rm -f "$af"
+      ;;
+  esac
 
   local cpu0 cpu1 t0 t1
   cpu0="$(field "$rec" cpu0)"; cpu1="$(field "$rec" cpu1)"
@@ -508,12 +752,72 @@ predicate_llama() {
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$HTTP_TIMEOUT" \
           "http://${host}:${port}/health" 2>/dev/null)"
   if [ "${code:-000}" != "000" ]; then
+    local base="idle, /health ${code}"
     if [ -f "$sf" ]; then
-      emit RECOVERED llama "$host" "$port" "$name" "/health ${code} after a suspect streak -- cleared"
-    else
-      emit OK llama "$host" "$port" "$name" "idle, /health ${code}"
+      emit RECOVERED llama "$host" "$port" "$name" "${base} after a suspect streak -- cleared"
+      rm -f "$sf"
+      return
     fi
     rm -f "$sf"
+
+    # SYNTHETIC TRANSACTION. The one check /health cannot substitute for: on
+    # mainline /health never touches the inference queue at all (it is a
+    # cheap lambda -- that is WHY it is cheap, and also why answering proves
+    # nothing about whether a completion actually works). Rate-limited and
+    # ONLY reached here, i.e. only when the unit already looks perfectly
+    # healthy by every cheaper signal -- inherits the CPU-first ordering
+    # (F39): never issued while busy, because we would not have reached this
+    # branch at all if the CPU sample had shown load.
+    if [ "$SYNTH_ENABLE" = "1" ]; then
+      local sstamp="${RUN_DIR}/synthstamp-llama-${host}-${port}"
+      local sfailc="${RUN_DIR}/synthfail-llama-${host}-${port}"
+      if due_for "$sstamp" "$SYNTH_INTERVAL_S"; then
+        local srec; srec="$(agent_call "$host" "$tr" "$((SYNTH_TIMEOUT_S + SSH_CONNECT_TIMEOUT + 10))" \
+                             synth "$port" "$SYNTH_MAX_TOKENS" "$SYNTH_TIMEOUT_S")"
+        if ! ok_rec "$srec"; then
+          # Could not even RUN the check (agent/SSH hop failed). Do NOT treat
+          # this as wedge evidence -- a flaky SSH hop is not a bad completion
+          # -- and do NOT stamp, so the next tick retries promptly rather than
+          # waiting a full SYNTH_INTERVAL_S for an answer we never got.
+          emit OK llama "$host" "$port" "$name" "${base}; synth attempted but the agent did not answer (transport=${tr}) -- confirmation skipped, /health OK stands"
+          return
+        fi
+        stamp_now "$sstamp"
+        local sverdict; sverdict="$(field "$srec" synth_verdict)"
+        if [ "$sverdict" = "PASS" ]; then
+          counter_clear "$sfailc"
+          local sdetail extS pms dms disagree
+          sdetail="$(field "$srec" synth_detail)"; extS="$(field "$srec" external_s)"
+          pms="$(field "$srec" prompt_ms)"; dms="$(field "$srec" predicted_ms)"
+          disagree="$(field "$srec" disagree)"
+          local dnote=""
+          # STRICT direction only (internal > external is a logical
+          # impossibility -- see the agent's synth verb comment for why the
+          # other direction is reported but not acted on). Logged loudly;
+          # does not by itself feed the fail-streak below, because it has
+          # never been validated against a real anomaly -- an untested new
+          # signal gets a log line, not a trigger finger.
+          case "$disagree" in yes:*) dnote=" ANOMALY: ${disagree} (server's own timing report cannot be trusted here -- logged, not acted on)" ;; esac
+          emit OK llama "$host" "$port" "$name" "${base}, synth CONFIRMED (${sdetail}, external=${extS}s prompt_ms=${pms} predicted_ms=${dms})${dnote}"
+        else
+          local sdetail; sdetail="$(field "$srec" synth_detail)"
+          local n; n="$(counter_bump "$sfailc")"
+          if [ "$n" -lt "$SYNTH_FAIL_STREAK" ]; then
+            emit SUSPECT llama "$host" "$port" "$name" \
+              "${base} BUT a real completion FAILED (verdict=${sverdict}: ${sdetail}). This is the blind spot /health cannot see. Failed attempt ${n}/${SYNTH_FAIL_STREAK} -- holding for a confirming attempt in ~${SYNTH_INTERVAL_S}s"
+          else
+            counter_clear "$sfailc"
+            emit WEDGED llama "$host" "$port" "$name" \
+              "/health answers ${code} but ${n} consecutive real completions FAILED (verdict=${sverdict}: ${sdetail}) -- self-reported health cannot be trusted here; a synthetic transaction is decisive because a listen backlog and a cheap /health lambda cannot fake generated text"
+          fi
+        fi
+        return
+      fi
+      # Not due -- rate limiter is doing its job. /health OK stands as this
+      # tick's evidence, exactly as before this feature existed.
+    fi
+
+    emit OK llama "$host" "$port" "$name" "$base"
     return
   fi
 
@@ -591,30 +895,73 @@ predicate_llama() {
 # workers never read model files, so there is no 65 GB reload.
 #
 # KNOWN LIMITATION, stated rather than hidden: a hung-but-listening rpc-server
-# is NOT detected. The kernel completes the handshake from the listen backlog
-# even when the process is frozen -- proved by the SIGSTOP test, where /health
-# connected in 0.000163 s and then never answered. Detecting that would need a
-# probe that speaks the ggml RPC protocol, which is version-fragile and out of
-# scope. Monitoring weakly is the deliberate choice over restarting dangerously.
+# is NOT fully covered. The kernel completes the handshake from the listen
+# backlog even when the process is frozen -- proved by the SIGSTOP test, where
+# /health connected in 0.000163 s and then never answered. A TRUE synthetic
+# transaction against rpc-server would need a coordinator llama-server loaded
+# with --rpc pointed at it, actually running a graph across the wire, and
+# checking real output -- and per the 2026-08-18 review, NOTHING in this
+# fleet's current topology does that today: it runs replication (S=1, R=N),
+# rpc-server is kept alive and tested for the S>1 frontier-model case but is
+# not on the path any real job takes. Building a coordinator+model just to
+# host a health check would mean running a second model load (F3: minutes,
+# single-core-serialised) and holding a shard group's worth of RAM, on a
+# schedule dictated by a watchdog rather than by any actual workload --
+# expensive, fragile to version drift, and protecting a code path nothing
+# uses. So: no synthetic transaction for rpc-server. Monitoring weakly beats
+# inventing a check that cannot work, which is this project's own recorded
+# judgement (F39-era design notes) and still holds.
+#
+# What DID get cheaper 2026-08-18: the nprocs tripwire below. It is not a
+# transaction -- it never speaks the RPC wire protocol -- but it is real,
+# structural, near-free evidence for exactly the F40 failure (rpc-server
+# links the SAME libggml, so the SAME ggml_abort()->fork()->wait4() hang can
+# happen here too), and it needed nothing new: cgroup.procs was already free
+# to read. It narrows, not closes, the limitation above.
 # ===========================================================================
 predicate_rpc() {
   local host="$1" port="$2" name="$3" tr="$4"
   local unit="rpc-server@${port}"
   local sf="${RUN_DIR}/streak-rpc-${host}-${port}"
+  local af="${RUN_DIR}/streak-abort-rpc-${host}-${port}"
 
   # window 1: we want active/CPU for the report, not for the decision.
   local rec; rec="$(agent_call "$host" "$tr" "$(budget)" probe "$unit" 1)"
   if ! ok_rec "$rec"; then
-    rm -f "$sf"
+    rm -f "$sf" "$af"
     emit BLIND rpc "$host" "$port" "$name" "transport=${tr} could not reach the agent -- no evidence either way, streak cleared"
     return
   fi
   local active; active="$(field "$rec" active)"
   if [ "$active" != "active" ]; then
-    rm -f "$sf"
+    rm -f "$sf" "$af"
     emit DOWN rpc "$host" "$port" "$name" "active=${active} -- Restart=always owns this, watchdog stands off"
     return
   fi
+
+  # F40 TRIPWIRE (see predicate_llama for the full rationale; rpc-server's
+  # baseline is 1 process, measured live -- no shell wrapper in this unit).
+  local np0 np1 npmax
+  np0="$(field "$rec" nprocs0)"; np1="$(field "$rec" nprocs1)"
+  case "${np0}${np1}" in
+    ''|*[!0-9]*) rm -f "$af" ;;
+    *)
+      npmax=$np0; [ "$np1" -gt "$npmax" ] && npmax=$np1
+      if [ "$npmax" -gt "$NPROCS_BASELINE_RPC" ]; then
+        local astreak; astreak="$(streak_start "$af")"
+        if [ "$astreak" -lt "$ABORT_GRACE" ]; then
+          emit SUSPECT rpc "$host" "$port" "$name" \
+            "nprocs=${npmax} > baseline ${NPROCS_BASELINE_RPC} -- possible ggml_abort() fork signature (F40). streak=${astreak}s/${ABORT_GRACE}s. Holding"
+          return
+        fi
+        rm -f "$af"
+        emit WEDGED rpc "$host" "$port" "$name" \
+          "nprocs=${npmax} > baseline ${NPROCS_BASELINE_RPC} for ${astreak}s -- ggml_abort() fork signature (F40). Restarting is cheap regardless (F23: workers never read model files)"
+        return
+      fi
+      rm -f "$af"
+      ;;
+  esac
 
   local tcprec; tcprec="$(agent_call "$host" "$tr" 30 tcpcheck "$port")"
   if ! ok_rec "$tcprec"; then

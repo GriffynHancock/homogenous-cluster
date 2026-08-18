@@ -76,7 +76,11 @@
 #     watchdog user gets is `systemctl restart llama-server@*`;
 #   * the heartbeat payload is read from stdin with a hard byte cap and written
 #     to one fixed path;
-#   * `probe` and `version` need no privilege at all.
+#   * `probe`, `version`, `tcpcheck`, `mlstate` and `synth` need no privilege
+#     at all -- `synth` in particular only ever talks to 127.0.0.1:<port> on
+#     THIS node (the port comes from the caller, the host never does), so the
+#     restricted key cannot be turned into a way to make this node call out
+#     anywhere else.
 #
 # `systemctl -H user@host` was considered and REJECTED for the restart path.
 # It works by running `systemd-stdio-bridge` on the remote and speaking the
@@ -85,10 +89,57 @@
 # StopUnit and StartTransientUnit for EVERY unit -- i.e. arbitrary root command
 # execution via the `systemd-run` path. There is no way to narrow it to one
 # unit and one verb. This wrapper exposes three verbs and one unit template.
+#
+# ---------------------------------------------------------------------------
+# 2026-08-18 ADDITIONS: nprocs (a free F40 tripwire) and `synth` (the
+# synthetic transaction). Why not trust the backend to report itself:
+#
+# "process-alive, port-open and self-reported health are all defeated" (F40) --
+# `ggml_abort()` FORKS from a multithreaded process
+# (`src/ggml/src/ggml.c:ggml_print_backtrace`, `waitpid(child_pid, NULL, 0)`
+# with no timeout) to try to print a backtrace via gdb/lldb. If the child
+# deadlocks on an inherited malloc-arena lock -- exactly what F40 caught on
+# node 2, `wchan=futex_wait_queue` on all four children -- the parent blocks in
+# `wait4()` FOREVER: never exits (Restart=always sees nothing), never releases
+# its listening socket (a port check sees "accept"), and the forked children
+# INHERIT that socket too, so even a killed-and-restarted illusion of the
+# service survives via its own zombies.
+#
+# CONFIRMED 2026-08-18: this is NOT an ik_llama.cpp-only hazard.
+# `/opt/llama.cpp/src/ggml/src/ggml.c` (mainline, the engine this fleet now
+# runs per F40's own reversal) has the IDENTICAL fork()/waitpid() code at the
+# same call site. Any future ggml_abort() on mainline -- whatever triggers it
+# -- can reproduce F40's exact hang. The fleet moving off ik_llama.cpp did not
+# retire this risk.
+#
+# nprocs is the free, structural tripwire for it: a forked child is a real
+# process, so it gets its OWN entry in the unit's cgroup.procs (threads do
+# not). MEASURED baseline, both nodes, 2026-08-18, servers healthy and BUSY
+# (400% of a core -- so this is not an idle-only artefact):
+#   llama-server@8080:  2 procs (the ExecStart=/bin/sh -c wrapper + the server)
+#   rpc-server@50052:   1 proc  (no shell wrapper needed for this unit)
+# A count ABOVE that baseline, sustained across a confirming second sample, is
+# near-certain evidence of the abort-fork signature -- not an inference, a
+# structural fact about the process tree. It costs one extra line already
+# being read for SRVPID discovery; nothing new is opened.
+#
+# `synth` is the decisive, expensive check, reserved for when the cheap ones
+# are ambiguous (idle, port fine, nprocs fine, /health answers ok). On
+# mainline, `/health` answering proves NOTHING about the inference pipeline --
+# `docs/watchdog-research.md` Q1: mainline's handler is a lambda returning a
+# server-state variable, deliberately NEVER posted to the task queue (that is
+# what makes it cheap and instant, and also what makes it blind to a wedged
+# queue). Only a real completion exercises tokenizer -> queue -> compute ->
+# detokenize -> response, which is the whole point of a synthetic
+# TRANSACTION rather than a synthetic PING: a listen backlog can fake a port,
+# nothing can fake generated text. See the `synth` verb below for the request
+# shape, the content-validation rules (ported from
+# `missing_link/worker.py:extract_content`, F21/F34's empty/truncated guards),
+# the internal-vs-external timing comparison, and the cost.
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
-AGENT_PROTO=3
+AGENT_PROTO=4
 
 # The agent runs as the UNPRIVILEGED watchdog user over SSH, so its drop box
 # cannot be root's /var/lib/llama-watchdog -- it writes into its own home. This
@@ -158,6 +209,21 @@ cpu_ns() {
 
 now_ns() { date +%s%N; }
 
+# Process count in the unit's cgroup -- the F40 tripwire (header note above).
+# Cheap and free of side effects: reads cgroup.procs, counts lines, nothing
+# else. Empty/unreadable reports 0 rather than failing the whole probe over a
+# diagnostic extra -- the controller already treats 0 as "could not measure"
+# for this field specifically (baselines here are 1 and 2, never 0 for an
+# ACTIVE unit).
+nprocs_of() {
+  local unit="$1" cg n
+  cg=$(systemctl show -p ControlGroup --value "${unit}.service" 2>/dev/null)
+  [ -n "$cg" ] && [ -r "/sys/fs/cgroup${cg}/cgroup.procs" ] || { echo 0; return; }
+  n=$(grep -c . "/sys/fs/cgroup${cg}/cgroup.procs" 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  echo "$n"
+}
+
 case "$VERB" in
 
   version)
@@ -183,14 +249,24 @@ case "$VERB" in
     # RPC peers, read out of the real server's cmdline. The unit's MainPID is
     # the /bin/sh wrapper, so walk the cgroup for the process whose comm
     # actually matches, rather than trusting MainPID (see the header note).
-    SRVPID=""; CMDLINE=""
+    #
+    # NPROCS is counted from the SAME cgroup.procs read -- one extra counter in
+    # a loop already running, not a new probe. It is the F40 tripwire: a real
+    # fork() (the abort-backtrace hazard, header note above) gets its own PID
+    # here; threads never do. Baseline is unit-specific and known from
+    # measurement (2 for llama-server, 1 for rpc-server); the controller
+    # compares, this agent just counts and reports.
+    SRVPID=""; CMDLINE=""; NPROCS=0
     CG=$(systemctl show -p ControlGroup --value "${UNIT}.service" 2>/dev/null)
     if [ -n "$CG" ] && [ -r "/sys/fs/cgroup${CG}/cgroup.procs" ]; then
       while read -r p; do
+        [ -z "$p" ] && continue
+        NPROCS=$((NPROCS + 1))
+        [ -n "$SRVPID" ] && continue
         [ -r "/proc/$p/comm" ] || continue
         c=$(cat "/proc/$p/comm" 2>/dev/null)
         case "$c" in
-          llama-server|ggml-rpc-serve*|rpc-server) SRVPID="$p"; break ;;
+          llama-server|ggml-rpc-serve*|rpc-server) SRVPID="$p" ;;
         esac
       done < "/sys/fs/cgroup${CG}/cgroup.procs"
     fi
@@ -208,17 +284,22 @@ case "$VERB" in
 
     if [ "$ACTIVE" != "active" ]; then
       # Nothing to measure and nothing to judge: Restart=always owns this.
-      echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) unit=${UNIT} active=${ACTIVE:-unknown} rpc=${RPC} ok=1"
+      echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) unit=${UNIT} active=${ACTIVE:-unknown} rpc=${RPC} nprocs0=${NPROCS} nprocs1=${NPROCS} ok=1"
       exit 0
     fi
 
     C0=$(cpu_ns "$UNIT"); T0=$(now_ns)
     sleep "$W"
     T1=$(now_ns); C1=$(cpu_ns "$UNIT")
+    # Resample nprocs too -- free (no sleep of its own) and catches an abort
+    # that forked DURING this window, not just one already present at t0.
+    # The controller takes the max of the two against the unit's baseline.
+    NPROCS1=$(nprocs_of "$UNIT")
 
     echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) unit=${UNIT} active=${ACTIVE}" \
          "srvpid=${SRVPID:-0} cpu0=${C0:-} cpu1=${C1:-} t0=${T0} t1=${T1}" \
-         "window=${W} rpc=${RPC} rpcpeers=${RPCPEERS:-} since=${SINCE// /_} ok=1"
+         "window=${W} rpc=${RPC} rpcpeers=${RPCPEERS:-} since=${SINCE// /_}" \
+         "nprocs0=${NPROCS} nprocs1=${NPROCS1} ok=1"
     ;;
 
   # tcpcheck <port> -- does a LOCAL listener accept a connection?
@@ -243,6 +324,172 @@ case "$VERB" in
     else
       echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) port=${P} tcp=refused ok=1"
     fi
+    ;;
+
+  # synth <port> <max_tokens> <timeout_s> -- THE SYNTHETIC TRANSACTION.
+  #
+  # A tiny, real completion, run against 127.0.0.1:<port> ONLY (never a
+  # caller-supplied host -- the point is to test THIS node's server, and a
+  # restricted key must not become a way to make this node call out anywhere
+  # else). It is the one check in this ladder that cannot be satisfied by a
+  # listen backlog, a cached process table entry, or a lambda that never
+  # touches the inference queue (mainline's /health -- see the header note):
+  # only a live tokenizer -> queue -> compute -> detokenize -> HTTP response
+  # round trip produces real generated text.
+  #
+  # CONTENT VALIDATION IS PORTED FROM missing_link/worker.py:extract_content,
+  # NOT reimplemented from scratch and NOT weakened: empty content is a
+  # failure (F21), non-empty content with finish_reason="length" is a failure
+  # (F34 -- truncated output stored as if it were complete), and a model that
+  # spent its whole budget in reasoning_content with nothing in content is the
+  # SAME failure by a different route (F21's exact reproduction). This is a
+  # deliberate second implementation, not an import: the agent ships to bare
+  # nodes with no missing-link venv, and importing a sibling service's
+  # internals would be the wrong kind of coupling for what is meant to stay a
+  # small, dependency-free script. If extract_content's contract changes,
+  # this needs to change with it -- that seam is a maintenance cost accepted
+  # deliberately, not an oversight.
+  #
+  # `reasoning_effort: low` is sent unconditionally. F35: llama-server drops
+  # unrecognised request kwargs silently, so this is inert on a model that
+  # does not understand it and helpful on one that does (gpt-oss/harmony,
+  # both fleet nodes' current model) -- there is no per-model branch here
+  # because the agent has no reliable way to know which model is loaded
+  # without ITSELF being a second client of the very server it is checking.
+  #
+  # COST, from documented rates (`docs/measurements.md` /
+  # `docs/FINDINGS.md` F17/F24/F27), stated as an ESTIMATE and NOT re-labelled
+  # as measured: prompt is ~12 tokens, prefill is compute-bound and fast at
+  # this size regardless of engine (well under 1 s); the default max_tokens
+  # (96) is sized against worker.py's own measured gpt-oss reasoning-token
+  # range (49-129 tokens across the tested reasoning_effort settings, see
+  # worker.py's REASONING_KWARGS comment) so a healthy server usually finishes
+  # before the cap, not at it. At gpt-oss's measured 6.05 t/s generation
+  # (F24), 96 tokens is a WORST-CASE ~16 s. Occupies one of four --parallel
+  # slots for that span; the other three are untouched. Rate-limited by the
+  # CONTROLLER (WATCHDOG_SYNTH_INTERVAL_S), not by this agent, which will run
+  # exactly the transaction it is asked for, whenever it is asked. THIS
+  # NUMBER IS NOT YET MEASURED LIVE -- both fleet nodes were running real
+  # document jobs throughout this change (hard constraint of the task this
+  # was built under); see the report for the exact command to run once a node
+  # is idle.
+  synth)
+    P="${2:-}"; MT="${3:-96}"; TO="${4:-60}"
+    case "$P" in ''|*[!0-9]*) die "refused_port:$P" ;; esac
+    [ "$P" -ge 1 ] && [ "$P" -le 65535 ] || die "refused_port_range:$P"
+    case "$MT" in ''|*[!0-9]*) die "refused_max_tokens:$MT" ;; esac
+    [ "$MT" -ge 1 ] && [ "$MT" -le 512 ] || die "refused_max_tokens_range:$MT"
+    case "$TO" in ''|*[!0-9]*) die "refused_timeout:$TO" ;; esac
+    [ "$TO" -ge 1 ] && [ "$TO" -le 300 ] || die "refused_timeout_range:$TO"
+
+    PY=""
+    for c in "${WATCHDOG_PYTHON:-}" /usr/bin/python3 python3; do
+      [ -n "$c" ] && command -v "$c" >/dev/null 2>&1 && { PY="$c"; break; }
+    done
+    if [ -z "$PY" ]; then
+      echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) port=${P} synth_verdict=AGENT_ERROR synth_detail=no_python3 ok=0"
+      exit 3
+    fi
+
+    # No RETURN trap here (this is a case arm in the main script, not a
+    # function -- RETURN never fires). $BODY is removed explicitly on every
+    # exit path below instead.
+    BODY="$(mktemp "${TMPDIR:-/tmp}/wd-synth.XXXXXX")"
+    REQ='{"model":"synthetic-probe","messages":[{"role":"user","content":"Reply with the single word: OK."}],"max_tokens":'"$MT"',"temperature":0,"stream":false,"reasoning_effort":"low"}'
+
+    # time_total is curl's own high-resolution client-side timer -- the
+    # EXTERNAL half of the internal-vs-external comparison the controller
+    # makes. http_code=000 means curl never got a response at all (refused,
+    # timed out, connection reset) and is reported as its own verdict rather
+    # than fed to the JSON parser.
+    META="$(curl -s -o "$BODY" -w '%{http_code} %{time_total}' \
+            --max-time "$TO" --connect-timeout 5 \
+            -H 'Content-Type: application/json' \
+            -X POST "http://127.0.0.1:${P}/v1/chat/completions" \
+            -d "$REQ" 2>/dev/null)"
+    HCODE="${META%% *}"; EXT_S="${META#* }"
+    case "$HCODE" in ''|*[!0-9]*) HCODE=000 ;; esac
+
+    if [ "$HCODE" = "000" ]; then
+      echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) port=${P} synth_verdict=TRANSPORT_FAIL synth_detail=curl_no_response external_s=${EXT_S:-} ok=1"
+      rm -f "$BODY"; exit 0
+    fi
+    if [ "$HCODE" -lt 200 ] || [ "$HCODE" -ge 300 ]; then
+      DETAIL=$(head -c 200 "$BODY" 2>/dev/null | tr '\n"' '  ')
+      echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) port=${P} synth_verdict=HTTP_${HCODE} synth_detail=${DETAIL:-none} external_s=${EXT_S:-} ok=1"
+      rm -f "$BODY"; exit 0
+    fi
+
+    # Content validation, ported from extract_content (see the comment above).
+    # Prints ONE line: "VERDICT|detail|prompt_ms|predicted_ms" so the caller
+    # never has to parse JSON itself.
+    RESULT="$("$PY" -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        payload = json.load(f)
+except Exception as e:
+    print("MALFORMED|%s: %s|-1|-1" % (type(e).__name__, str(e)[:150]))
+    sys.exit(0)
+try:
+    choice = payload["choices"][0]
+    message = choice.get("message", {}) or {}
+    content = (message.get("content") or "").strip()
+    reasoning = (message.get("reasoning_content") or "").strip()
+    finish = choice.get("finish_reason")
+    timings = payload.get("timings") or {}
+    p_ms = timings.get("prompt_ms", -1)
+    d_ms = timings.get("predicted_ms", -1)
+except Exception as e:
+    print("MALFORMED|shape: %s: %s|-1|-1" % (type(e).__name__, str(e)[:150]))
+    sys.exit(0)
+
+if content:
+    if finish == "length":
+        print("TRUNCATED|hit max_tokens mid-answer (%d chars)|%s|%s" % (len(content), p_ms, d_ms))
+    else:
+        print("PASS|%d chars, finish=%s|%s|%s" % (len(content), finish, p_ms, d_ms))
+elif reasoning and finish == "length":
+    print("EMPTY_REASONING|%d chars reasoning, 0 content, finish=length|%s|%s" % (len(reasoning), p_ms, d_ms))
+elif finish == "length":
+    print("EMPTY_LENGTH|hit max_tokens, no content at all|%s|%s" % (p_ms, d_ms))
+else:
+    print("EMPTY|no content, finish=%s|%s|%s" % (finish, p_ms, d_ms))
+' "$BODY" 2>&1)"
+    rm -f "$BODY"
+
+    VERDICT="${RESULT%%|*}"
+    REST="${RESULT#*|}"
+    DETAIL="${REST%%|*}"; REST="${REST#*|}"
+    P_MS="${REST%%|*}"; D_MS="${REST#*|}"
+
+    # Internal-vs-external disagreement, per the operator's framing ("why are
+    # we depending so much on the backend to report itself?"). Only the
+    # STRICT direction is treated as an anomaly worth a distinct field:
+    # internal (prompt_ms+predicted_ms) claiming MORE work than the whole
+    # request's wall-clock time is a logical impossibility -- the internal
+    # clock covers a subset of what curl's timer covers, never a superset --
+    # so any occurrence is unambiguous evidence the server's self-report is
+    # wrong, not merely slow. The other direction (external much larger than
+    # internal) has too many innocent explanations on this fleet -- queueing
+    # behind another slot, a cold prompt cache -- to threshold without a
+    # measurement, so it is reported as a number and left for the controller
+    # to log, not to act on. See the report for why this is the only half of
+    # "measure externally and internally, and treat disagreement as its own
+    # fault signal" implemented today.
+    DISAGREE="no"
+    case "$P_MS $D_MS" in
+      *[!0-9.\ -]*) ;;  # non-numeric, skip
+      *)
+        INT_MS=$(echo "$P_MS $D_MS" | awk '{i=$1+$2; if (i<0) i=0; printf "%d", i}')
+        EXT_MS=$(echo "$EXT_S" | awk '{printf "%d", $1*1000}')
+        if [ "$INT_MS" -gt 0 ] && [ "$EXT_MS" -gt 0 ] && [ "$INT_MS" -gt "$EXT_MS" ]; then
+          DISAGREE="yes:internal=${INT_MS}ms>external=${EXT_MS}ms"
+        fi
+        ;;
+    esac
+
+    echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) port=${P} synth_verdict=${VERDICT} synth_detail=${DETAIL// /_} external_s=${EXT_S:-} prompt_ms=${P_MS} predicted_ms=${D_MS} disagree=${DISAGREE} ok=1"
     ;;
 
   # mlstate -- Missing Link's own progress counters, read from its SQLite job
@@ -366,7 +613,7 @@ print("ml_running=%s ml_pending=%s ml_chunks=%s ml_jobs=%s" % (
     ;;
 
   '')
-    die "no_verb (allowed: version probe restart heartbeat)"
+    die "no_verb (allowed: version probe tcpcheck synth mlstate restart heartbeat)"
     ;;
   *)
     die "refused_verb:${VERB}"
