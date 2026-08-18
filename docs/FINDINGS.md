@@ -2115,3 +2115,82 @@ watchdog rollout, not merely an argument for it.**
 
 It is also a reminder that the watchdog is a *mitigation*, not a fix: restarting
 into the same engine means the next job dies on its 5th chunk too.
+
+---
+
+## F41. A faithfulness classifier's reliability DEGRADES WITH EVIDENCE LENGTH, and cross-model agreement stops being a safety net
+
+**CONFIRMED by measurement, 2026-08-18.** Full write-up in
+`docs/audit-production-scale.md`. This kills a design that had looked strong,
+and the reason it looked strong is the transferable part.
+
+A two-model MiniCheck ensemble (Flan-T5-Large + RoBERTa-Large) was validated on a
+36-pair negation battery and scored 95.8% / 97.2%, with **cross-model
+disagreement predicting error at precision 1.00 and recall 1.00** — every error
+one model made, the other caught. That result justified the whole "flag for
+review" design.
+
+**Every one of those pairs was a one-to-three-sentence document.** Re-run with
+each pair's identical clause embedded verbatim in a ~4096-token document — the
+size production actually scores against:
+
+| | short doc | production scale |
+|---|---:|---:|
+| Precision of disagreement | 1.00 | **0.75** |
+| Recall of disagreement | 1.00 | **0.43** |
+| Errors BOTH models made | 0 | **4/72 = 5.6%** (95% Wilson CI 2.2–13.4%) |
+| Escalation rate | 6.9% | 5.6% |
+
+**Note the escalation rate went DOWN.** The ensemble did not get noisier, it got
+**quieter and less reliable at the same time** — the worst possible combination,
+because a shrinking flag list reads as improving quality.
+
+**The flagship case flipped from caught to silent.** `retention_seven_years`
+("seven years... or until the client turns twenty-five, whichever is later") is
+the exact clause the two-model design was built around, and at production scale
+both models agree and are wrong. A 27-document position sub-study isolates why:
+**RoBERTa fails on that pair specifically at the MIDDLE position.** That is
+lost-in-the-middle (arXiv:2307.03172) striking the *classifier* — the same effect
+that justifies chunking the *generator*. Re-running the same pair at the same
+position with different filler flipped the answer, so position is a real factor
+but not the only source of variance.
+
+### Real model output is worse ground than the fixtures
+
+Scored against 208 real gpt-oss summary sentences (a real pipeline job plus the
+chunk-size sweep corpus):
+
+- **55.6% of real summary sentences carry more than one claim.** A classifier
+  scores a sentence as one unit, so a sentence with two supported claims and one
+  fabricated one yields a middling score that identifies nothing. **Sub-sentence
+  decomposition is therefore a prerequisite, not a refinement.**
+- **nltk's sentence splitter degenerates on real markdown**, producing 9.1%
+  garbage fragments — `"P."` split out of `"K.P. Dutt"`. The tokeniser everyone
+  reaches for is not safe on this material.
+
+### Cost inverts the whole proposition
+
+Measured: 17.74 s/claim (Flan-T5) and 8.81 s/claim (RoBERTa) at production
+evidence size. The earlier ~75–95 min estimate assumed 8 sentences per chunk;
+the **real measured density is 18**. For a 25-chunk document, **hop 1 alone is
+~199 minutes — longer than the ~143-minute summarisation job it audits.**
+
+### What this means, and what survives
+
+- **Do not wire the ensemble in as a safety net.** The engineering is sound —
+  refuse-rather-than-degrade, offsets computed rather than asked for, two
+  correctly-scoped hops. The *empirical claim* that justified trusting it did not
+  survive scale-up.
+- **Deterministic hard signals become the primary path, not an optimisation.**
+  A number either appears in the cited span or it does not, and that check does
+  not degrade with evidence length, does not need a GPU, and is explainable.
+- **The generalisable lesson, and it is the same one this project keeps
+  relearning: a metric validated at one scale tells you nothing about another.**
+  F40 was a benchmark that did not reproduce the deployment's *concurrency*;
+  this is a validation that did not reproduce the deployment's *evidence length*.
+  Both looked rigorous. Both measured the wrong configuration.
+
+**Also found, not fixed:** `audit.py`'s `preflight()` has a broad
+`except Exception` that reports "the model failed to load" as an ordinary
+length-based refusal. That is a degrade-instead-of-refuse path in the very
+function written to prevent one.
