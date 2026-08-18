@@ -3,11 +3,180 @@
 {% block sub %}Job <code>{{ job.id }}</code> — {{ job.kind }}
   <span class="badge {{ job.status }}">{{ job.status }}</span>{% endblock %}
 {% block body %}
+<style>
+  /* Section-level citation markers in the result. Deliberately quiet: per
+     arXiv:2501.01303 a citation raises perceived trust EVEN WHEN RANDOM, so a
+     marker that shouts is actively harmful here. It should look like a
+     footnote to follow, not a seal of approval. */
+  a.cite { display:inline-block; margin:0 .05rem; padding:0 .3rem; font-size:.72em;
+           vertical-align:.35em; line-height:1.5; border:1px solid var(--line);
+           border-radius:4px; text-decoration:none; color:var(--mut); }
+  a.cite:hover, a.cite:focus { color:var(--accent); border-color:var(--accent); }
+  .cite-note { border-left:3px solid var(--line); padding:.1rem 0 .1rem .9rem;
+               margin:.7rem 0 1.4rem; color:var(--mut); font-size:.85rem; }
+  .cite-note p { margin:.5rem 0; }
+  .cite-note code { font-size:.9em; }
+  .cite-drop { color:#b8860b; }
+  details:target { border-color:var(--accent) !important; }
+</style>
+{# "Retry now" / "Resume" -- an explicit OPERATOR OVERRIDE for a terminal job.
+   Shared between the failed and cancelled branches below so the two states
+   cannot drift into inconsistent copy. See app.py's _revive_preview and
+   db.revive_job for what this is actually doing and why cancelled jobs are
+   included. The one thing this box deliberately does NOT do is probe the
+   inference server to say for certain whether the resume will succeed --
+   see _revive_preview's docstring -- so it states what is RECORDED and the
+   rule that decides resume-vs-restart, not a guess dressed up as a fact. #}
+{% macro revive_box(job, progress, revive_preview) %}
+<div style="border:1px solid var(--line);border-radius:8px;padding:.8rem 1rem;margin:.7rem 0 1.1rem">
+  {% if revive_preview %}
+    {% set remaining = progress.chunks_expected - revive_preview.n_chunks %}
+    <p style="margin:.1rem 0;font-size:.85rem">
+      {{ revive_preview.n_chunks }} chunk summar{{ "y" if revive_preview.n_chunks == 1 else "ies" }}
+      of {{ progress.chunks_expected }}
+      {{ "is" if revive_preview.n_chunks == 1 else "are" }} already saved on disk
+      {%- if revive_preview.model %}, produced by <code>{{ revive_preview.model }}</code>{% endif %}.
+      <strong>Reviving will reuse {{ "it" if revive_preview.n_chunks == 1 else "them" }}
+      {%- if remaining > 0 %} and only send the remaining {{ remaining }}
+      chunk{{ "s" if remaining != 1 }} to the model{% else %} and go straight to the
+      reduce step{% endif %} -- but only if the model that claims this job still matches
+      the one that produced them{% if not revive_preview.instruction_matches %}, and
+      these chunks do not currently agree on the operator instruction that produced
+      them, so a match is unlikely{% endif %}.</strong>
+      If a different model is serving when this is claimed, these saved summaries are
+      discarded automatically and the whole document restarts from the beginning --
+      never mixed with a different model's output.
+    </p>
+  {% else %}
+    <p style="margin:.1rem 0;font-size:.85rem;color:var(--mut)">No chunk summaries
+    were saved before this job stopped, so reviving it starts the document from the
+    beginning.</p>
+  {% endif %}
+
+  {% if job.status == "failed" and progress.attempts > 1 and progress.attempts < progress.max_attempts %}
+    <p style="margin:.5rem 0 .3rem;font-size:.85rem;color:#c0392b">
+      <strong>This failed without using its full retry budget</strong>
+      (attempt {{ progress.attempts }} of {{ progress.max_attempts }}), which
+      Missing Link only does for a failure it classifies as a problem with the
+      DOCUMENT or the REQUEST, not the cluster -- retrying reproduces the identical
+      request against the identical document, so <strong>this will very likely fail
+      again in exactly the same way</strong>. Read the error below before retrying
+      blind; this button exists for when the operator knows something that changed
+      (a corrected document, a shortened instruction), not as a first response.
+    </p>
+  {% elif job.status == "failed" and progress.attempts <= 1 %}
+    <p style="margin:.5rem 0 .3rem;font-size:.85rem;color:#c0392b">
+      <strong>This failed on its first attempt</strong> (attempt
+      {{ progress.attempts }} of {{ progress.max_attempts }}), which -- IF this job ran
+      under the current retry policy -- usually means the DOCUMENT or the REQUEST was
+      the problem, and <strong>retrying will very likely fail again in exactly the
+      same way</strong>. But a job that failed BEFORE this retry policy existed shows
+      the same "attempt 1" reading even when the real cause was the cluster, not the
+      document (found live while building this feature, against exactly such a job --
+      see the error below rather than trusting this number alone).
+    </p>
+  {% elif job.status == "failed" %}
+    <p style="margin:.5rem 0 .3rem;font-size:.85rem">
+      This exhausted all {{ progress.max_attempts }} attempts, each ending with the
+      inference backend unreachable or dying mid-document -- a CLUSTER problem, not a
+      problem with this document. If the backend has since been fixed, this is
+      exactly the case this button is for.
+    </p>
+  {% else %}
+    <p style="margin:.5rem 0 .3rem;font-size:.85rem">
+      This was cancelled by request, not a failure -- reviving it should simply pick
+      up where it stopped.
+    </p>
+  {% endif %}
+
+  <form method="post" action="/jobs/{{ job.id }}/revive">
+    <button type="submit">{{ "Resume" if job.status == "cancelled" else "Retry now" }}</button>
+  </form>
+</div>
+{% endmacro %}
 {% if job.status in ("pending","running") %}
-  <!-- Jobs run for hours; a manual refresh is the wrong interaction. -->
+  <!-- Jobs run for hours; a manual refresh is the wrong interaction. This
+       reload is also the NO-JS FALLBACK for live progress -- every field in
+       the box below is rendered server-side from the live database on every
+       request, so it is correct on a plain page load with no script at all.
+       JS below only makes updates land sooner than 15s; it is never the only
+       source of this data, so a browser with JS off just sees it update
+       more slowly, never a blank or stale-forever page. -->
   <meta http-equiv="refresh" content="15">
   <p style="color:var(--mut)">This page refreshes every 15 seconds. Nothing is
   waiting on you — close it and come back.</p>
+
+  {% if job.status == "running" %}
+  {% set basis_labels = {
+       "job": "measured from this job's own chunks so far",
+       "measured": "measured from this cluster's completed jobs",
+       "estimate": "estimate — not yet calibrated"} %}
+  <div id="live-progress" style="border:1px solid var(--line);border-radius:8px;
+       padding:.8rem 1rem;margin:.6rem 0 1.1rem">
+    <p style="margin:.1rem 0">
+      <strong>Chunk <span id="lp-chunk-n">{{ [progress.chunks_done + 1, progress.chunks_expected] | min }}</span> of
+      <span id="lp-expected">{{ progress.chunks_expected }}</span></strong>
+      (<span id="lp-chunks">{{ progress.chunks_done }}</span> done)
+      {%- if progress.endpoint %} — running on <code>{{ progress.endpoint }}</code>{% endif %}
+    </p>
+    {% if progress.attempts > 1 %}
+    <p style="margin:.1rem 0;font-size:.85rem">
+      <strong>Attempt {{ progress.attempts }} of {{ progress.max_attempts }}.</strong>
+      {%- if progress.resumed_chunks %} Resumed — {{ progress.resumed_chunks }} of
+      {{ progress.chunks_expected }} chunk{{ "s" if progress.chunks_expected != 1 }}
+      were already summarised by an earlier attempt and are being reused, so only the
+      remaining {{ progress.chunks_expected - progress.resumed_chunks }} are being sent
+      to the model.
+      {%- else %} Restarted from the beginning: the earlier attempt's chunk summaries
+      could not be reused (the model or the guidance changed since they were written),
+      and mixing summaries from two different models is not safe.
+      {%- endif %}
+    </p>
+    {% endif %}
+    <p style="margin:.1rem 0;color:var(--mut);font-size:.85rem">
+      Elapsed: <span id="lp-elapsed">{{ "%.0fs"|format(progress.elapsed_s) if progress.elapsed_s is not none else "—" }}</span>
+      {%- if progress.eta_human %} · ETA: <span id="lp-eta">{{ progress.eta_human }}</span>
+        <span id="lp-eta-basis">({{ basis_labels.get(progress.eta_basis, progress.eta_basis) }})</span>
+      {%- endif %}
+    </p>
+    {% if progress.tok_s %}
+    <p style="margin:.1rem 0;color:var(--mut);font-size:.85rem" id="lp-toks">
+      Prefill: <span id="lp-prefill">{{ "%.1f"|format(progress.tok_s.last_prefill_tok_s) if progress.tok_s.last_prefill_tok_s else "—" }} tok/s</span>
+      (avg <span id="lp-prefill-avg">{{ "%.1f"|format(progress.tok_s.avg_prefill_tok_s) if progress.tok_s.avg_prefill_tok_s else "—" }}</span>)
+      · Generation: <span id="lp-gen">{{ "%.1f"|format(progress.tok_s.last_gen_tok_s) if progress.tok_s.last_gen_tok_s else "—" }} tok/s</span>
+      (avg <span id="lp-gen-avg">{{ "%.1f"|format(progress.tok_s.avg_gen_tok_s) if progress.tok_s.avg_gen_tok_s else "—" }}</span>)
+      <span style="font-size:.78rem">— from this job's own <span id="lp-n-timed">{{ progress.tok_s.n_timed }}</span> timed chunk{{ "s" if progress.tok_s.n_timed != 1 }}, kept separate: prefill and generation run at very different speeds on this hardware.</span>
+    </p>
+    {% endif %}
+    <p style="margin:.3rem 0 0;font-size:.78rem"><a href="/jobs/{{ job.id }}/progress">progress as JSON</a></p>
+  </div>
+  {% elif job.status == "pending" %}
+  {% if progress.retry_after %}
+  <!-- A pending job that has already been started at least once. Without this
+       box the most alarming state in the system -- the inference backend died
+       mid-document -- would look exactly like a job that has simply never run. -->
+  <div style="border:1px solid var(--line);border-radius:8px;padding:.8rem 1rem;
+       margin:.6rem 0 1.1rem">
+    <p style="margin:.1rem 0"><strong>Waiting to retry —
+      attempt {{ progress.attempts }} of {{ progress.max_attempts }} failed.</strong></p>
+    <p style="margin:.2rem 0;color:var(--mut);font-size:.85rem">
+      The next attempt starts after {{ progress.retry_after[:19].replace("T"," ") }} UTC,
+      as soon as an inference endpoint is answering. Nothing is lost in the meantime:
+      {% if progress.chunks_done %}the {{ progress.chunks_done }} chunk
+      summar{{ "y" if progress.chunks_done == 1 else "ies" }} already completed
+      {{ "is" if progress.chunks_done == 1 else "are" }} kept, and the retry will
+      resume from {{ "it" if progress.chunks_done == 1 else "them" }} rather than
+      restarting the document.{% else %}no chunks had completed yet, so the retry
+      starts from the beginning.{% endif %}
+    </p>
+    <pre style="margin:.4rem 0 0;font-size:.8rem">{{ job.error }}</pre>
+  </div>
+  {% else %}
+  <p style="color:var(--mut);font-size:.85rem">Queued — will split into about
+  {{ progress.chunks_expected }} chunk{{ "s" if progress.chunks_expected != 1 }} once it starts.</p>
+  {% endif %}
+  {% endif %}
+
   {% if estimate %}
   <p><strong>Expected to take about {{ estimate.human }}.</strong>
     <span style="color:var(--mut)">
@@ -18,6 +187,22 @@
       so this comes from benchmark figures, not from observed runs.
     {%- endif %}</span></p>
   {% endif %}
+  {% if job.status == "running" and job.cancel_requested %}
+  <p style="color:var(--mut)">Stop requested — this will take effect at the
+  next chunk boundary, not immediately (an in-flight request to the model
+  cannot be interrupted). Chunks already completed are kept and will not be
+  redone if this job is resumed.</p>
+  {% else %}
+  <form method="post" action="/jobs/{{ job.id }}/cancel">
+    <button type="submit">{{ "Cancel" if job.status == "pending" else "Stop" }}</button>
+  </form>
+  {% endif %}
+{% elif job.status == "cancelled" %}
+  <p style="color:var(--mut)">Cancelled after completing {{ progress.chunks_done }}
+  of {{ progress.chunks_expected }} chunk{{ "s" if progress.chunks_expected != 1 }}.
+  {%- if job.endpoint %} Was running on <code>{{ job.endpoint }}</code>.{% endif %}
+  Not an error — this was requested.</p>
+  {{ revive_box(job, progress, revive_preview) }}
 {% endif %}
 
 <div class="tbl-wrap"><table>
@@ -26,6 +211,7 @@
   {% if job.finished_at %}<tr><th>Finished</th><td>{{ job.finished_at[:19].replace("T"," ") }}</td></tr>{% endif %}
   {% if job.chunks %}<tr><th>Chunks</th><td>{{ job.chunks }}</td></tr>{% endif %}
   {% if job.total_s %}<tr><th>Wall clock</th><td>{{ "%.1f s"|format(job.total_s) }}</td></tr>{% endif %}
+  {% if job.endpoint %}<tr><th>Endpoint</th><td><code>{{ job.endpoint }}</code></td></tr>{% endif %}
 </table></div>
 
 {% if job.instruction %}
@@ -34,13 +220,75 @@
 {% endif %}
 
 {% if job.status == "failed" %}
-  <h3>Error</h3><pre>{{ job.error }}</pre>
+  <div style="border:1px solid #c0392b;border-radius:8px;padding:.9rem 1.1rem;
+       margin:.6rem 0 1.2rem;background:color-mix(in srgb, #c0392b 8%, transparent)">
+    <h3 style="margin:.1rem 0;color:#c0392b">This job failed{% if progress.attempts > 1 %}
+      after {{ progress.attempts }} attempts{% endif %}</h3>
+    <p style="margin:.2rem 0;color:var(--mut);font-size:.85rem">
+      Got through {{ progress.chunks_done }} of {{ progress.chunks_expected }}
+      chunk{{ "s" if progress.chunks_expected != 1 }} before failing
+      {%- if job.endpoint %}, running against <code>{{ job.endpoint }}</code>{% endif %}.
+      {%- if progress.chunks_done > 0 %} Those chunk summaries are kept on disk,
+      in case this job is ever moved back to pending and resumed.{% endif %}
+    </p>
+    <pre style="margin:.4rem 0 0">{{ job.error }}</pre>
+  </div>
+  {{ revive_box(job, progress, revive_preview) }}
 {% elif job.status == "done" %}
   <h3>Result <span style="font-weight:400;color:var(--mut);font-size:.8rem">—
     <a href="/jobs/{{ job.id }}/text">copy box</a> ·
     <a href="/jobs/{{ job.id }}/result">plain text</a> ·
     <a href="/api/jobs/{{ job.id }}">JSON</a></span></h3>
-  <pre>{{ job.result }}</pre>
+  {% if citations %}
+    {# Rendered from parsed segments rather than job.result whenever this was a
+       multi-chunk job, EVEN IF nothing resolved: the parser has already excised
+       any invented marker, and dumping the raw text instead would put
+       "[Section 47]" back on the page looking exactly like a citation. The raw
+       text is still available verbatim behind the copy box / plain text /
+       JSON links above -- this page shows what can be stood behind, those
+       show what the model actually wrote. #}
+    <pre>{% for seg in citations.segments %}{% if seg.kind == "text" %}{{ seg.text }}{% else %}<a class="cite" href="#section-{{ seg.section }}"
+      title="Section {{ seg.section }}, characters {{ seg.start }}–{{ seg.end }} of the source. The model said this paragraph drew on that section. Nothing has checked that the section supports it.">{{ seg.section }}</a>{% endif %}{% endfor %}</pre>
+
+    <div class="cite-note">
+      {% if citations.has_citations %}
+        <p><strong>What the numbers mean, and what they do not.</strong>
+        A number is the section the model said that paragraph drew on. It links to
+        that section below, and to the exact character range of the source it
+        covers. <strong>That is a claim about where the model looked — not a check
+        that the section actually supports the sentence.</strong> Nothing here has
+        verified it; only reading the section does that. Treat a number as "start
+        reading here", not as a guarantee.</p>
+      {% else %}
+        <p><strong>No citations in this result.</strong> The reduce step was asked
+        to tag each paragraph with the section it drew on, and this result carries
+        no usable tag. The summary is not wrong and is not incomplete — it is
+        simply unattributed, exactly as every result was before this feature
+        existed. To check a claim, use the section list below and find the span by
+        hand.</p>
+      {% endif %}
+      {% if citations.dropped_count %}
+        <p class="cite-drop"><strong>{{ citations.dropped_count }} marker{{ "s" if citations.dropped_count != 1 }} dropped.</strong>
+        The model cited
+        {% for d in citations.dropped %}<code>{{ d.marker }}</code>{% if d.count > 1 %} ×{{ d.count }}{% endif %}{% if not loop.last %}, {% endif %}{% endfor %},
+        but this document has {{ sections|length }} section{{ "s" if sections|length != 1 }}.
+        {{ "They were" if citations.dropped_count != 1 else "It was" }} removed rather
+        than linked: a link to a section that does not exist would point somewhere
+        real-looking and wrong, which is worse than no citation. A result that drops
+        many markers is worth looking at — the model is not following the labels it
+        was given.</p>
+      {% endif %}
+      {% if citations.unparsed_count %}
+        <p class="cite-drop">{{ citations.unparsed_count }} marker-shaped
+        phrase{{ "s were" if citations.unparsed_count != 1 else " was" }} left as plain
+        text, not in the <code>[Section N]</code> form and so not resolvable:
+        {% for u in citations.unparsed %}<code>{{ u.marker }}</code>{% if u.count > 1 %} ×{{ u.count }}{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}.
+        Left in place rather than deleted — it is the model's own text.</p>
+      {% endif %}
+    </div>
+  {% else %}
+    <pre>{{ job.result }}</pre>
+  {% endif %}
 {% endif %}
 
 {% if sections %}
@@ -49,7 +297,10 @@
   document is only usable if you can check it. Each section below records the exact
   character range of the original it came from.</p>
   {% for s in sections %}
-    <details style="border:1px solid var(--line);border-radius:6px;padding:.6rem;margin-bottom:.5rem">
+    {# id is what a [Section N] citation in the result links to. N is idx+1 --
+       the same binding parse_section_citations resolves through, so the link
+       target and the cited span are the same chunk by construction. #}
+    <details id="section-{{ s.idx + 1 }}" style="border:1px solid var(--line);border-radius:6px;padding:.6rem;margin-bottom:.5rem">
       <summary>Section {{ s.idx + 1 }}
         <code style="color:var(--mut);font-size:.8rem">chars {{ s.start_char }}–{{ s.end_char }}</code></summary>
       <p>{{ s.summary }}</p>
@@ -63,4 +314,100 @@
 <pre>{{ job.document[:4000] }}{% if job.document|length > 4000 %}
 
 … truncated for display ({{ job.document|length }} characters total){% endif %}</pre>
+
+{% if job.status == "running" %}
+<script>
+// Progressive enhancement ONLY -- see the comment above the <meta refresh>
+// tag near the top of this page. Plain setInterval + fetch against a cheap
+// SQLite-only JSON endpoint: no websocket, no SSE, nothing that can wedge,
+// and a closed tab costs nothing because there is no connection to leave open.
+(function () {
+  "use strict";
+  var url = "/jobs/{{ job.id }}/progress";
+  var pollMs = 3000;  // no faster than 2-3s, per this project's own standing rule
+
+  // Mirrors the basis_labels dict in the server-rendered version of this box
+  // (see the Jinja above) -- three tiers, never collapsed into one "measured"
+  // bucket: a rate calibrated on this job's own first couple of chunks is a
+  // materially different claim from the cluster-wide average, which is in
+  // turn different from the unconditioned fallback constant.
+  var BASIS_LABELS = {
+    job: "measured from this job's own chunks so far",
+    measured: "measured from this cluster's completed jobs",
+    estimate: "estimate — not yet calibrated"
+  };
+
+  function setText(id, text) {
+    var el = document.getElementById(id);
+    if (el && text !== undefined && text !== null) el.textContent = text;
+  }
+
+  function fmt1(n) { return (n === null || n === undefined) ? "—" : n.toFixed(1); }
+
+  function paint(d) {
+    setText("lp-chunks", d.chunks_done);
+    setText("lp-expected", d.chunks_expected);
+    setText("lp-chunk-n", Math.min(d.chunks_done + 1, d.chunks_expected));
+    if (d.elapsed_s !== null && d.elapsed_s !== undefined) {
+      setText("lp-elapsed", Math.round(d.elapsed_s) + "s");
+    }
+    if (d.eta_human) {
+      setText("lp-eta", d.eta_human);
+      setText("lp-eta-basis", "(" + (BASIS_LABELS[d.eta_basis] || d.eta_basis) + ")");
+    }
+    // tok_s is null until this job has produced at least one real (non-
+    // resumed) timed chunk -- the box may not exist yet on first paint if the
+    // page was rendered before any chunk landed, so guard every element.
+    if (d.tok_s) {
+      setText("lp-prefill", fmt1(d.tok_s.last_prefill_tok_s) + " tok/s");
+      setText("lp-prefill-avg", fmt1(d.tok_s.avg_prefill_tok_s));
+      setText("lp-gen", fmt1(d.tok_s.last_gen_tok_s) + " tok/s");
+      setText("lp-gen-avg", fmt1(d.tok_s.avg_gen_tok_s));
+      setText("lp-n-timed", d.tok_s.n_timed);
+    }
+    // The job reached a terminal state while this tab was open -- reload once
+    // to pick up the result/error section, which this lightweight endpoint
+    // deliberately does not carry (it never returns job.result or the full
+    // document). Stop polling either way; there is nothing further to learn.
+    if (d.status !== "pending" && d.status !== "running") {
+      clearInterval(timer);
+      window.location.reload();
+    }
+  }
+
+  function poll() {
+    fetch(url, {cache: "no-store"})
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d) paint(d); })
+      .catch(function () { /* one missed poll is not worth reporting */ });
+  }
+
+  poll();
+  var timer = setInterval(poll, pollMs);
+  // Belt-and-braces: stop even if the terminal-state check above never fires
+  // (e.g. this tab is backgrounded through the actual completion).
+  window.addEventListener("pagehide", function () { clearInterval(timer); });
+})();
+</script>
+{% endif %}
+
+{% if citations and citations.has_citations %}
+<script>
+// Progressive enhancement ONLY. Without it, clicking a citation still jumps to
+// the right <details> (it has the id, and :target highlights it) -- the reader
+// then clicks the disclosure triangle themselves. With it, the section is
+// already open when they arrive, which is the whole point of "get from a claim
+// to its source span". Nothing on this page depends on it running.
+(function () {
+  "use strict";
+  function openTarget() {
+    if (!window.location.hash) return;
+    var el = document.getElementById(window.location.hash.slice(1));
+    if (el && el.tagName === "DETAILS") { el.open = true; el.scrollIntoView(); }
+  }
+  window.addEventListener("hashchange", openTarget);
+  openTarget();
+})();
+</script>
+{% endif %}
 {% endblock %}

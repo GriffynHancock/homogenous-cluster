@@ -1,5 +1,13 @@
 {% extends "base.html" %}
 {% block body %}
+{% if unseen %}
+<div class="banner">
+  <span><strong>{{ unseen }}</strong> job{{ "s" if unseen != 1 }} finished since you last checked.</span>
+  <form method="post" action="/jobs/ack" class="inline-form">
+    <button type="submit" class="btn-sm">Dismiss</button>
+  </form>
+</div>
+{% endif %}
 
 <fieldset>
   <legend>Batch upload — multiple files, pick workflows per file</legend>
@@ -25,6 +33,19 @@
     <input type="file" name="upload" id="upload">
     <label for="document">…or paste text</label>
     <textarea name="document" id="document" placeholder="Paste the document here."></textarea>
+
+    <p class="hint">Optional guidance, one box per task — only the box for the
+      Task selected above is used. Type it, or upload a file instead (a house
+      style guide, a report template, a list of questions); a typed box and a
+      file for the same task are combined.</p>
+    {% for k in kinds %}
+      <label for="instruction_{{ k }}_single">Guidance for “{{ k }}”</label>
+      <textarea name="instruction_{{ k }}" id="instruction_{{ k }}_single"
+        placeholder="Optional guidance for the {{ k }} task…"></textarea>
+      <label for="guidance_file_{{ k }}_single">…or a guidance file for “{{ k }}”</label>
+      <input type="file" name="guidance_file_{{ k }}" id="guidance_file_{{ k }}_single">
+    {% endfor %}
+
     <button type="submit">Queue it</button>
   </form>
 </fieldset>
@@ -43,22 +64,86 @@
   <em>Approximate — word counts, not tokens.</em>{% endif %}
 </p>
 
+{% set pending_jobs = jobs | selectattr("status", "equalto", "pending") | list %}
+{% if pending_jobs | length > 1 %}
+<form method="post" action="/jobs/reorder">
+  <p style="color:var(--mut);font-size:.85rem;margin:0 0 .5rem">
+    Queue order — lower number runs first. Edit and save; it takes effect from
+    the next job the worker picks up (a job already running is not interrupted).
+  </p>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Order</th><th>Job</th><th>Task</th><th>Submitted</th></tr></thead>
+    <tbody>
+    {% for j in pending_jobs %}
+      <tr>
+        <td><input type="number" name="priority_{{ j.id }}" value="{{ j.priority }}" style="width:4.5rem"></td>
+        <td><code>{{ j.id }}</code></td>
+        <td>{{ j.kind }}</td>
+        <td>{{ j.created_at[:19].replace("T"," ") }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  <button type="submit">Save order</button>
+</form>
+{% endif %}
+
 <div class="tbl-wrap">
 <table>
   <thead><tr><th>Job</th><th>Task</th><th>Status</th><th>Chunks</th>
-             <th>Time</th><th>Submitted</th></tr></thead>
+             <th>Time</th><th>Submitted</th><th>Actions</th></tr></thead>
   <tbody>
   {% for j in jobs %}
     <tr>
       <td><a href="/jobs/{{ j.id }}"><code>{{ j.id }}</code></a></td>
       <td>{{ j.kind }}</td>
-      <td><span class="badge {{ j.status }}">{{ j.status }}</span></td>
+      <td><span class="badge {{ j.status }}">{{ j.status }}</span>
+        {%- if j.status in ("done","failed","cancelled") and not j.seen_at %}<span class="new-flag">NEW</span>{% endif %}</td>
       <td>{{ j.chunks if j.chunks is not none else "—" }}</td>
       <td>{{ "%.0fs"|format(j.total_s) if j.total_s else "—" }}</td>
       <td>{{ j.created_at[:19].replace("T"," ") }}</td>
+      <td>
+        {% if j.status == "pending" %}
+        <form method="post" action="/jobs/{{ j.id }}/cancel" class="inline-form">
+          <button type="submit" class="btn-sm">Cancel</button>
+        </form>
+        {% elif j.status == "running" %}
+          {% if j.cancel_requested %}
+          <span style="color:var(--mut);font-size:.75rem">stopping…</span>
+          {% else %}
+          <form method="post" action="/jobs/{{ j.id }}/cancel" class="inline-form">
+            <button type="submit" class="btn-sm">Stop</button>
+          </form>
+          {% endif %}
+        {% else %}—{% endif %}
+      </td>
     </tr>
   {% else %}
-    <tr><td colspan="6" style="color:var(--mut)">No jobs yet.</td></tr>
+    <tr><td colspan="7" style="color:var(--mut)">No jobs yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<h3 style="font-size:1rem;margin:2rem 0 .5rem">Inference endpoints</h3>
+<p style="color:var(--mut);font-size:.85rem">
+  One worker per endpoint, each claiming jobs independently. A node that fails
+  its health check stops claiming but is retried periodically, and rejoins on
+  its own once it answers again — it never fails the queue.
+</p>
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Endpoint</th><th>Status</th><th>Working on</th><th>Checked</th></tr></thead>
+  <tbody>
+  {% for ep in endpoints %}
+    <tr>
+      <td><code>{{ ep.url }}</code></td>
+      <td><span class="badge {{ ep.css }}">{{ ep.label }}</span></td>
+      <td>{% if ep.current_job %}<a href="/jobs/{{ ep.current_job }}"><code>{{ ep.current_job }}</code></a>{% else %}idle{% endif %}</td>
+      <td>{{ ep.last_checked[:19].replace("T"," ") if ep.last_checked else "—" }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" style="color:var(--mut)">No inference endpoints configured.</td></tr>
   {% endfor %}
   </tbody>
 </table>

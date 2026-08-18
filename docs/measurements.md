@@ -826,3 +826,151 @@ A real completion, verbatim, from the run:
 
 On-topic, accurate, and coherent — so the throughput above was not bought by
 degrading output, per the standing rule in `CLAUDE.md`.
+
+---
+
+## ik_llama.cpp vs mainline through `llama-server` — the RELIABILITY A/B, and why F27's numbers do not transfer
+
+**Node 2 (10.10.0.39), 2026-08-18, 07:30–08:00.** Same machine, same model file
+(`gpt-oss-120b-F16.gguf`), same flags (`-t 4 -c 32768 --parallel 4 --host 0.0.0.0
+--port 8080 --no-warmup --jinja`), same `/v1/chat/completions` client, and — the
+point of the exercise — **the same prompts in the same order**, taken from the real
+document in job `06af2911d7fc` chunked at `chunk_tokens=1024`. `max_tokens=64` so
+the comparison is prefill-dominated and cheap to repeat.
+
+**This measurement exists because F27's does not describe the deployment.** F27 used
+`llama-bench`, which issues one sequence. The server runs four slots. See F40.
+
+### The headline is not a speed number, it is a survival number
+
+| Request | prompt tokens | ik_llama.cpp `8337e4cd` | mainline `b10369` |
+|---|---:|---|---|
+| 1 | 1339 | ok | ok |
+| 2 | 1410 | ok | ok |
+| 3 | 1126 | ok | ok |
+| 4 | 1060 | ok | ok |
+| **5** | 995 | **FATAL — `iqk_flash_attn.cpp:347`, server wedged** | **ok** |
+
+Reproduced on ik **twice from a clean restart**, both times on request 5, both times
+on the slot-0 wrap-around. Mainline logged `kv_unified = 'false'` at startup — each
+slot owns its own KV cache — and **completed all 9 requests of the run, two full
+slot cycles**, ending `ALL REQUESTS SURVIVED`.
+
+### Speed, on the requests both engines completed
+
+Read from the servers' own `slot print_timing` lines, never from client-side
+timing (F17).
+
+| prompt tokens | ik prefill (tok/s) | mainline prefill (tok/s) | ik advantage | ik gen (tok/s) | mainline gen (tok/s) |
+|---:|---:|---:|---:|---:|---:|
+| 1339 | 23.25 | 16.29 | **+42.7%** | 5.21 | 5.26 |
+| 1410 | 21.46 | 16.26 | **+32.0%** | 5.22 | 5.26 |
+| 1126 | 19.64 | 16.27 | **+20.7%** | 5.24 | 5.34 |
+| 1060 | 18.76 | 16.36 | **+14.7%** | 5.24 | 5.34 |
+
+End-to-end wall clock for the same four requests: ik **69.9 / 78.0 / 69.5 / 68.7 s**
+against mainline **94.4 / 98.9 / 81.2 / 76.8 s** — ik ahead by 26% / 21% / 14% / 11%.
+
+**Three corrections to what F27 led this project to expect:**
+
+1. **The prefill advantage is not a flat +52%, and it decays.** Through the server on
+   real harmony-templated requests it ran **+43% down to +15%**, because ik's own
+   prefill rate falls monotonically as the KV cache fills (23.25 → 21.46 → 19.64 →
+   18.76 tok/s) while **mainline's does not move** (16.29, 16.26, 16.27, 16.36 —
+   a spread of 0.6%, and if anything trending up). F27's `pp512`/`pp2048` pair could
+   not show this: it measures a cold cache twice.
+2. **The −14% generation penalty did not appear.** Both engines generated at
+   **~5.2–5.3 tok/s**, indistinguishable. F27's mainline figure of 6.04 tok/s came
+   from `llama-bench`; through `llama-server` with `--jinja` and four slots, mainline
+   generates at 5.26. The trade F27 described — buy prefill, pay generation — is not
+   the trade actually on offer.
+3. **So the honest end-to-end figure for adopting ik is ~+11% to +26% on short
+   requests, not +22% guaranteed** — and it is only collectable for four requests.
+
+### What this costs, and what it buys
+
+Moving node 2 to mainline costs roughly **20% of prefill throughput** on
+document work. It buys a server that finishes the document. Given that prefill is
+79% of wall clock, ~20% of prefill is ~16% of end-to-end — **the price of the
+mitigation is about one sixth of the time, against a current failure rate of 100%
+of jobs longer than four chunks.**
+
+Untested, and both must be measured before either is adopted (F40): ik at
+`--parallel 1`, and ik with flash attention explicitly off.
+---
+
+## Watchdog liveness signals — what separates BUSY from WEDGED (2026-08-18)
+
+Measured on node 1, `llama-server@8080.service`, ik_llama.cpp, gpt-oss-120b-F16,
+`-t 4 -c 32768 --parallel 4`, `n_threads_http=7`, `n_ctx_slot=8192`. These are the
+numbers `cluster/llama-watchdog.sh` is built on.
+
+### Cgroup CPU (`CPUUsageNSec`) — the discriminator
+
+| Server state | 3 s window | 10 s window | 20 s window | % of one core |
+|---|---:|---:|---:|---:|
+| idle | **0 ms** | **0 ms** | **0 ms** | 0% |
+| ONE real completion in flight | 12,028 ms | 40,046 ms | — | **400%** |
+| 4 concurrent completions | — | 39,827–40,161 ms | — | **398–401%** |
+| SIGSTOPped (simulated wedge) | — | 0 ms | 0 ms | 0% |
+
+Exactly zero against exactly 400%, holding across six consecutive 10 s windows
+spanning both prefill and generation. **The 3 s window separates them as cleanly
+as the 20 s window**, so the 10 s default is margin, not necessity.
+
+Machine-wide **load average was 2.27–3.09 throughout**, from unrelated agent
+processes — which is why load average is not usable here (F39: node 1 read 2.30
+while llama-server was completely idle).
+
+### `/health` latency, and why its timeout is not diagnostic
+
+On an idle (CPU-flat) server, 20 consecutive samples:
+
+| endpoint | min | max | codes |
+|---|---:|---:|---|
+| `/health` (loopback) | 0.736 ms | 0.912 ms | 200 × 20 |
+| `/health` (via 10.10.0.34) | 0.712 ms | 1.211 ms | 200 × 10 |
+| `/props` | 0.649 ms | 0.710 ms | 200 × 5 |
+
+Because CPU is checked first, `/health` is only ever asked when the unit burned
+no CPU — i.e. when a healthy server is idle. In that branch it answers in under
+a millisecond or never. **Any timeout above a few hundred ms yields the same
+verdict**; 5 s is used purely for transport headroom (~520× F28's 9.544 ms
+saturated RTT).
+
+### The probe's own footprint on a busy server
+
+One `curl --max-time 5 /health` issued during four concurrent completions:
+curl gave up at 5.001 s; the server logged the request **75 seconds later** with
+`status=200`. That is 75 s of one of seven http workers pinned in
+`queue_results.recv()`, per probe. Across a **ten-tick busy run the CPU-first
+watchdog issued zero HTTP requests** (`log_server_request` count over the whole
+window: **0**).
+
+### Per-service signals — the CPU predicate does NOT generalise
+
+| service | idle CPU over the window | idle is… | predicate used |
+|---|---:|---|---|
+| `llama-server@8080` | 0 ms | a **fault** when silent | cgroup CPU, then `/health` |
+| `rpc-server@50052` | **0 ms while perfectly healthy** | **NORMAL** | unit active + RPC port accepting *on the node* |
+| `missing-link` | 5,061 ms / 3 s = **0.17% of a core** | **NORMAL** | HTTP + read-only job-store counters |
+
+Applying the llama-server predicate to either of the other two would restart
+healthy services on an idle cluster.
+
+### `/proc/<MainPID>/stat` is unusable on this fleet
+
+`llama-server@.service` runs `ExecStart=/bin/sh -c '...'` and the shell does not
+exec away: `MainPID=72777` is `comm=sh`, 1 thread, `utime=0 stime=0`, while its
+child `72781` (`comm=llama-server`) burns 400% of a core. The `utime+stime`
+signal recommended in `docs/watchdog-research.md` reads **identically zero** here
+and would classify every busy server as wedged. Cgroup accounting covers both
+processes; `CPUUsageNSec` 6,569,646,000 ns == `cpu.stat usage_usec` 6,569,646.
+
+### Missing Link's job store is in WAL mode
+
+`pragma journal_mode` → `wal`. A read-only SQLite connection to a WAL database
+needs **write** access to the `-shm` index, so `mode=ro` as the unprivileged
+watchdog user returns `-1` for every count while succeeding for the owner. The
+watchdog is not given write access to the job store; the query is re-run as the
+store's own user through one narrow `sudoers` rule.

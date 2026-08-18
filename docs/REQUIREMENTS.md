@@ -141,19 +141,22 @@ certainly yes, and unmeasured.
 
 ## Open requirements not yet met
 
+**Updated 2026-08-18** — verified against the merged code (`main` at `33ddc79`),
+not just against the earlier "in progress" claim.
+
 | Requirement | State |
 |---|---|
-| Batch upload | in progress |
-| Document table with previews + per-row workflow tick boxes | in progress |
-| Per-workflow prompt inputs | in progress |
-| Navigation / no orphaned routes | in progress |
-| Raw-text output page | in progress |
-| Cancel + reorder pending jobs | in progress |
-| Stop a running job | in progress, with a stated limit |
-| Resume from intermediate artifacts | in progress |
-| Notification on completion | in progress |
-| Watchdog moved off-cluster | **not started — needs hardware** |
-| Chunk-size / quant-format measurement | **not started** (`DESIGN-NOTES.md` H) |
+| Batch upload | **done** — `POST /batch`, multi-file |
+| Document table with previews + per-row workflow tick boxes | **done** — `batch.html`; text preview (first 200 chars), a page-1 image thumbnail was considered and deliberately rejected (`app.py`, `PREVIEW_CHARS` comment) rather than left undone |
+| Per-workflow prompt inputs | **done** — typed textarea or uploaded file per workflow, refused (not truncated) over a measured size cap |
+| Navigation / no orphaned routes | **done** — top-level nav in `base.html`; every route reachable by clicking through from the index or a job page |
+| Raw-text output page | **done** — `GET /jobs/{id}/text`, linked from the job page |
+| Cancel + reorder pending jobs | **done** — `POST /jobs/{id}/cancel`, `POST /jobs/reorder` |
+| Stop a running job | **done, with the stated limit** — cooperative only, cannot interrupt an in-flight HTTP call |
+| Resume from intermediate artifacts | **done** — chunk summaries persist per chunk; a resume is trusted only if the recorded model AND instruction both match what is currently serving |
+| Notification on completion | **done** — `seen_at` flag + unseen-jobs banner, `POST /jobs/ack` |
+| Watchdog moved off-cluster | **in progress** — an agent is building the multi-node version now; `cluster/llama-watchdog.sh` still runs on-node today |
+| Chunk-size / quant-format measurement | **in progress on node 2** — `llama-server@8080` up there, `rpc-server@50052` deliberately stopped for the duration (`DESIGN-NOTES.md` H) |
 
 ---
 
@@ -202,3 +205,19 @@ same sequence in front of a non-technical user during setup and several fail sil
    conventions in `CLAUDE.md`.
 3. **Scripts must be re-runnable and must verify their own effect** — the discipline
    `setup.sh` already follows, and the reason the five N=2 bugs (F30) were survivable.
+
+**Status, 2026-08-18: requirement 2 is done.** `PreToolUse` hooks are implemented in
+`.claude/settings.json` + `.claude/hooks/cluster-guard.py`, both now tracked (the
+`.gitignore` rule was narrowed from `.claude/` to `.claude/*` plus negations, so the
+guard travels with the repo). `git add -A`, `git commit -a`, `pkill -f` and inline
+Python that does not compile are blocked outright; cluster service control, `git push`,
+mutating SQL against the live job store, writes to `/opt/models`, and git operations in
+the live checkout are gated to the operator. **Tested in both directions** — 105 harness
+cases plus an end-to-end run under `--dangerously-skip-permissions` — and swept against
+1071 lines of this repo's own scripts for false positives. Requirements 1 and 3 are
+unchanged and still stand.
+
+**Read `docs/AGENT-HARDENING.md`** for the rule-by-rule evidence, what is deliberately
+*not* hooked, and — most important for the Skill — **what a hook fundamentally cannot
+catch.** The off-by-one SQL predicate is genuinely uncatchable by any command pattern;
+it needs a row-count-asserting helper script that does not exist yet.

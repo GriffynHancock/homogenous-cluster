@@ -17,4 +17,17 @@ llama.log
 
 # Agent worktrees and local Claude state. Never commit: the worktrees are
 # embedded git repos and committing gitlinks pollutes the repo and confuses merges.
-.claude/
+# Ignore the CONTENTS of .claude/, not the directory itself, so the two files
+# that are project policy rather than local state can be tracked. The agent
+# hardening hooks (docs/AGENT-HARDENING.md) are worthless if they only exist in
+# one checkout -- they have to travel with the repo, and later into the Skill.
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/hook-audit.log
+
+# Benchmark output. Gitignored because the corpus files embed the OPERATOR'S
+# REAL DOCUMENT TEXT -- chunk text and summaries of actual sensitive material --
+# and this repository is published. The measurements derived from these runs
+# belong in docs/measurements.md; the raw content must never leave the box.
+bench/out/

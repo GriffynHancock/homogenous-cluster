@@ -1,0 +1,72 @@
+# Dependencies for the faithfulness audit ledger (missing_link/audit.py) ONLY.
+#
+# WHY A SEPARATE FILE AND NOT AN EXTRA IN requirements.txt
+# -------------------------------------------------------
+# `requirements.txt` is the PRODUCTION install for the web UI and the worker --
+# the thing that runs on every node. This file adds ~1.5 GB of model stack for a
+# tool that is not wired into the pipeline and is run by hand. Two files keeps
+# that separation impossible to get wrong by accident; a `[audit]` extra in a
+# pyproject would also work, but `missing-link` has no pyproject to put it in, so
+# adding packaging machinery just to express "these are optional" would be more
+# change, not less. `missing_link/audit.py` imports torch/transformers/minicheck
+# lazily inside `MiniCheckScorer.load()`, so the module imports and its tests run
+# in the production venv with none of this installed
+# (tests/test_audit.py::test_no_heavy_imports enforces exactly that).
+#
+# THE CUDA TRAP -- MEASURED, NOT ASSUMED
+# --------------------------------------
+# The MiniCheck README's documented install pulls a full CUDA 13.0 torch build on
+# this GPU-less box: ~2 GB of dead `nvidia-cu*` wheels and a 5.2 GB venv
+# (docs/minicheck-spike.md section 1). Installing from the CPU-only wheel index
+# instead was verified on node 1 on 2026-08-18: torch 2.13.0+cpu, no nvidia-*
+# wheels at all, 1.5 GB venv -- a 3.7 GB saving with identical behaviour
+# (inference is CPU either way; `torch.cuda.is_available()` was already False).
+#
+# INSTALL -- FOUR STEPS, IN THIS ORDER (verified end to end on node 1, 2026-08-18)
+# ---------------------------------------------------------------------------
+#   python3 -m venv .venv-audit
+#   .venv-audit/bin/pip install --upgrade pip
+#   .venv-audit/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   .venv-audit/bin/pip install -r requirements-audit.txt
+#   .venv-audit/bin/python -c "import nltk; nltk.download('punkt_tab')"
+#
+# Torch second, from the CPU index, on its own line. Doing it in one command
+# means resolving every other package against the pytorch index too, which does
+# not carry them. Once torch is present pip leaves it alone, because `minicheck`
+# requires only an unpinned `torch`.
+#
+# The `--upgrade pip` line is NOT boilerplate. Debian 12 ships pip 23.0.1, which
+# dies part-way through this install while uninstalling the distro's own
+# setuptools 66.1.1:
+#     TypeError: expected string or bytes-like object, got 'NoneType'
+#     (pip/_vendor/packaging/version.py, parsing a None version)
+#
+# AND IF THAT CRASH HAPPENS, DELETE THE VENV -- DO NOT RETRY IN PLACE. Observed
+# on this box: after the crash, re-running the same install with a newer pip
+# silently re-resolved torch to the CUDA build, pulling 17 `nvidia-*` wheels and
+# taking the venv to 5.2 GB. Starting from an empty venv in the order above
+# gives 1.5 GB and zero `nvidia-*` packages.
+#
+# TWO UNDOCUMENTED REQUIREMENTS THE UPSTREAM README DOES NOT MENTION
+# -----------------------------------------------------------------
+# 1. `accelerate` is required but is NOT in minicheck's own `dependencies`.
+#    `Inferencer.__init__` calls `from_pretrained(..., device_map="auto")`, and
+#    current transformers raises `ValueError: Using a device_map ... requires
+#    accelerate`. It is listed below because upstream forgot to.
+# 2. `nltk` needs `punkt_tab`, not just `punkt` -- hence the download line above.
+#    Without it: `LookupError: Resource 'punkt_tab' not found`.
+#
+# MODEL CHECKPOINTS
+# -----------------
+# ~5.9 GB, fetched from the HF Hub on first use (measured 315 s cold, 3.4 s warm
+# from cache). Point them somewhere with room:
+#   export MINICHECK_CACHE_DIR=/path/with/space
+# or pass --cache-dir. On an air-gapped cluster this directory has to be
+# populated out of band; there is no offline fallback.
+
+# torch is NOT listed here on purpose -- see the two-step install above. Listing
+# it would let a one-line `pip install -r` pull the CUDA build back in.
+minicheck @ git+https://github.com/Liyan06/MiniCheck.git@main
+accelerate==1.14.0
+transformers==5.15.0
+nltk==3.10.3

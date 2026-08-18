@@ -1,16 +1,20 @@
 """Missing Link web API and UI.
 
-Deliberately minimal: no auth, no priorities, no distributed workers. It runs
-on an isolated network by design (see the security posture in CLAUDE.md --
-securing the network is the organisation's responsibility, and this app makes
-no claim to help).
+Deliberately minimal: no auth, no distributed workers. It runs on an isolated
+network by design (see the security posture in CLAUDE.md -- securing the
+network is the organisation's responsibility, and this app makes no claim to
+help).
 
 The point of this layer is that slowness stops being a defect. A chat window
-makes a user wait; a job queue lets them submit and leave.
+makes a user wait; a job queue lets them submit and leave. Queue control
+(reordering, cancel/stop) and a completion marker exist for the same reason:
+"submit and leave" only works if leaving does not mean losing control of the
+queue, or missing that something finished.
 """
 import os
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
@@ -22,6 +26,39 @@ from missing_link import db, extract, worker
 
 DB_PATH = os.environ.get("MISSING_LINK_DB", "/opt/missing-link/jobs.sqlite")
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8080")
+
+# R inference endpoints, not one. `provisioning/nodes.env` already carries this
+# list as the bash array INFERENCE_ENDPOINTS -- kept deliberately separate from
+# the RPC endpoints (see nodes.env: under replication these are R independent
+# llama-servers, not a shard coordinator). LLAMA_URLS is the Python-side
+# equivalent: comma-separated, so it can be set straight from that same list.
+#
+# Falling back to the single LLAMA_URL keeps a one-endpoint deployment behaving
+# EXACTLY as before -- one worker, one server, same as pre-fan-out.
+_LLAMA_URLS_ENV = os.environ.get("LLAMA_URLS")
+if _LLAMA_URLS_ENV:
+    LLAMA_URLS = [u.strip() for u in _LLAMA_URLS_ENV.split(",") if u.strip()]
+else:
+    LLAMA_URLS = [LLAMA_URL]
+
+# Per-endpoint status, read by /health and the index page. Plain dict rather
+# than anything fancier: each entry is only ever written by its own worker
+# task (see _worker_loop) and read by request handlers, and CPython's GIL makes
+# single dict-key assignment atomic, so no lock is needed for this -- the same
+# level of care the rest of this module uses elsewhere.
+ENDPOINT_STATE = {
+    url: {"reachable": None, "current_job": None, "last_checked": None, "last_error": None}
+    for url in LLAMA_URLS
+}
+
+# Capped backoff for an endpoint that fails its health probe: retried
+# periodically rather than spun hot, but short enough to rejoin within a
+# minute of coming back. Module-level constants (not literals inside the loop)
+# so tests can shrink them instead of sleeping for real seconds.
+WORKER_BACKOFF_BASE_S = 5
+WORKER_BACKOFF_CAP_S = 60
+WORKER_IDLE_POLL_S = 5
+
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 # The preview a non-specialist gets per uploaded document, in the batch review
@@ -43,13 +80,22 @@ async def lifespan(_app: FastAPI):
     if stranded:
         print(f"[startup] requeued {stranded} job(s) stranded by a previous run")
 
-    task = None
+    # requeue_running() runs exactly once, here, BEFORE any worker task exists
+    # -- see its docstring in db.py. That ordering is what keeps it safe now
+    # that there is more than one worker: every 'running' row it finds was
+    # stranded by a PREVIOUS process, never by a sibling worker in this one.
+    tasks = []
     if not os.environ.get("MISSING_LINK_NO_WORKER"):
-        task = asyncio.create_task(_worker_loop())
+        # One worker per inference endpoint (job-level fan-out, not
+        # chunk-level -- see docs/DESIGN-NOTES.md section G). Each claims jobs
+        # independently against the shared queue; db.claim_next_pending's
+        # BEGIN IMMEDIATE (F20) is what makes that safe with more than one
+        # claimer.
+        tasks = [asyncio.create_task(_worker_loop(url)) for url in LLAMA_URLS]
     try:
         yield
     finally:
-        if task is not None:
+        for task in tasks:
             task.cancel()
 
 
@@ -62,12 +108,56 @@ def index(request: Request):
         request, "index.html",
         {"jobs": db.list_jobs(DB_PATH), "kinds": sorted(worker.PROMPTS),
          "rate": _rate_note(), "backlog": db.pending_chunk_backlog(DB_PATH),
-         "tput": db.throughput_stats(DB_PATH), "active": "home"},
+         "tput": db.throughput_stats(DB_PATH), "active": "home",
+         # How a returning user finds out what finished without polling every
+         # job page. See db.count_unseen.
+         "unseen": db.count_unseen(DB_PATH),
+         # One row per inference endpoint. Under replication a node failure
+         # costs 1/R of throughput rather than the job, so the operator needs to
+         # see WHICH endpoint went away -- otherwise the only symptom is "it got
+         # slower". See _endpoint_rows.
+         "endpoints": _endpoint_rows()},
     )
 
 
+async def _resolve_instruction(form, kind):
+    """Combine typed guidance with an optional guidance FILE, for one workflow.
+
+    Guidance -- typed or extracted from a file -- is embedded in every map and
+    reduce call for jobs of this kind (worker.build_prompt / build_reduce_prompt
+    via `{instruction}`). A guidance file therefore goes through the SAME
+    extract.extract() as a document upload: it sniffs magic bytes and REFUSES
+    what it cannot read rather than degrading it (F38 -- a PDF decoded as UTF-8
+    was silently summarised as binary and stored 'done'; a guidance file that
+    cannot be read must fail the same way a document that cannot be read does).
+
+    The combined text is then checked against worker.check_instruction_length
+    BEFORE it can reach a job: guidance is repeated on every map call, so an
+    oversized style guide must be refused with the limit named, not silently
+    truncated. Raises HTTPException(400) naming the workflow on either failure.
+    """
+    typed = (form.get(f"instruction_{kind}") or "").strip()
+    upload = form.get(f"guidance_file_{kind}")
+    file_text = ""
+    if upload is not None and getattr(upload, "filename", None):
+        raw = await upload.read()
+        try:
+            file_text = extract.extract(raw, upload.filename).strip()
+        except extract.ExtractionError as exc:
+            raise HTTPException(400, f"guidance file for '{kind}': {exc}")
+
+    combined = "\n\n".join(part for part in (typed, file_text) if part) or None
+    if combined:
+        try:
+            worker.check_instruction_length(combined)
+        except worker.GuidanceTooLong as exc:
+            raise HTTPException(400, f"guidance for '{kind}': {exc}")
+    return combined
+
+
 @app.post("/jobs")
-async def submit(kind: str = Form(...),
+async def submit(request: Request,
+                 kind: str = Form(...),
                  document: str = Form(""),
                  upload: UploadFile | None = File(None)):
     if kind not in worker.PROMPTS:
@@ -88,7 +178,13 @@ async def submit(kind: str = Form(...),
     if not text:
         raise HTTPException(400, "no document supplied")
 
-    job_id = db.create_job(DB_PATH, kind, text)
+    # Only the guidance box matching the chosen `kind` applies -- see
+    # _resolve_instruction and templates/index.html, which shows one box per
+    # workflow the same way the batch review page does.
+    form = await request.form()
+    instruction = await _resolve_instruction(form, kind)
+
+    job_id = db.create_job(DB_PATH, kind, text, instruction)
     return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
 
@@ -153,10 +249,8 @@ async def batch_confirm(request: Request, batch_id: str):
         raise HTTPException(404, "no such batch")
 
     form = await request.form()
-    instructions = {
-        kind: (form.get(f"instruction_{kind}") or "").strip() or None
-        for kind in worker.PROMPTS
-    }
+    instructions = {kind: await _resolve_instruction(form, kind)
+                    for kind in worker.PROMPTS}
 
     created = []
     for doc in docs:
@@ -210,16 +304,271 @@ def _estimate_for(job):
     return {"seconds": secs, "human": worker.humanise_seconds(secs), "basis": basis}
 
 
+def _progress_payload(job, chunks_done=None):
+    """Everything the job page's live-progress poll needs, from local reads
+    only. See the /jobs/{id}/progress route docstring for why "local reads
+    only" is load-bearing, not just an implementation detail.
+
+    `chunks_done`, if given, skips the chunk_summaries query -- job_view
+    already has the same rows (as `sections`) and would otherwise query them
+    twice per request for no reason.
+    """
+    document = job.get("document") or ""
+    n_chunks = worker.count_chunks(document) if document else 0
+    if chunks_done is None:
+        chunks_done = len(db.get_chunk_summaries(DB_PATH, job["id"]))
+    reduce_pending = (job["status"] == "running"
+                      and n_chunks > 1 and chunks_done >= n_chunks)
+
+    elapsed_s = None
+    if job.get("started_at"):
+        end_raw = job.get("finished_at") or datetime.now(timezone.utc).isoformat()
+        try:
+            elapsed_s = (datetime.fromisoformat(end_raw)
+                        - datetime.fromisoformat(job["started_at"])).total_seconds()
+        except ValueError:
+            elapsed_s = None  # malformed timestamp must not break the poll
+
+    # THREE-TIER rate, best available first, each labelled so the UI never
+    # shows a number without saying how sure it is (the operator's own
+    # standing complaint about this project: an inferred figure must look
+    # inferred). Preference order:
+    #   1. "job"      -- THIS job's own chunk timings, once there are enough
+    #                    of them (worker.MIN_JOB_TIMED_CHUNKS) to be more than
+    #                    one chunk's noise. Best predictor of what THIS job
+    #                    will do next -- it already reflects this document's
+    #                    actual chunk sizes and whatever this run's endpoint
+    #                    is currently doing.
+    #   2. "measured" -- the cluster-wide average (db.seconds_per_chunk),
+    #                    unchanged from before this job existed.
+    #   3. "estimate" -- the benchmark fallback constant, when neither of the
+    #                    above has enough samples yet.
+    job_timings = db.get_chunk_timings(DB_PATH, job["id"])
+    job_stats = worker.chunk_rate_stats(job_timings)
+    cluster_spc, _cluster_n = db.seconds_per_chunk(DB_PATH)
+
+    if job_stats and job_stats["n_timed"] >= worker.MIN_JOB_TIMED_CHUNKS \
+            and job_stats["seconds_per_chunk"]:
+        rate_spc, rate_basis = job_stats["seconds_per_chunk"], "job"
+    elif cluster_spc is not None:
+        rate_spc, rate_basis = cluster_spc, "measured"
+    else:
+        rate_spc, rate_basis = None, "estimate"
+
+    eta_seconds = eta_basis = eta_human = None
+    if job["status"] == "running":
+        eta_seconds, eta_basis = worker.remaining_seconds(
+            n_chunks, chunks_done, reduce_pending, rate_spc, rate_basis)
+        eta_human = worker.humanise_seconds(eta_seconds)
+
+    return {
+        "status": job["status"],
+        "chunks_done": chunks_done,
+        "chunks_expected": n_chunks,
+        "elapsed_s": elapsed_s,
+        "eta_seconds": eta_seconds,
+        "eta_human": eta_human,
+        "eta_basis": eta_basis,
+        # Prefill and generation tok/s, ALWAYS SEPARATE, never blended into
+        # one number -- see worker.chunk_rate_stats for why a blended figure
+        # would be meaningless on this hardware. Both None until this job has
+        # a real client.complete() timing to show (not before the first
+        # non-resumed chunk lands).
+        "tok_s": job_stats,
+        # Which endpoint (LLAMA_URLS entry) is/was running this job -- see the
+        # `endpoint` column and worker.run_one's set_job_endpoint call. Under
+        # fan-out this is the difference between "a node failed" and "it got
+        # slower" as the operator's only symptom.
+        "endpoint": job.get("endpoint"),
+        "error": job.get("error"),
+        "cancel_requested": bool(job.get("cancel_requested")),
+        # RETRY STATE. A retried job must be visibly a retried job: "attempt 3
+        # of 4, resumed from 22 of 26 chunks" is the difference between an
+        # operator seeing a queue that healed itself overnight and one seeing a
+        # job that mysteriously took three times as long. `attempts` counts
+        # STARTS (db.claim_next_pending), so it is 0 for a job that has never
+        # been claimed and 1 during an ordinary first run.
+        "attempts": int(job.get("attempts") or 0),
+        "max_attempts": worker.MAX_ATTEMPTS,
+        # Set only while a job is waiting out its backoff; also the flag that
+        # says "this pending job is a retry, not a fresh submission".
+        "retry_after": job.get("retry_after"),
+        # How many chunk summaries THIS attempt reused rather than recomputed.
+        # Deliberately not inferred from chunks_done: the resume is rejected
+        # (and the rows deleted) when the model or the instruction changed, so
+        # only the worker knows, and it records it. See db.record_resume.
+        "resumed_chunks": int(job.get("resumed_chunks") or 0),
+    }
+
+
+def _revive_preview(job, sections):
+    """What db.revive_job's resume would actually reuse, for the job page to
+    tell the operator BEFORE they click Retry -- see templates/job.html. None
+    for anything but a terminal (failed/cancelled) job, or one with no
+    persisted chunks -- there is nothing to preview in either case.
+
+    Reads db.get_recorded_model / get_recorded_instruction -- the SAME two
+    calls worker.run_one itself makes when deciding whether a resume is safe
+    -- rather than reimplementing that judgement here, so this preview and
+    the actual resume can never silently disagree.
+
+    What this CANNOT tell the operator, deliberately: which model is serving
+    RIGHT NOW. This project has a standing rule against a status page probing
+    the inference server (see job_progress's docstring and F39 -- /health,
+    /slots and /metrics all queue behind token generation on this server, so
+    a "cheap" liveness check can itself hang for as long as the job it is
+    reporting on). /props is not known to share that queue, but the rule is
+    "a status-rendering page does not call the backend", not "unless the
+    specific route seems safe today" -- and the model actually serving at the
+    NEXT claim may not even be the one serving now, once fan-out means R
+    endpoints. So this states what is RECORDED and the rule that decides
+    resume-vs-restart, not a yes/no prediction of which one will happen.
+    """
+    if job["status"] not in ("failed", "cancelled") or not sections:
+        return None
+    recorded_model = db.get_recorded_model(DB_PATH, job["id"])
+    instr_ok, recorded_instruction = db.get_recorded_instruction(DB_PATH, job["id"])
+    return {
+        "n_chunks": len(sections),
+        "model": recorded_model,
+        "instruction_matches": instr_ok and recorded_instruction == job.get("instruction"),
+    }
+
+
 @app.get("/jobs/{job_id}", response_class=HTMLResponse)
 def job_view(request: Request, job_id: str):
     job = db.get_job(DB_PATH, job_id)
     if job is None:
         raise HTTPException(404, "no such job")
+    # Viewing a finished job's page IS the acknowledgement -- the simplest
+    # "seen" interaction available without JS. Terminal-but-unread is exactly
+    # what "unseen" means; see db.count_unseen / the index banner.
+    if job["status"] in ("done", "failed", "cancelled") and job["seen_at"] is None:
+        db.mark_seen(DB_PATH, job_id)
+        job = db.get_job(DB_PATH, job_id)
+    sections = db.get_chunk_summaries(DB_PATH, job_id)
+    # Section-level citations (Tier B, docs/citation-research.md). Resolved HERE,
+    # at render time, rather than stored: it is a regex over the result plus a
+    # dict lookup on offsets that are already persisted, so there is nothing to
+    # migrate, nothing to keep in sync, and jobs that finished before this
+    # existed render correctly as "no citations" instead of needing a backfill.
+    #
+    # Only for a multi-chunk job. A single-chunk document never runs a reduce
+    # step (summarise_traced returns the one map output directly), so it was
+    # never asked for markers and their absence says nothing about the model --
+    # a distinction the page has to make, or every short document looks like the
+    # model ignored the instruction.
+    citations = None
+    if job["status"] == "done" and job["result"] and len(sections) > 1:
+        citations = worker.parse_section_citations(job["result"], sections)
     return TEMPLATES.TemplateResponse(
         request, "job.html",
         {"job": job,
-         "estimate": _estimate_for(job) if job["status"] in ("pending", "running") else None,
-         "sections": db.get_chunk_summaries(DB_PATH, job_id)})
+         "estimate": _estimate_for(job) if job["status"] == "pending" else None,
+         "sections": sections,
+         "citations": citations,
+         # Rendered server-side so the page is fully correct on first load and
+         # on every 15s no-JS refresh; the JS below only makes updates land
+         # sooner than that, it is never the only source of this data.
+         "progress": _progress_payload(job, chunks_done=len(sections)),
+         "revive_preview": _revive_preview(job, sections)})
+
+
+@app.get("/jobs/{job_id}/progress")
+def job_progress(job_id: str):
+    """Cheap JSON for the job page's live-progress poll.
+
+    SQLITE READS ONLY -- this must NEVER call llama-server. Probing the
+    inference server from a status page is the exact mistake that just cost
+    this project a 97,299-character job: /health on this build queues behind
+    token generation (it posts a METRICS task onto the same queue
+    update_slots() drains), so a "cheap" liveness probe can itself hang for as
+    long as the job it is trying to report on, under load, with idle slots.
+    Everything below comes from the jobs row, the persisted chunk_summaries
+    count, and the self-calibrating rate in db.seconds_per_chunk -- no request
+    from this handler ever leaves the process.
+
+    Poll no faster than every 2-3 seconds (see templates/job.html) -- this is
+    plain `setInterval` + `fetch`, not a persistent connection, so a closed
+    browser tab costs nothing and nothing here can wedge.
+    """
+    job = db.get_job(DB_PATH, job_id)
+    if job is None:
+        raise HTTPException(404, "no such job")
+    return _progress_payload(job)
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """Cancel a pending job, or request a cooperative stop of a running one.
+
+    Same route for both -- db.request_cancel decides which applies from the
+    job's current status. See worker.JobCancelled for exactly how far a stop
+    on a RUNNING job goes (it cannot preempt the chunk currently in flight).
+    """
+    result = db.request_cancel(DB_PATH, job_id)
+    if result is None:
+        raise HTTPException(404, "no such job")
+    return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+
+@app.post("/jobs/{job_id}/revive")
+def revive_job(job_id: str):
+    """Explicit operator override: return a FAILED or CANCELLED job to
+    'pending' with a fresh attempt budget, reusing whatever chunk summaries
+    db.revive_job left on disk (worker.run_one's ordinary resume check decides
+    how many of those actually get reused once the job is claimed -- this
+    route only performs the status transition, it does not predict the
+    outcome). See templates/job.html for what the operator is told about that
+    BEFORE they click, and db.revive_job's docstring for the full reasoning,
+    including why a cancelled job is revivable and a done one is not.
+
+    409, not a silent no-op, for a job that is not in a revivable state --
+    reachable if the job page is stale (e.g. an auto-retry claimed the job
+    between page load and this click) or if this is ever hit directly.
+    """
+    result = db.revive_job(DB_PATH, job_id)
+    if result is None:
+        raise HTTPException(404, "no such job")
+    if result != "revived":
+        raise HTTPException(409, f"job is {result}, not revivable")
+    return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+
+@app.post("/jobs/reorder")
+async def reorder_jobs(request: Request):
+    """Save a new queue order for pending jobs. Takes effect on the NEXT claim
+    (see claim_next_pending) -- a job already running finishes or is stopped
+    separately, it is not interrupted by a reorder.
+
+    Reads raw form data rather than typed FastAPI params because the field
+    names are dynamic (one `priority_<job id>` input per pending row in
+    templates/index.html) -- there is no fixed set of parameters to declare.
+    """
+    form = await request.form()
+    pending = [j for j in db.list_jobs(DB_PATH) if j["status"] == "pending"]
+
+    def sort_key(j):
+        # A missing or unparsable field must not crash the page -- fall back
+        # to the job's existing priority so a partial submission still
+        # produces a sensible (if partially unreordered) result.
+        raw = form.get(f"priority_{j['id']}")
+        try:
+            rank = float(raw)
+        except (TypeError, ValueError):
+            rank = float(j["priority"])
+        return (rank, j["created_at"], j["id"])
+
+    ordered_ids = [j["id"] for j in sorted(pending, key=sort_key)]
+    db.reorder_pending(DB_PATH, ordered_ids)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/jobs/ack")
+def acknowledge_all():
+    """Dismiss the 'N jobs finished' banner on the index page."""
+    db.mark_all_seen(DB_PATH)
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/jobs/{job_id}/result", response_class=PlainTextResponse)
@@ -255,40 +604,118 @@ def health():
     jobs = db.list_jobs(DB_PATH)
     return {
         "ok": True,
-        "llama_url": LLAMA_URL,
+        "llama_url": LLAMA_URLS[0],  # kept for backward compat with existing callers
+        "endpoints": _endpoint_rows(),
         "counts": {s: sum(1 for j in jobs if j["status"] == s)
-                   for s in ("pending", "running", "done", "failed")},
+                   for s in ("pending", "running", "done", "failed", "cancelled")},
     }
 
 
-async def _worker_loop():
-    """Single background worker.
+def _endpoint_rows():
+    """ENDPOINT_STATE as a list, with a display label/class precomputed.
 
-    Deliberately ONE worker: the cluster serves one request at a time until the
-    MoE batching question is measured (see STATUS.md). Running the blocking
-    HTTP call in a thread keeps the event loop free to serve the status page,
-    which matters because a job holds that thread for hours.
+    Precomputed here rather than in the template to keep the templates in the
+    project's existing minimal no-JS style -- plain values in, plain markup
+    out, no template-side branching on tri-state reachability.
     """
+    rows = []
+    for url in LLAMA_URLS:
+        st = ENDPOINT_STATE[url]
+        if st["reachable"] is True:
+            label, css = "reachable", "done"
+        elif st["reachable"] is False:
+            label, css = "unreachable", "failed"
+        else:
+            label, css = "unknown", "pending"  # never probed yet (e.g. just started)
+        rows.append({"url": url, "label": label, "css": css, **st})
+    return rows
+
+
+def _backoff_seconds(streak):
+    """Capped, growing backoff: `streak` failures in a row -> seconds to wait."""
+    return min(WORKER_BACKOFF_CAP_S, WORKER_BACKOFF_BASE_S * streak)
+
+
+def _probe_endpoint(client, state):
+    """Update `state` from one reachability probe. Returns True if reachable.
+
+    Split out from _worker_loop so the health-aware-routing decision is a
+    plain function a test can call directly, without driving the whole async
+    loop.
+    """
+    state["last_checked"] = datetime.now(timezone.utc).isoformat()
+    try:
+        client.assert_reachable()
+    except worker.BackendUnavailable as exc:
+        state["reachable"] = False
+        state["last_error"] = str(exc)
+        state["current_job"] = None
+        return False
+    state["reachable"] = True
+    state["last_error"] = None
+    return True
+
+
+async def _worker_loop(base_url):
+    """One background worker per inference endpoint (job-level fan-out).
+
+    Job-level, not chunk-level: chunk-level fan-out only reduces the wall-clock
+    of a SINGLE document (same total work, spread wider), while job-level fan-out
+    is what multiplies aggregate throughput -- the ~1.8x measured on two nodes.
+    See docs/DESIGN-NOTES.md section G. Chunk-level is deliberately out of scope
+    here.
+
+    Each worker owns one LlamaClient for its whole lifetime (not one per job),
+    so the per-model reasoning-kwargs detection it caches after its first call
+    is reused rather than re-probed every job.
+
+    HEALTH-AWARE ROUTING: probe /health BEFORE claiming a job, not after.
+    run_one() already has its own assert_reachable() call (F36) -- but that
+    only protects a job already claimed, and still ends with that job marked
+    FAILED. Without this pre-claim probe, a persistently dead endpoint would
+    sit in a claim-then-immediately-fail loop, taking jobs away from endpoints
+    that could actually run them. With it, a dead node just stops claiming --
+    costing 1/R of throughput, never failing the queue -- and resumes the
+    moment its health probe passes again.
+    """
+    client = worker.LlamaClient(base_url)
+    state = ENDPOINT_STATE[base_url]
+    unreachable_streak = 0
+    consecutive_errors = 0
+
+    def _on_claim(job):
+        state["current_job"] = job["id"]
+
     # EVERY iteration is guarded. Without this, any exception escaping run_one
     # kills this asyncio task SILENTLY -- an unretrieved task exception prints
     # nothing -- and the queue then stops forever with the current job frozen in
     # 'running'. Observed 2026-08-17: a job sat 'running' for seven minutes with
-    # the model server idle and not one line in the log.
+    # the model server idle and not one line in the log. Now that there is one
+    # of these per endpoint, losing this guard on just one endpoint would be
+    # just as silent -- R-1 of them would keep working and mask it.
     #
     # run_one already turns per-job failures into failed jobs. This catches the
     # rest: a corrupt database, a disk-full write, a bug in the queue itself.
-    consecutive_errors = 0
     while True:
+        if not _probe_endpoint(client, state):
+            unreachable_streak += 1
+            await asyncio.sleep(_backoff_seconds(unreachable_streak))
+            continue
+        unreachable_streak = 0
+
         try:
-            did_work = await asyncio.to_thread(worker.run_one, DB_PATH, LLAMA_URL)
+            did_work = await asyncio.to_thread(
+                worker.run_one, DB_PATH, base_url, client, _on_claim)
             consecutive_errors = 0
         except Exception as exc:  # noqa: BLE001 -- the loop must never die
             consecutive_errors += 1
-            print(f"[worker] iteration failed ({consecutive_errors}): "
+            print(f"[worker {base_url}] iteration failed ({consecutive_errors}): "
                   f"{type(exc).__name__}: {exc}", flush=True)
+            state["current_job"] = None
             # Back off so a persistent fault does not spin the CPU, but never
             # give up: the whole point of a queue is that it keeps trying.
-            await asyncio.sleep(min(60, 5 * consecutive_errors))
+            await asyncio.sleep(_backoff_seconds(consecutive_errors))
             continue
+        state["current_job"] = None
         if not did_work:
-            await asyncio.sleep(5)
+            await asyncio.sleep(WORKER_IDLE_POLL_S)

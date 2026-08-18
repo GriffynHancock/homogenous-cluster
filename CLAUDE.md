@@ -22,6 +22,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `docs/DESIGN-NOTES.md` | Analysed-but-not-built ideas, with numbers (expert parallelism, speculative decoding, replication, why-not-RAG) | current |
 | `docs/EVALUATION.md` | Which datasets and faithfulness metrics to use, and why NOT to reproduce the hallucination leaderboard | current |
 | `docs/REQUIREMENTS.md` | **What the operator actually asked for, in their words.** Outranks older "settled" decisions | current |
+| `docs/AGENT-HARDENING.md` | Which agent operations are blocked/gated and why, and what a hook fundamentally cannot catch | current |
 | `docs/UPSTREAM-PATCHES.md` | Corrections still to fold back into the plan and spec | current |
 | `provisioning/` | `join-node.sh`, `setup.sh`, `distribute.sh`, `harden-ssh.sh`, `build-*.sh`, `nodes.env`, `preseed.cfg` | — |
 | `cluster/` | `models.json` + `models.sh` (model index), `install-services.sh`, `rpc-server@.service` | — |
@@ -245,6 +246,15 @@ cluster:
    is "the whole cluster just locking itself out of the inference that it needs to
    recover itself." An 8 GB laptop running `curl` is sufficient and sufficient is
    the point. **Triage and batching may live on-node; LIVENESS may not.**
+   **Cause corrected 2026-08-18 (F40): it was not a client disconnect.** The
+   journal shows the disconnect F36 blamed happened ten minutes *after* the
+   fatal error, and the server kept serving through an earlier real disconnect.
+   It was the ik_llama.cpp abort above: `ggml_abort` forks from a multithreaded
+   process, the parent blocks in `wait4()` forever and never exits, and **the
+   forked children inherit the listening socket** — so `Restart=always` sees a
+   live process *and a port check sees an open port*. F36's symptoms and every
+   fix it produced stand; only its cause was wrong. **A liveness probe must
+   therefore test neither the process nor the port, but progress.**
 
 Extensible in two directions, because neither the hardware nor the work is
 uniform:
@@ -368,10 +378,23 @@ Settled:
 - **llama.cpp RPC** for sharding, pinned to a release tag. Exo, prima.cpp and
   distributed-llama rejected — see the spec for the reasoning, and do not
   re-propose them.
-- **`ik_llama.cpp` for the document workload.** Measured **+52% prefill, −14%
-  generation** versus mainline — a net **+22% end-to-end**, because prefill
-  dominates. Output verified coherent. Keep mainline built alongside; do not mix
-  builds across a shard group.
+- ~~**`ik_llama.cpp` for the document workload**~~ — **REVERSED 2026-08-18, see
+  F40. Run MAINLINE.** `ik_llama.cpp` **fatal-errors on the fifth request of any
+  `--parallel 4` job** — a 100% failure rate on any document longer than four
+  chunks. Its SWA flash-attention path keeps only the last 512 KV cells, which
+  is a superset of every query's window *for one sequence*; with four
+  interleaved slots those cells belong to other sequences, the mask is wholly
+  masked, and it aborts. Mainline b10369 survives the identical sequence.
+  **F27's +52%/+22% is not wrong, it is unusable**: it was measured with
+  `llama-bench`, which issues ONE sequence, while this project's own standing
+  constraint is `--parallel 4`. Re-measured through `llama-server`, ik's prefill
+  lead is **+43% decaying to +15%** as the cache fills, and F27's −14%
+  generation penalty **does not appear at all**. Keep ik built alongside — `ik`
+  at `--parallel 1`, and with flash attention explicitly off, are both untested
+  and might restore the win.
+  **The transferable lesson, and it is the sharpest in this repo: a benchmark
+  that does not reproduce the deployment's concurrency is not a benchmark of the
+  deployment.**
 - **Debian 12 headless**, scripted provisioning (not `dd` cloning — disks vary).
 - **Tailscale for SSH and the web GUI only.** RPC mesh runs on raw LAN IPs.
 - ~~**Open WebUI** as the chat frontend~~ — **NO LONGER SETTLED.** It is a *chat*
@@ -389,6 +412,39 @@ leaderboard, not verified here — against GLM-4.6 at
 9.5% with identical active params and one third the disk. See
 `docs/MODEL-SELECTION.md` and F25.
 
+## Roles: orchestrator vs subagent
+
+**READ THIS FIRST AND WORK OUT WHICH ONE YOU ARE.** Subagents inherit this whole
+file, so it is addressed to both, and getting the role wrong is expensive in
+exactly opposite directions.
+
+**If you were launched by the Agent/Task tool, you are a SUBAGENT.** You are not
+the orchestrator. Do the task you were given, end to end, yourself. **Do not
+launch further agents**, do not re-plan the session, do not go and fix adjacent
+problems you noticed. If you find something outside your brief, *report it* —
+that is the orchestrator's to schedule. Report what you actually ran and saw.
+
+**If you are the top-level session, you are the ORCHESTRATOR. Your scarce
+resource is context, not time, and every file you read yourself is context you
+cannot get back.** So:
+
+- **Delegate the work. Do not do it yourself.** Implementation, merges, conflict
+  resolution, benchmarks, forensics, research — all of it goes to an agent. The
+  temptation is always to do "just this one small thing" inline because
+  explaining it feels slower than doing it. That is the trap: doing it inline
+  costs the whole file in context, permanently, and the explanation was going to
+  be needed anyway.
+- **What only you can do:** decide what the work IS, sequence it, resolve
+  contention for the hardware, hold the standing constraints, judge whether a
+  returned result is actually believable, and talk to the operator. Editing
+  `STATUS.md`/`CLAUDE.md`/`FINDINGS.md` to record decisions is orchestrator work.
+- **Read narrowly.** `STATUS.md`, `docs/FINDINGS.md` and the specific thing the
+  operator asked about. Anything else, send an agent and take its summary.
+- **Brief agents with the constraints, not just the task.** Point them at the
+  exact files and findings. An agent that has to rediscover F35 wastes a session.
+- **Never spend your own context proving an agent right.** Ask for the command
+  output inline in its report and judge that.
+
 ## Conventions
 
 - **Research before specifying or building.** Before committing to a tool,
@@ -399,9 +455,50 @@ leaderboard, not verified here — against GLM-4.6 at
 - **Delegate research to Sonnet subagents** rather than running searches inline.
   Ask for conclusions plus source URLs, with CONFIRMED / REPORTED / INFERRED
   distinguished. Point them at specific repos, issues and files.
-- **Run at most ONE Sonnet agent at a time** (up to two Haiku agents are fine).
-  Do not fan out unless explicitly asked. Do your own work — spec edits, doc
-  updates — while an agent runs, rather than launching another.
+- **Fan out.** The default is parallel agents in separate git worktrees, up to
+  about five at once, so work that does not contend for the same files or the
+  same hardware runs concurrently. (This supersedes an earlier "one Sonnet agent
+  at a time" rule, which was written before worktree isolation and was throttling
+  throughput for no benefit.) The real constraints on fan-out are **file
+  contention** — two agents editing `app.py` is a merge you will pay for later —
+  and **hardware contention**: there is one `llama-server` per node and a
+  benchmark needs it to itself.
+- **Model tier by risk, not by size of task.** Opus for high-complexity or
+  high-risk implementation — anything touching faithfulness, the completion
+  guards, or the job store. Sonnet for everything else, which is most things.
+- **Agent hygiene is enforced, not merely advised.** `.claude/settings.json`
+  runs `PreToolUse` hooks (`.claude/hooks/cluster-guard.py`) that **block**
+  `git add -A`, `git commit -a`, `pkill -f` and inline Python that does not
+  compile, and **gate** cluster service control, `git push`, mutating SQL
+  against the live job store, writes to `/opt/models`, and git working-tree
+  operations in the live checkout. **If a hook blocks you, the hook is right and
+  the command was wrong** — read its message and take the alternative it names.
+  Never set `CLUSTER_OPS_CONFIRMED=1` on your own initiative; that prefix means
+  the operator said yes. See `docs/AGENT-HARDENING.md`.
+- **Enumerate paths; never stage by wildcard.** `git add <path> [<path>…]`,
+  after reading `git status --porcelain`. `git add -A` once swept three agent
+  worktrees in as embedded git repos, and pushed them.
+- **Kill by unit or by PID, never by pattern.** `systemctl stop <unit>`, or
+  `pgrep -f <pat>` → read the PIDs → `kill <pid>`. `pkill -f` matches the
+  caller's own command line and has killed the agent's shell three times.
+- **Assert row counts on destructive SQL.** Run the `SELECT count(*)` with the
+  *identical* predicate first, print it, and stop if it is 0 or outside what you
+  expected. A `substr(document,1,5)='%PDF'` off-by-one matched 0 rows and was
+  caught only because someone looked. **No hook can catch this** — it is not a
+  command pattern, it is a wrong predicate.
+- **Read an API before calling it.** Missing Link is FastAPI, so
+  `GET /openapi.json` is free and authoritative. Guessed form-field names cost
+  three round trips of 422/405.
+- **Never run git working-tree operations in the repo root itself.** It is
+  `missing-link.service`'s `WorkingDirectory=`, so a merge there leaves a window
+  in which any restart crash-loops the unit every 5 s. Merge in a worktree. Use
+  `git -C <abs-path>` rather than `cd` — a `cd` that silently lands in the wrong
+  worktree turns a merge into a no-op that reports "Already up to date", which
+  happened three times in one session.
+- **Quote commit messages with single quotes.** Backticks inside a double-quoted
+  `-m` are command substitution: bash runs them and **silently deletes the text**
+  from the message. Cost a sentence out of a commit that documented exactly this
+  class of slip.
 - Leave **15% memory headroom** in all model-fit calculations. Do not spec
   configurations that fit only marginally.
 - **Performance claims must come from measurement on the hardware.** If a number

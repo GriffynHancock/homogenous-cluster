@@ -1,0 +1,38 @@
+{
+  "$comment": [
+    "Agent hardening for this repo. Every rule traces to an incident in",
+    "docs/AGENT-HARDENING.md or a standing constraint in CLAUDE.md.",
+    "One guard script sees every Bash call rather than relying on the per-hook",
+    "'if' matcher: 'if' does best-effort bash parsing and fails OPEN on parse",
+    "failure, which is the one behaviour we cannot accept here.",
+    "Read-only inspection (systemctl status, journalctl, git status/diff/log,",
+    "ssh, curl, sqlite3 ?mode=ro) is deliberately untouched -- the agents on",
+    "this project must reach the real cluster."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cluster-guard.py",
+            "timeout": 15,
+            "statusMessage": "Checking command against cluster safety rules"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/cluster-guard.py",
+            "timeout": 15,
+            "statusMessage": "Checking write target against cluster safety rules"
+          }
+        ]
+      }
+    ]
+  }
+}
