@@ -22,8 +22,14 @@ WHY MAP-REDUCE, decided on evidence rather than preference:
     tokens, 28.3 at 2048, 24.8 at 2214. Small chunks stay in the efficient band.
   * Map-reduce beats refine decisively on book-length text (arXiv:2310.00785),
     and refine is strictly sequential, so far slower in wall-clock.
-  * Chunk size barely matters for map-reduce (unlike refine), so ~4K with 10%
-    overlap is fine and is not worth tuning.
+  * Chunk size barely matters for map-reduce QUALITY (unlike refine) --
+    BooookScore-style scoring is roughly flat across chunk sizes. It is NOT
+    true for wall-clock: a measured sweep on real hardware (node 2, the real
+    97,299-char document, docs/measurements.md) found a U-shaped curve, 1.85x
+    worse at 1024 tokens and 1.29x worse at 6144 than the measured optimum at
+    4096 -- generation falls monotonically with chunk size but prefill does
+    not, so the two effects cross near 4096. CHUNK_TOKENS below is set to
+    that measured optimum, not to a quality argument alone.
 """
 import re
 import time
@@ -84,8 +90,11 @@ REDUCE_PROMPTS = {
 
 # ~4K tokens with 10% overlap. Approximated in words: this deliberately does NOT
 # tokenise, because doing so would mean shipping the model's tokeniser into the
-# queue process. Chunk size barely matters for map-reduce, so an approximation
-# is adequate -- but it is an approximation, so the value is conservative.
+# queue process. Chunk size barely matters for map-reduce QUALITY, so the word
+# approximation is adequate for staying in the right neighbourhood -- but a
+# measured wall-clock sweep (docs/measurements.md) found 4096 is the actual
+# throughput optimum, 1.85x faster than 1024 and 1.29x faster than 6144, so
+# this value is no longer "pick anything reasonable", it is measured.
 CHUNK_TOKENS = 4096
 OVERLAP_TOKENS = 410
 # Empirical ratio for English prose. Under-filling a chunk is safe; overfilling
