@@ -311,11 +311,19 @@ async def corpus_upload(files: list[UploadFile] = File(...),
                         note: str = Form("")):
     """Add documents to the corpus. Multi-file, one genre per submission.
 
-    Each file is extracted with the SAME extract.extract() a job upload uses --
-    magic-byte sniffing, refuse rather than degrade (F38). A refusal is stored
-    as its own row with the reason, so it is visible and deletable and, above
-    all, DOES NOT BLOCK THE REST OF THE BATCH: uploading twelve legislative
-    texts of which one is a scanned PDF must leave eleven in the corpus.
+    Each file is extracted with the SAME extraction a job upload uses --
+    magic-byte AND content sniffing, refuse rather than degrade (F38, and its
+    HTML/RTF extension). A refusal is stored as its own row with the reason,
+    so it is visible and deletable and, above all, DOES NOT BLOCK THE REST OF
+    THE BATCH: uploading twelve legislative texts of which one is a scanned
+    PDF must leave eleven in the corpus.
+
+    Uses extract_with_method() rather than plain extract() so the corpus row
+    can record HOW the text was obtained ("plain"/"pdf"/"html") -- see
+    db.add_corpus_document's docstring for why that provenance matters here
+    specifically: an HTML document's marker_rate/numbers_per_1k_words are
+    computed on markup-stripped text, and a reader comparing it against a
+    plain-text document needs to be able to tell the two apart.
 
     Deliberately creates NO jobs and makes NO inference call. Profiling is
     string analysis; the whole point of a corpus is that holding a document
@@ -346,7 +354,8 @@ async def corpus_upload(files: list[UploadFile] = File(...),
             continue
 
         try:
-            text = extract.extract(raw, f.filename).strip()
+            text, method = extract.extract_with_method(raw, f.filename)
+            text = text.strip()
             if not text:
                 raise extract.ExtractionError("no text after extraction")
         except extract.ExtractionError as exc:
@@ -354,7 +363,7 @@ async def corpus_upload(files: list[UploadFile] = File(...),
             db.add_corpus_document(DB_PATH, record)
             continue
 
-        record.update(status="ready", text=text,
+        record.update(status="ready", text=text, extraction_method=method,
                       text_sha256=corpus.sha256_hex(text),
                       **corpus.profile(text))
         db.add_corpus_document(DB_PATH, record)

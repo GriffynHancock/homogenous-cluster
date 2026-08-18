@@ -1190,11 +1190,23 @@ CREATE INDEX IF NOT EXISTS idx_corpus_documents_genre
 CREATE INDEX IF NOT EXISTS idx_corpus_documents_sha
     ON corpus_documents (sha256);
 """
-# None yet. Present, and wired into init_corpus_documents below, so the FIRST
-# column added to this table does not have to reintroduce the migration
-# plumbing -- and, more to the point, cannot arrive via a LAZY per-operation
-# init_*() call, which is the race that marked real jobs failed. See init_db.
-_CORPUS_NEW_COLUMNS = []
+# The FIRST column added to this table, via the migration plumbing that was
+# put in place for exactly this -- additive, applied once at startup by
+# init_corpus_documents, never by a lazy per-operation init_*() call (the race
+# that marked real jobs failed; see init_db and _add_missing_columns).
+_CORPUS_NEW_COLUMNS = [
+    # "plain" | "pdf" | "html" -- see extract.extract_with_method(). Recorded
+    # because a corpus row's marker_rate/numbers_per_1k_words are only
+    # interpretable in light of what actually produced the stored text: HTML
+    # extraction strips markup and reflows block structure into newlines
+    # before profile() ever runs, which is exactly the kind of transform that
+    # made an operator's raw-passthrough numbers look wrong for reasons that
+    # had nothing to do with the document (see extract.py's module docstring).
+    # NULL for rows added before this column existed -- not backfilled,
+    # because "unknown" and "plain" are different claims and conflating them
+    # would misrepresent old rows as verified passthrough.
+    ("extraction_method", "TEXT"),
+]
 
 
 def init_corpus_documents(path):
@@ -1235,7 +1247,7 @@ _CORPUS_FIELDS = (
     "filename", "genre", "status", "error", "text", "note", "sha256",
     "text_sha256", "n_bytes", "n_chars", "n_words", "n_chunks", "chunk_tokens",
     "n_sentences", "n_marker_sentences", "marker_rate", "n_numbers",
-    "numbers_per_1k_words",
+    "numbers_per_1k_words", "extraction_method",
 )
 
 
@@ -1254,6 +1266,12 @@ def add_corpus_document(path, record):
     consumes: a pypdf upgrade can change the extracted text without changing a
     byte of the PDF, and a measurement re-run after that is not comparable with
     the one before it even though the file is untouched.
+
+    `extraction_method` ("plain"/"pdf"/"html", from
+    extract.extract_with_method) is the third piece of that same provenance:
+    it says whether `text` is the upload verbatim or the product of a
+    transform, which is what a reader needs to know before trusting
+    marker_rate/numbers_per_1k_words on a document that turned out to be HTML.
     """
     doc_id = uuid.uuid4().hex[:12]
     values = [record.get(f) for f in _CORPUS_FIELDS]

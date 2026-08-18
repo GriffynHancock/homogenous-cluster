@@ -33,9 +33,12 @@
            style="width:100%;padding:.5rem;font:inherit;background:var(--bg);
            color:var(--fg);border:1px solid var(--line);border-radius:6px">
 
-    <p class="hint">Same formats as everywhere else: PDF with a text layer, or
-      plain text (.txt/.md/.csv). A file that cannot be read is listed below
-      with the reason and <strong>does not block the rest of the batch</strong>.
+    <p class="hint">Same formats as everywhere else: PDF with a text layer,
+      HTML (detected by its content, not its filename — a page saved as
+      <code>.txt</code> is still recognised and stripped of markup), or plain
+      text (.txt/.md/.csv). RTF is refused rather than parsed — save it as
+      plain text first. A file that cannot be read is listed below with the
+      reason and <strong>does not block the rest of the batch</strong>.
       Uploading identical bytes twice is refused, naming the row that already
       holds them.</p>
     <button type="submit">Add to corpus</button>
@@ -62,7 +65,12 @@
   can speak to the severed-clause question (measured: 15.4% on legal-styled text
   vs 0.03% on narrative prose).
   <em>Numbers/1k</em> is checkable figures per 1000 words; a document with none
-  cannot exercise the faithfulness cascade's hard number tier.</p>
+  cannot exercise the faithfulness cascade's hard number tier.
+  A document whose text was not taken verbatim from the upload — currently
+  <code>pdf</code> (via pypdf) or <code>html</code> (markup stripped, block
+  structure kept as line breaks) — is labelled under its filename below, since
+  every one of these numbers is computed on the STORED text, not the original
+  bytes.</p>
 
 <div class="tbl-wrap">
 <table>
@@ -77,6 +85,11 @@
     <tr>
       <td><a href="/corpus/{{ d.id }}/text">{{ d.filename }}</a><br>
         <code style="font-size:.7rem;color:var(--mut)">{{ d.id }}</code>
+        {%- if d.extraction_method and d.extraction_method != "plain" %}
+        <br><span class="badge" style="font-size:.65rem;background:var(--bg);
+          border:1px solid var(--line);color:var(--mut)"
+          title="text stored here is {{ d.extraction_method }}-extracted, not the raw upload verbatim"
+          >{{ d.extraction_method }}-extracted</span>{% endif %}
         {%- if d.note %}<br><span class="preview">{{ d.note }}</span>{% endif %}</td>
       <td>{{ d.genre }}</td>
       <td>{{ "{:,}".format(d.n_chars) }}</td>
