@@ -1075,3 +1075,235 @@ different slot size, and write-up of the extended sweep was assigned
 elsewhere. **Do not quote figures from `chunk-size-bench-c65536/` until they
 have their own dated section in this file** — see that directory for the raw
 data in the meantime.
+
+---
+
+## Chunk-size sweep, extended — `-c 65536` (`n_ctx_slot = 16384`), node 2, mainline engine
+
+**Date:** 2026-08-18 | **Node:** node2 (`10.10.0.39:8080`) | **Engine:** mainline
+llama.cpp b10369 at `/opt/llama.cpp/bin` (unchanged, confirmed via
+`/etc/default/llama-server` and process cmdline throughout) | **Model:**
+gpt-oss-120b F16 | `-t 4 -c 65536 --parallel 4` → **`n_ctx_slot = 16384`**,
+confirmed from the server's own startup log, not inferred from `-c`:
+
+```
+Aug 18 12:37:14 node2 sh[98284]: 0.27.588.520 I srv load_model: initializing,
+  n_slots = 4, n_ctx_slot = 16384, kv_unified = 'false'
+```
+
+**This section extends, and does not restate, the "Chunk-size sweep — real
+map-reduce pipeline, node 2, mainline engine" section immediately above.**
+Same driver (`bench/chunk_size_driver.py` via `bench/chunk-size-bench.sh`),
+same real pipeline, same document (job `06af2911d7fc`, 97,299 chars / 16,745
+words). Raw data: `bench/out/chunk-size-bench-c65536/results.json`
+(gitignored — real document text; per-size transcripts at
+`bench/out/chunk-size-bench-c65536/chunk_<N>.txt`). `results.json` has
+`aborted: null` and `status: "ok"` for all three points below — no failed or
+excluded runs in this sweep (contrast the earlier sweep's `1024` row, which
+**was** a failure: its reduce step hit `max_tokens` and returned truncated,
+`final_chars: 0` — see that section for the detail; it is a second,
+independent reason not to run 1024 in production, on top of it being the
+slowest point measured).
+
+### RSS before/after raising `-c`, since headroom was the reason it was thought affordable
+
+Measured via `/proc/<pid>/status` on node 2, `llama-server`'s own PID (not the
+`sh -c` wrapper) in every case:
+
+| Point | VmRSS | |
+|---|---:|---:|
+| Before, old `-c 32768` process, still warm from the prior sweep | 71,523,148 kB | 68.2 GiB |
+| After raising to `-c 65536`, freshly reloaded, idle | 66,444,692 kB | 63.4 GiB |
+| After running this sweep's `12288`-token chunks under real load (peak observed) | 70,027,432 kB | 66.8 GiB |
+| After restoring `-c 32768` and reloading, idle | 65,264,920 kB | 62.2 GiB |
+
+Node 2 total RAM is 131.8 GB (125 GiB). **Peak observed usage at `-c 65536`
+under real load was 66.8 GiB — comfortably inside the project's ≤75% per-node
+working-limit guidance (~98.8 GB)** and barely above the `-c 32768` baseline.
+Raising `-c` was affordable on this node; the wall-clock cost below is not a
+memory-pressure effect. **One oddity, unexplained:** `VmHWM` (the process's
+own lifetime high-water mark) read within a few hundred KB of **123,447,xxx
+kB (≈117.7 GiB)** across three different PIDs spanning both a restart and an
+`-c` change — well above any RSS actually observed. Reported as measured, not
+otherwise explained; flagging it rather than theorising, since it does not
+match the VmRSS values or `free -h`'s `used` column at any point during this
+session.
+
+### The control comparison is the headline finding
+
+| config | CHUNK_TOKENS | chunks | prefill s | generation s | total s (prefill+gen) |
+|---|---:|---:|---:|---:|---:|
+| `-c 32768`, n_ctx_slot 8192 (prior section) | 4096 | 7 | 1197.8 | 1030.9 | **2228.7 ← still the measured optimum** |
+| `-c 65536`, n_ctx_slot 16384 | **4096 — control, identical chunking** | 7 | 2049.8 | 914.3 | 2964.1 |
+| `-c 65536`, n_ctx_slot 16384 | 8192 | 4 | 1908.7 | 916.6 | 2825.3 |
+| `-c 65536`, n_ctx_slot 16384 | 12288 | 3 | 1710.9 | 1030.6 | 2741.5 |
+
+(`results.json`'s own `wall_s` field — true measured wall clock including
+between-request `/health` gates — is 0.7–0.8 s higher than `prefill+gen` for
+every row here, e.g. 2964.8 s true wall against 2964.1 s prefill+gen for the
+control; negligible, and the `prefill+gen` convention is kept for
+comparability with the section above.)
+
+**Identical chunking (4096 tokens, 7 chunks, same document, same engine, same
+node) costs ~33% more wall-clock at `-c 65536` than at `-c 32768`: 2964.1 s
+vs 2228.7 s (ratio 1.33×).** The cost is concentrated almost entirely in
+prefill — 1197.8 → 2049.8 s, a **+71.1%** increase — while generation actually
+improved slightly (1030.9 → 914.3 s, **−11.3%**).
+
+**Within the `-c 65536` configuration, bigger chunks do help**: 8192 beats the
+4096 control by 4.7% (2825.3 vs 2964.1) and 12288 beats it by 7.5% (2741.5 vs
+2964.1). **But every point measured at `-c 65536` is worse than the `-c
+32768` / `CHUNK_TOKENS=4096` optimum already on record — 12288, the best of
+the three, is still 23.0% slower** (2741.5 / 2228.7 = 1.230). Read the three
+`-c 65536` rows in isolation and the story is "bigger keeps winning, go
+further" — exactly the wrong conclusion. The control is what prevents that
+misread: it isolates the effect of raising `-c` itself from the effect of
+raising `CHUNK_TOKENS`, and the former costs more than the latter recovers.
+
+### Mechanism — labelled INFERRED, and partially, not fully, isolable
+
+`--parallel` (slot count) was held constant at 4 across every row in this
+sweep and the one above it; only `-c`, and therefore `n_ctx_slot` (the
+per-slot KV allocation), changed. **So the effect is attributable to the size
+of the per-slot context allocation, not to slot count** — that much can be
+said with the evidence in hand, because slot count is the one variable that
+did not move.
+
+**What cannot be said from this evidence is the specific mechanism inside
+that allocation.** A plausible account: this node is already bandwidth-bound
+(STREAM peak 28.2 GB/s, generation measured at ~99% of that ceiling, F11), so
+anything that increases bytes moved per token is expensive here, and a larger
+KV allocation is a candidate for exactly that during attention. But
+generation — the phase that reads the KV cache every step — got *faster*, not
+slower, at the larger `-c`, while prefill, which builds the KV cache rather
+than repeatedly re-reading it, absorbed the entire cost. That is not what a
+simple "more KV bytes moved per token" story predicts, and this sweep cannot
+distinguish "attention over a larger allocated buffer costs more even when
+most of it is unused" from "some other one-time or per-step cost inside
+`-c`-dependent memory management (allocation, zeroing, bookkeeping over a
+2× buffer)" from any other explanation. Doing so would need either an
+intermediate `-c` value (e.g. `49152`) to see whether the prefill cost scales
+with `n_ctx_slot` continuously or steps, or a memory-bandwidth trace during
+prefill specifically. **Neither was run. Treat the mechanism as open.**
+
+### Coherence verdict at 8192 and 12288
+
+Read in full (`bench/out/chunk-size-bench-c65536/chunk_8192.txt` and
+`chunk_12288.txt`), and cross-checked by hand against the actual chunk text in
+the corpus JSONs (`corpus_chunk_8192.json`, `corpus_chunk_12288.json`) rather
+than judged on fluency alone. The source document is a badly OCR'd Gaudiya
+Vaishnava devotional text with heavily garbled diacritics (e.g. the real
+front matter reads `SwÅmÈ B. S. TridaˆÎÈ` / `ßrÈpad B. P. JanÅrdan MahÅrÅj` for
+the compiler and editor, and the author's title block is `O˜ Vi›ˆupÅd
+A›tottara-Íata-ÍrÈ-ßrimad Bhakti Sundar Govinda Dev-GoswÅmÈ MahÅrÅj`).
+
+**No empty or truncated completions, no invented section markers, and the
+thematic content at every size checked out against the source**: the two-part
+structure ("The Soul and the Supreme Shelter" / "The Way Home"), the critique
+of *sahajiyā*, the stages-of-devotion ladder, and the named anecdotes (the
+exam-question scholar, the boy's rice-and-beans offering, Mahāprabhu drinking
+from a devotee's pot) all appear in the summaries at 8192 and 12288 and all
+are genuinely in the source chunks, not fabricated.
+
+**One recurring defect, present at every chunk size tested including the
+smallest — this is not a large-chunk-specific problem on this document.** The
+central author's name is rendered differently, and wrongly, in every run
+checked: the original sweep's 4096 (`-c 32768`) produced "Śrī cārādhara
+Mahārāja (Bhakti Siddhānta Saraswat Mahārāja)"; this sweep's 4096 control
+produced "Śrī candra Mahārāja (Bhakti Rakṣak candra Dhar)"; 8192 produced "Śrī
+Candra Bhakti Sundar Govinda Dev‑Gosvāmī Mahārāja" (closest to correct — the
+real name is "Bhakti Sundar Govinda Dev-Gosvāmī Mahārāj", garbled in the
+source OCR); 12288 produced "Śrī Bhakti Rākṣaka Śrī Śrī Brahmadhara
+Dev‑Goswāmī Mahārāja" (wrong). Since this happens at the smallest chunk size
+too, and the source text itself is corrupted at exactly this name, the
+likelier cause is the OCR garbling, not chunk size — but it could not be
+ruled out as chunk-size-correlated with n=1 document and no controlled
+repeats at fixed size, and it is exactly the kind of proper-noun fabrication
+this project's faithfulness requirement cares about, so it is reported
+plainly rather than dismissed.
+
+**One counter-example against a naive "bigger chunks hallucinate more"
+story:** the 12288 run is the *only* one of the four sizes checked (both
+sweeps) that correctly recovered the compiler and editor attribution from the
+front matter ("Compiled by ... Tridāśī", "Edited by ... Janārdan Mahārāja") —
+matching the real, if garbled, source text closely. The 4096 and 8192 runs
+omitted this detail entirely. So on this specific document, more context did
+not uniformly mean more confabulation; in this one instance it meant more
+correctly-recovered detail that smaller chunks dropped.
+
+**A softer, INFERRED signal worth flagging:** final (reduced) output length
+fell as chunk size grew — 533 words (4096 control) → 531 words (8192) → 446
+words (12288) — while covering the same 97,299-character document with fewer,
+coarser map-step summaries (7 → 4 → 3 chunks) feeding a reduce step with a
+fixed budget (`REDUCE_MAX_TOKENS=2048`). Fewer, larger intermediate summaries
+carrying the same reduce budget is a plausible mechanism for reduced final
+granularity — the shape "lost in the middle" predicts — but this is a length
+observation, not a fact-level audit, and is not strong enough on its own to
+call it measured information loss.
+
+**Overall verdict, honestly: no clear quality degradation was found at 8192
+or 12288 relative to 4096 on this document**, beyond the pre-existing
+name-rendering defect that also affects the smallest chunk size. This is a
+manual spot check of one document across four configurations, not a
+systematic audit (`missing_link.audit` was not run against this corpus) — it
+should not be read as a settled quality result the way the wall-clock numbers
+above are measured and settled. **The wall-clock and quality optima did not
+turn out to diverge on this evidence** — which is itself worth recording,
+since the opposite finding was the one actively being looked for.
+
+### Node 2 restored
+
+```
+$ sed -i 's/^LLAMA_CTX=.*/LLAMA_CTX=32768/' /etc/default/llama-server
+$ cat /etc/default/llama-server
+LLAMA_BIN=/opt/llama.cpp/bin
+LLAMA_MODEL=/opt/models/gpt-oss-120b/gpt-oss-120b-F16.gguf
+LLAMA_THREADS=4
+LLAMA_CTX=32768
+LLAMA_PARALLEL=4
+$ systemctl restart llama-server@8080   # ready in ~30s (page cache warm, F3)
+$ journalctl -u llama-server@8080 | grep n_ctx_slot | tail -1
+... n_slots = 4, n_ctx_slot = 8192, kv_unified = 'false'
+$ systemctl is-active rpc-server@50052
+active
+$ systemctl show rpc-server@50052 -p NRestarts,ActiveEnterTimestamp
+NRestarts=0
+ActiveEnterTimestamp=Tue 2026-08-18 12:34:13 AEST
+```
+
+`n_ctx_slot=8192` confirmed restored from the server's own log (not
+inferred). `rpc-server@50052` was never stopped by this sweep and shows
+`NRestarts=0` throughout, active continuously since the earlier agent
+restarted it at 12:34:13. Engine confirmed still mainline
+(`/etc/default/llama-server`'s `LLAMA_BIN=/opt/llama.cpp/bin`, unchanged
+throughout). Config backups left in place for reversibility:
+`/etc/default/llama-server.pre-c65536.bak` (this session's original) and the
+pre-existing `/etc/default/llama-server.ik.bak`.
+
+### Recommendation — wall-clock optimum and quality verdict, stated separately
+
+**Wall-clock: `CHUNK_TOKENS = 4096` at `-c 32768 --parallel 4`
+(`n_ctx_slot=8192`) remains the fastest configuration measured anywhere in
+either sweep — 2228.7 s, still unbeaten.** Raising `-c` to reach larger chunk
+sizes is not free: at identical chunking it cost **33% more wall-clock**, an
+amount the intra-config gains from then going to 8192 or 12288 (4.7–7.5%)
+never claw back. There is no wall-clock case, on this hardware and this
+model, for raising `-c` past what `CHUNK_TOKENS=4096` needs.
+
+**Quality: no evidence found here that larger chunks degrade output** on this
+one document — the one recurring defect (the author's name) is present at
+every size including the smallest, and the largest chunk size actually
+recovered a detail the smaller ones missed. This is a spot check, not an
+audit, and should not be over-read, but as far as it goes the quality and
+wall-clock optima **agree**, and both point at 4096 as no worse than, and
+faster than, the alternatives.
+
+**What this implies for `-c` and `--parallel`, since chunk size and slot
+budget are the same decision:** keep `--parallel 4` (F24: batching's own
+optimum, unrelated to this question) and size `-c` as `n_ctx_slot ×
+--parallel` where `n_ctx_slot` must clear `CHUNK_TOKENS + wrapper (~900) +
+MAP_MAX_TOKENS (1024)` with margin. For `CHUNK_TOKENS=4096` that is `4096 +
+900 + 1024 = 6020`, comfortably inside `n_ctx_slot=8192` (2172 tokens of
+headroom) — i.e. **`-c 32768 --parallel 4` is not just affordable but is now
+shown to be the throughput-optimal setting as well, and should not be raised
+for this workload without a new reason to run `CHUNK_TOKENS` above ~6144.**
