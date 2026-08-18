@@ -1498,13 +1498,93 @@ def word_spans(text):
     return [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
 
 
-def chunk_spans(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
+# --- Boundary snapping (EXPERIMENTAL, default OFF) ---------------------------
+# docs/chunking-research.md is the research this rests on. Short version: the
+# external evidence on chunking strategy is almost entirely about RETRIEVAL
+# (does a fancier splitter improve recall of the right chunk?), which is not
+# this project's problem -- map-reduce reads every chunk regardless, so there
+# is nothing to retrieve. Recent retrieval-focused papers find semantic/
+# LLM-based chunking is NOT clearly worth its cost even on their own turf
+# (arXiv:2410.13070; the academic-RAG evaluation in docs/chunking-research.md
+# §1), so there is no external result to import wholesale here.
+#
+# What DOES motivate a cheap, reversible mitigation is project-specific:
+# docs/audit-ledger.md's negation battery found the checkers' one systematic
+# failure shape is "a clause with a second, competing clause attached" --
+# a retention period plus its "unless" exception, an exemption plus its
+# carve-out. A fixed-word cut lands wherever the word counter happens to be,
+# so it will periodically sever a clause from exactly the qualifier that
+# changes its meaning -- reproducing that failure shape by construction,
+# not by chance. The 10% overlap likely repairs this for the NEXT chunk (the
+# full sentence reappears near the start of chunk N+1, whose overlap window
+# is ~287 words -- generous for one clause), but chunk N's own summary was
+# still generated from a severed clause, and that summary is what the reduce
+# step -- and the audit's hop-1 evidence window -- both see. This is REASONED
+# from measured findings, not itself measured; see the doc for what would
+# have to be run before trusting it.
+#
+# So: keep the fixed-size word-count chunker exactly as it is (chunk size is
+# what CLAUDE.md and F19/F24 already justify), and ONLY nudge each boundary to
+# the nearest sentence/paragraph break within a small tolerance -- a few dozen
+# characters against a ~17,000-character chunk. No tokenizer, no embedding
+# model, no new dependency: the regex is deliberately the same shape as
+# audit.py's `_SENT_FALLBACK`, which already stands in for nltk in the
+# production venv (nltk is audit-only -- see requirements-audit.txt -- and
+# pulling it into every node's production install to gain sentence awareness
+# would cost real disk/CPU on the resource this project has already measured
+# as the bottleneck, for a benefit that is reasoned, not shown).
+#
+# A bare "\n" is deliberately NOT treated as a boundary. PDF text (extract.py)
+# line-wraps at a fixed width, so a lone newline there is exactly as arbitrary
+# as a word-count cut -- snapping to it would look like a fix and not be one.
+# Only genuine sentence-ending punctuation or a blank-line paragraph break count.
+BOUNDARY_SNAP_TOLERANCE = 120  # chars either side of the naive cut point
+
+_SENTENCE_END_RE = re.compile(r"[.!?][\"'’”)\]]*\s+")
+_PARA_BREAK_RE = re.compile(r"\n[ \t]*\n")
+
+
+def _nearest_boundary(text, pos, tolerance=BOUNDARY_SNAP_TOLERANCE):
+    """The sentence/paragraph boundary nearest `pos`, within `tolerance` chars
+    either side -- or `pos` unchanged if nothing qualifies nearby.
+
+    A "boundary" is the character position right after sentence-ending
+    punctuation (optionally followed by a closing quote/bracket) AND the
+    whitespace that follows it -- i.e. the first character of the next
+    sentence/paragraph, so a chunk snapped to it starts or ends cleanly
+    rather than on a stray leading/trailing space. Also matches a blank-line
+    paragraph break. Returning `pos` unchanged is the safe default: it means
+    fall back to the naive word-count cut rather than force a snap to
+    something that is not actually a sentence end.
+    """
+    lo, hi = max(0, pos - tolerance), min(len(text), pos + tolerance)
+    window = text[lo:hi]
+    candidates = [lo + m.end() for m in _SENTENCE_END_RE.finditer(window)]
+    candidates += [lo + m.end() for m in _PARA_BREAK_RE.finditer(window)]
+    if not candidates:
+        return pos
+    return min(candidates, key=lambda c: abs(c - pos))
+
+
+def chunk_spans(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS,
+                snap_boundaries=False):
     """Chunk with TRUE character offsets into the original text.
 
     Returns [{"index", "start", "end", "text"}]. Note `text` is sliced from the
     ORIGINAL string rather than rejoined from split words, so original spacing and
     line breaks survive -- which matters when a human is asked to check a claim
     against the source.
+
+    `snap_boundaries`: EXPERIMENTAL, default False so behaviour and every
+    existing offset are byte-for-byte unchanged. When True, each chunk's start
+    (except the first chunk's, which stays 0) and end (except the last
+    chunk's, which stays len(text)) is nudged to the nearest sentence or
+    paragraph break within BOUNDARY_SNAP_TOLERANCE chars -- see the design
+    note above `_nearest_boundary` for why, and docs/chunking-research.md for
+    what is and is not evidence for turning this on by default. The word-index
+    bookkeeping that decides WHERE each chunk starts (stride, overlap) is
+    untouched; only the rendered/persisted character span is nudged, so chunk
+    count and the `text[start:end] == chunk text` invariant both still hold.
     """
     if overlap_tokens >= chunk_tokens:
         raise ValueError(
@@ -1525,9 +1605,20 @@ def chunk_spans(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
         end_w = min(start_w + size, len(spans))
         s_char = spans[start_w][0]
         e_char = spans[end_w - 1][1]
+        is_last = end_w >= len(spans)
+        if snap_boundaries:
+            if start_w > 0:
+                s_char = _nearest_boundary(text, s_char)
+            if not is_last:
+                e_char = _nearest_boundary(text, e_char)
+            if s_char >= e_char:
+                # Tolerance is small relative to chunk size, so this should be
+                # unreachable in practice -- but a degenerate/empty chunk would
+                # be worse than an un-snapped one, so fall back defensively.
+                s_char, e_char = spans[start_w][0], spans[end_w - 1][1]
         out.append({"index": len(out), "start": s_char, "end": e_char,
                     "text": text[s_char:e_char]})
-        if end_w >= len(spans):
+        if is_last:
             break
         start_w += stride
     return out
