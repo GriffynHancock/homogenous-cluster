@@ -14,10 +14,14 @@ control, resumable chunk-level persistence, automatic retry-and-resume on
 backend failure, live per-chunk telemetry with separate prefill/generation
 rates, per-workflow guidance (text or file), section-level citations on the
 reduce output, a revive route, a per-job failure-history table, and a
-deterministic faithfulness cascade — **469 tests** (`.venv/bin/python -m
-pytest tests/ -q`, confirmed passing this session). **44 findings** in
-`docs/FINDINGS.md`. **50 commits are unpushed to `origin/main`** (confirmed
-`git rev-list --count origin/main..main` after an explicit `fetch`).
+deterministic faithfulness cascade, a corpus benchmark page and the
+provenance/licence gap it surfaced — **552 tests** (`.venv/bin/python -m
+pytest tests/ -q`, reproduced this session: 0 failures, 25s; up from 469 at
+the previous entry — the corpus feature added its own test files). **45
+findings** in `docs/FINDINGS.md` (F45 landed this session). **60 commits are
+unpushed to `origin/main`** (confirmed `git rev-list --count
+origin/main..main` after an explicit `fetch`, this session — up from the
+previous entry's 50; **the repo has NOT been pushed as of this entry**).
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
 
 **THE REPLICATION MEASUREMENT IS DONE, AND IT PASSES.** Aggregate throughput
@@ -57,17 +61,17 @@ claim, which still stands, was kept).
 finished. Verified from the live system this session, not carried over from
 the previous entry:**
 
-1. **The `-c 65536` extended chunk-size sweep on node 2 has FINISHED.**
-   `bench/out/chunk-size-bench-c65536/results.json` has a complete `status:
-   "ok"` row for all three sizes tested (4096, 8192, 12288), and its driver
-   process is no longer running. **Its numbers are deliberately not written up
-   in `docs/measurements.md` yet** — that write-up belongs to whoever owns
-   `bench/` next; see that file's note not to quote them from elsewhere in the
-   meantime. Node 2's `rpc-server@50052` should be checked and restarted if
-   still stopped from the sweep — **not verified this session**, because
-   restarting a cluster service is out of scope for the agent that wrote this
-   update; check `systemctl is-active rpc-server@50052` on node 2 before
-   assuming it is back.
+1. **The `-c 65536` extended chunk-size sweep on node 2 has FINISHED, AND has
+   since been written up.** This entry corrects the previous version of this
+   file, which said the write-up was still owed — it was not, by the time that
+   claim was written. `docs/measurements.md`'s "Chunk-size sweep, extended"
+   section (added by commit `35ee0a0`, 16:17, which is *before* the previous
+   STATUS entry at 17:49) has the full table and the finding: raising `-c`
+   past what `CHUNK_TOKENS=4096` needs costs **33% more wall-clock on
+   identical chunking**, not a wash. `CLAUDE.md`'s `-c` standing constraint has
+   been corrected to say so. Node 2's `rpc-server@50052` **is active**,
+   confirmed by direct SSH this session (`systemctl is-active` → `active`,
+   twice, four minutes apart) — the sweep is over and the service is back.
 2. **The citation-test job (`18339bace8f0`) has FINISHED, not "in flight."**
    Read directly from `/opt/missing-link/jobs.sqlite` (read-only) this
    session: `status = done`, 7 chunks, finished
@@ -98,13 +102,15 @@ previously has actually been closed, not assuming it away.
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **44 findings** from running this on real
+1. **Read `docs/FINDINGS.md`.** **45 findings** from running this on real
    hardware. Several correct the plan or the spec — **and F28 corrects this file
    and F23; F40 reverses the ik_llama.cpp recommendation fleet-wide; F39/F43
    correct the watchdog's own design twice, once for what it was probing and
-   once for a bug in the probe itself.** Do not trust the original plan's
+   once for a bug in the probe itself; F45 corrects the metric the corpus page
+   uses to judge a document's usability.** Do not trust the original plan's
    numbers over these, and do not trust an older copy of this file's engine
-   choice — it changed.
+   choice — it changed, more than once, including during this session (see
+   "Where things stand" below).
 2. `docs/measurements.md` is the only place performance numbers may be quoted
    from.
 3. `docs/UPSTREAM-PATCHES.md` lists the concrete corrections still to fold back
@@ -470,17 +476,52 @@ refusal, two-scope hard checking, and a canonical entity index.
 
 **The work:**
 
-1. **Load real material.** In flight at session end: Privacy Act 1988
-   compilations (several, deliberately), amending instruments, the ISM, and
-   NIST 800-series. `docs/corpus-selection.md` should carry a ranked shortlist —
-   **read it before assuming the operator's picks are the right ones.** The open
-   argument is that OAIC privacy determinations may be a better structural proxy
-   than the ISM, because they are published findings on real personal and health
-   information incidents, i.e. what a sensitive-sector office actually *writes*,
-   whereas the Act and the ISM are what it *reads*.
-2. **Re-run the blocked measurements against it.** Boundary severance is the
-   headline: the question is whether a word-count cut severs clause pairs on
-   material that actually contains them.
+1. **Load real material — DONE, verified from the live store this session.**
+   `/opt/missing-link/jobs.sqlite`'s `corpus_documents` table (read-only query,
+   this session) holds **17 documents, 403 chunks at `CHUNK_TOKENS=4096`,
+   7,416,682 characters**, across four genres: **legislative 6** (four Privacy
+   Act 1988 point-in-time compilations — 2005-05-16, 2014-03-12, 2018-02-22,
+   2026-06-04 "current" — plus the Notifiable Data Breaches amending Act and
+   the Credit Reporting Code), **nist standards 4** (SP 800-53 Rev4 and Rev5,
+   SP 800-171 Rev3, SP 800-63B Rev4), **regulatory 5** (five OAIC investigation
+   determinations, including the Ashley Madison joint investigation), and
+   **standards 2** (ISM April 2019 and June 2026 editions). **The four Privacy
+   Act compilations are what make the revision-diff experiment (item 4 below)
+   possible** — real, dated, small textual deltas between compilations of one
+   instrument, exactly the shape Q5 of `docs/corpus-selection.md` asked for.
+   `docs/corpus-selection.md` **exists on disk and carries the ranked
+   shortlist this task used** — **read it before assuming the operator's
+   picks are the right ones.** Its headline finding: **it demotes the ISM**
+   from "primary sourcing pick" to "extraction stress test + revision-diff
+   pair" and **promotes OAIC Commissioner-initiated investigation
+   determinations to #1** on the shortlist, because they are the closest
+   public proxy to a real internal incident investigation — a narrative
+   fact-finding account against a named respondent, ending in numbered
+   findings against statutory tests — which is what a sensitive-sector office
+   actually *writes*, whereas the Act and the ISM are what it *reads*. It also
+   found **Hansard's licence (CC BY-NC-ND, NoDerivs) genuinely conflicts with
+   this pipeline** (see the new `docs/REQUIREMENTS.md` entry this session,
+   2026-08-18) and recommends against using it at all, and it explains why
+   **Commonwealth Ombudsman reports were skipped**: `ombudsman.gov.au` sits
+   behind a Cloudflare JS challenge and returns 403 to plain HTTP fetch — a
+   real constraint on corpus assembly from government sources, not an
+   oversight (also recorded as F45's "also worth recording" note).
+   **Correction to how this file previously described `docs/corpus-
+   selection.md`: it was NOT committed to git** as of the previous entry
+   (`git log --all -- docs/corpus-selection.md` returns nothing) — it existed
+   only as a file on the coordinator's disk in the main checkout. It has been
+   copied into this session's worktree so it ships with these doc fixes; it
+   still needs an actual commit to exist once this repo goes public.
+2. **Re-run the blocked measurements against it — attempted, and it found the
+   instrument itself was broken before it could answer the question.** The
+   boundary-severance re-run against the new legislative corpus is **F45**:
+   marker density on real legislation came back only 2–4× the narrative
+   texts' (1.8–4.9% vs 0.00–1.4%), not the dramatic gap expected, because
+   legislation's paragraph-per-clause HTML feeds thousands of short
+   structural lines into the sentence splitter's denominator. **The severance
+   question itself is therefore still open** — what's now known is that
+   marker density is within-genre comparable only, until the splitter
+   excludes non-sentence fragments. Read F45 directly, not this summary.
 3. **Settle `--entity-rules strict` on clean source.** It is the setting most
    likely correct for production and the only reason it is not the default is
    that nothing clean has been measured.
@@ -866,15 +907,37 @@ second replica, `10.10.0.39`)** — both provisioned, both serving.
 
 | Item | node 1 | node 2 |
 |---|---|---|
-| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` — **the ENGINE ACTUALLY SERVING (F40)**, confirmed this session from `/etc/default/llama-server`'s `LLAMA_BIN=` | **reported same by the previous entry; not re-checked this session (no SSH to node 2)** |
-| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` — **kept installed, NOT the default any more.** Old config backed up at `/etc/default/llama-server.ik.bak` (confirmed on node 1 this session) | reported same, not re-checked |
-| `rpc-server@50052` | reported active, `-t 4`, user `cluster` — not re-checked this session | reported active normally; **the previous entry left it deliberately stopped for a chunk-size sweep that has since finished — confirm `systemctl is-active rpc-server@50052` before assuming it is back, this was not re-checked this session** |
+| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` — **the ENGINE ACTUALLY SERVING (F40)**, confirmed this session from `/etc/default/llama-server`'s `LLAMA_BIN=` | **mainline, but this moved during this session — see the box below the table before trusting a snapshot of this row** |
+| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` — **kept installed, NOT the default any more.** Old config backed up at `/etc/default/llama-server.ik.bak` (confirmed on node 1 this session) | kept installed; **actually serving 16:29–18:24 this session** (see below) |
+| `rpc-server@50052` | active, `-t 4`, user `cluster` — confirmed by direct check this session | **active**, confirmed by direct SSH this session (`systemctl is-active` → `active`) — the chunk-size sweep that left it stopped is over |
 | Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB), **Qwen3-Next-80B-A3B-Instruct UD-Q8_K_XL — download now COMPLETE, both shard files present, ~93 GB total** (confirmed by `ls` this session; the previous entry's "26%" is stale) | **gpt-oss-120b, md5-verified** (not re-checked) |
 | SSH | password auth still ON (no key installed until this session) | **key-only, hardened** |
-| Disk free | **248 GB** (`df -h /`, confirmed this session — down from the previous entry's 367 GB, consistent with the ~93 GB Qwen3-Next model landing) | 437 GB (not re-checked) |
-| Missing Link | job store + worker + web API, fan-out across R endpoints (code merged but **`LLAMA_URLS` unset — only node 1 is actually used**, see task 2 above), queue control, resumable per-chunk persistence, automatic retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table — **469 tests**. Confirmed running the current code: `ActiveEnterTimestamp` 11:53:31, after all of the above landed | n/a (coordinator only) |
+| Disk free | **248 GB** (`df -h /`, confirmed this session) | **375 GB** (`df -h /`, confirmed this session by direct SSH — down from the previous entry's 437 GB, consistent with the corpus/model activity recorded above) |
+| Missing Link | job store + worker + web API, fan-out across R endpoints (code merged but **`LLAMA_URLS` unset — only node 1 is actually used, confirmed this session from `/etc/default/missing-link`**, see task 2 above), queue control, resumable per-chunk persistence, automatic retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table, a corpus benchmark page — **552 tests**. Confirmed running the current code: `ActiveEnterTimestamp` **17:44:47** (confirmed this session — later than the previous entry's 11:53:31, i.e. the service was restarted again since then, consistent with the corpus feature going live) | n/a (coordinator only) |
 | Phase 0 gate | **PASSED** | — |
 | #26500 gate | **PASSED across both machines** (F31) | — |
+
+**Node 2's engine changed while this session was checking it, and that is worth
+recording plainly rather than smoothing over.** Direct SSH checks, in order:
+
+1. First check: `/etc/default/llama-server` read `LLAMA_BIN=/opt/ik_llama.cpp/bin`.
+2. `journalctl` on node 2 shows `llama-server@8080` started at **16:29:27** running
+   ik_llama.cpp at the default configuration — `--parallel 4`, `flash_attn = 1`
+   (**not** the untested `--parallel 1` or flash-attention-off variants F40 named
+   as still open) — and it ran without a logged crash through at least 18:24, longer
+   than the four requests F40 found fatal on a busy job (consistent with a mostly
+   idle service in that window, not with the bug being fixed).
+3. A **second and third check, four minutes apart, both read
+   `LLAMA_BIN=/opt/llama.cpp/bin`** — mainline. `systemctl show` confirms the
+   service restarted at **18:24:53 AEST**, a timestamp inside this session's own
+   working window. **This agent did not restart it** — this pass is read-only on
+   node 2 per its brief. Something else (the operator, or another concurrent
+   session) flipped it back to mainline while this documentation pass was running.
+
+**What this means for anyone reading this file next: treat "node 2's engine" as a
+live value, not a fact to carry forward.** As of the last check this session
+(18:28 AEST), node 2 is on mainline, matching node 1 and the fleet-wide decision.
+Re-check `/etc/default/llama-server` before relying on it.
 
 **`rpc-server` IS now running on both nodes.** The unit is *templated*, so the
 name is `rpc-server@50052.service` — plain `systemctl status rpc-server` reports
