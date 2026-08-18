@@ -41,6 +41,13 @@ WHAT THE DETERMINISTIC TIER ACTUALLY DOES
                    verified genuine fabrications, ZERO false positives.
                    Distinctive terms are checked too but only ROUTE; see
                    ENTITY_MODE for why that was demoted, and on what evidence.
+    tier 1b HARD   A SECOND SCOPE, on failures only. A figure absent from its
+                   cited span but present in ANOTHER CHUNK of the same document
+                   is a CITATION ERROR; a figure absent from every chunk is a
+                   FABRICATION. Conflating those made the most serious finding
+                   this tool can produce indistinguishable from the least. See
+                   `DocumentScope`; it costs +5-16% of the cheap tier and
+                   cannot turn a failure into a pass.
     tier 2  SOFT   lexical overlap, trigram similarity, unit agreement,
                    negation polarity, quantifier scope, dropped qualifiers.
                    These NEVER decide. They route: clearly fine, or hand it on.
@@ -64,6 +71,19 @@ doubt are different evidence and are never merged into one opaque score --
 a reader must be able to see WHY something was flagged. A `status` of "fail"
 anywhere in a ledger always means a hard, deterministic failure.
 
+RELATIONSHIP TO entity_index.py
+-------------------------------
+Distinctive terms are resolved against a CANONICAL INDEX of the entities a
+scope contains, not against its raw characters. The old check compacted a
+multi-word name into one string and fuzzy-matched it against individual source
+TOKENS, which could not succeed even in principle -- and that accounts for most
+of the measured false-positive rate on OCR-damaged source. Measured after the
+change on 1,014 real claims: false positives 11.34% -> 8.48%, fabricated-name
+catch UNCHANGED at 98.8%, but 1-character name corruptions caught 36.1% ->
+14.6%. That last number is a real regression, it is why the entity signal is
+NOT promoted out of ENTITY_MODE="route", and it is why
+`entity_index.STRICT_RULES` exists. See docs/two-scope-and-entity-index.md.
+
 RELATIONSHIP TO audit.py
 ------------------------
 This module IMPORTS from `audit.py` and does not modify it. The scorer
@@ -86,9 +106,8 @@ import time
 import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from difflib import SequenceMatcher
 
-from . import audit
+from . import audit, entity_index
 from .audit import (  # noqa: F401  (re-exported for callers of this module)
     CAT_DISAGREEMENT,
     CAT_POLARITY,
@@ -114,8 +133,28 @@ CASCADE_SCHEMA_VERSION = 1
 DECOMPOSE = True
 
 # --- new finding categories (additive to audit.py's) ------------------------
-CAT_NUMBER = "number_unsupported"
+#
+# TWO SCOPES, TWO DIFFERENT FAILURES. A figure absent from its cited span is
+# not one finding, it is two, and conflating them makes the most serious thing
+# this tool can say indistinguishable from the least serious:
+#
+#   * absent from the cited span, PRESENT ELSEWHERE IN THE DOCUMENT -- the
+#     model attributed correct information to the wrong section. A CITATION
+#     error. Annoying; the fact is in the document and a reader can find it.
+#   * absent from EVERY chunk of the document -- the model invented it. A
+#     FABRICATION. This is F42's death year: asserted in the reduce output,
+#     present in no chunk summary and nowhere in the source. It is the reason
+#     this tool exists.
+#
+# `CAT_NUMBER` is retained for the case where NO document scope was supplied:
+# the figure is absent from the cited span and the checker was given nothing
+# wider to look in, so it must not claim to know which of the two it is.
+CAT_NUMBER = "number_unsupported"           # scope unknown -- no document given
+CAT_NUMBER_FABRICATED = "number_fabricated"       # absent from the whole document
+CAT_NUMBER_ELSEWHERE = "number_misattributed"     # present in another chunk
 CAT_ENTITY = "entity_unsupported"
+CAT_ENTITY_FABRICATED = "entity_fabricated"
+CAT_ENTITY_ELSEWHERE = "entity_misattributed"
 CAT_NEEDS_CLASSIFIER = "needs_classifier"
 
 # Signal kinds. EVERY signal carries one. A hard number mismatch and a soft
@@ -131,14 +170,24 @@ KIND_CLASSIFIER = "classifier"
 # makes it self-describing. The new hard categories rank high because they are
 # the only findings in the whole ledger that are DETERMINISTIC: a missing
 # figure is a fact about the text, not a model's opinion of it.
+#
+# `number_fabricated` and `number_unsupported` share rank 1 deliberately. They
+# are the same finding -- a figure with no counterpart in the evidence -- and
+# the only difference is whether a wider scope was available to rule out
+# misattribution. A misattribution ranks BELOW both, because the fact is in the
+# document: the reader has a correction to make, not an invention to catch.
 CASCADE_CATEGORY_PRIORITY = {
     CAT_UNSCOREABLE: 0,
     CAT_NUMBER: 1,
-    CAT_ENTITY: 2,
-    CAT_NEEDS_CLASSIFIER: 3,
-    CAT_DISAGREEMENT: 4,
-    CAT_UNSUPPORTED: 5,
-    CAT_POLARITY: 6,
+    CAT_NUMBER_FABRICATED: 1,
+    CAT_NUMBER_ELSEWHERE: 2,
+    CAT_ENTITY: 3,
+    CAT_ENTITY_FABRICATED: 3,
+    CAT_ENTITY_ELSEWHERE: 4,
+    CAT_NEEDS_CLASSIFIER: 5,
+    CAT_DISAGREEMENT: 6,
+    CAT_UNSUPPORTED: 7,
+    CAT_POLARITY: 8,
 }
 
 TIER_UNSCOREABLE = "unscoreable"
@@ -964,14 +1013,53 @@ def century_support(mention, evidence_numbers):
     return None
 
 
-def _value_index(nums):
-    idx = {}
-    for n in nums:
-        idx.setdefault(n.value, []).append(n)
-    return idx
+class NumberEvidence:
+    """Every number in one evidence region, indexed for value lookup.
+
+    Pulled out of `check_numbers` so that the CITED SPAN and the WIDER
+    DOCUMENT are searched by exactly the same code. Two lookup functions that
+    could drift apart would be a two-scope checker whose two scopes disagree
+    about what "the same number" means, which is the failure mode the whole
+    normalisation section exists to prevent.
+
+    Building one is O(len(text)); it is built ONCE per evidence region and
+    reused across every claim scored against it.
+    """
+
+    __slots__ = ("nums", "by_value", "by_mantissa", "enum_count")
+
+    def __init__(self, text):
+        self.nums = extract_numbers(text)
+        self.by_value = {}
+        self.by_mantissa = {}
+        for n in self.nums:
+            self.by_value.setdefault(n.value, []).append(n)
+            if n.mantissa is not None:
+                self.by_mantissa.setdefault(n.mantissa, []).append(n)
+        self.enum_count = enumeration_count(text)
+
+    def lookup(self, c):
+        """Find `c` in this region. Returns (evidence_dict, via, Num or None)."""
+        hits = self.by_value.get(c.value)
+        via = "value"
+        if not hits and c.mantissa is not None:
+            # "1.2 million" claimed where the source writes "1.2" plus a
+            # magnitude word the extractor grouped differently. Lax on purpose.
+            hits = self.by_value.get(c.mantissa) or self.by_mantissa.get(c.mantissa)
+            via = "mantissa"
+        if not hits and c.mantissa is None:
+            hits = self.by_mantissa.get(c.value)
+            via = "mantissa"
+        if hits:
+            return hits[0].as_dict(), via, hits[0]
+        year = century_support(c, self.nums)
+        if year is not None:
+            return ({"text": str(year), "value": str(year), "kind": K_YEAR},
+                    "century_of_year", None)
+        return None, None, None
 
 
-def check_numbers(claim, evidence):
+def check_numbers(claim, evidence, evidence_numbers=None, scope=None):
     """Hard signal: does every number in `claim` occur in `evidence`?
 
     Matching is on the normalised VALUE, not on the surface form and not on the
@@ -980,32 +1068,28 @@ def check_numbers(claim, evidence):
     (money claimed against a plain source number) does not fail the hard check
     -- it is reported as a soft `unit_agreement` observation instead, because
     the figure itself is present and a reader can see the rest.
+
+    TWO SCOPES. `scope`, when given, is a `DocumentScope` over the whole
+    document, and it is consulted **only for figures the cited span could not
+    account for**. That ordering is the entire cost story: a figure present in
+    its own cited span never triggers the wider search, so the second pass runs
+    on the ~1% of figures that fail rather than on all of them. The wider pass
+    can only ever RECLASSIFY a failure -- it can never turn a failure into a
+    pass, because a figure supported by some other chunk is still not supported
+    by the one the model cited.
     """
     c_nums = extract_numbers(claim)
-    e_nums = extract_numbers(evidence)
-    e_idx = _value_index(e_nums)
-    e_mantissa = {}
-    for n in e_nums:
-        if n.mantissa is not None:
-            e_mantissa.setdefault(n.mantissa, []).append(n)
-    enum_n = enumeration_count(evidence)
+    ev = evidence_numbers if evidence_numbers is not None else NumberEvidence(evidence)
+    enum_n = ev.enum_count
 
     matched, unmatched, derived, unit_notes = [], [], [], []
     for c in c_nums:
-        hits = e_idx.get(c.value)
-        via = "value"
-        if not hits and c.mantissa is not None:
-            # "1.2 million" claimed where the source writes "1.2" plus a
-            # magnitude word the extractor grouped differently. Lax on purpose.
-            hits = e_idx.get(c.mantissa) or e_mantissa.get(c.mantissa)
-            via = "mantissa"
-        if not hits and c.mantissa is None:
-            hits = e_mantissa.get(c.value)
-            via = "mantissa"
-        if hits:
-            best = hits[0]
-            matched.append({"claim": c.as_dict(), "evidence": best.as_dict(),
+        e_dict, via, best = ev.lookup(c)
+        if e_dict is not None:
+            matched.append({"claim": c.as_dict(), "evidence": e_dict,
                             "via": via})
+            if best is None:
+                continue                 # century derivation: no unit to compare
             if c.unit and best.unit and c.unit != best.unit \
                     and c.unit != best.prev_word:
                 unit_notes.append(
@@ -1016,13 +1100,6 @@ def check_numbers(claim, evidence):
                     {"value": str(c.value), "claim_kind": c.kind,
                      "evidence_kind": best.kind})
             continue
-        year = century_support(c, e_nums)
-        if year is not None:
-            matched.append({"claim": c.as_dict(),
-                            "evidence": {"text": str(year), "value": str(year),
-                                         "kind": K_YEAR},
-                            "via": "century_of_year"})
-            continue
         if not c.strict and enum_n and Decimal(enum_n) == c.value:
             derived.append({"claim": c.as_dict(), "enumeration_count": enum_n})
             continue
@@ -1030,8 +1107,14 @@ def check_numbers(claim, evidence):
             {"claim": c.as_dict()} if c.strict
             else {"claim": c.as_dict(), "enumeration_count": enum_n})
 
+    # ---- SECOND PASS. Only on what the cited span could not account for. ----
+    elsewhere, fabricated, scope_label = [], [], None
+    if unmatched and scope is not None:
+        scope_label = scope.label
+        elsewhere, fabricated = _widen_numbers(c_nums, unmatched, scope)
+
     status = "fail" if unmatched else ("warn" if derived else "pass")
-    return {
+    out = {
         "name": "numbers", "kind": KIND_HARD, "status": status,
         "claim_numbers": len(c_nums),
         "matched": matched,
@@ -1041,16 +1124,70 @@ def check_numbers(claim, evidence):
         "unit_disagreements": unit_notes,
         "detail": _numbers_detail(unmatched, derived),
     }
+    if scope_label is not None:
+        out["document_scope"] = scope_label
+        out["elsewhere_in_document"] = elsewhere
+        out["absent_from_document"] = fabricated
+        out["detail"] = _numbers_detail(unmatched, derived, elsewhere,
+                                        fabricated, scope_label)
+    return out
 
 
-def _numbers_detail(unmatched, derived):
+def _widen_numbers(c_nums, unmatched, scope):
+    """Re-check ONLY the unmatched figures against the whole document.
+
+    Returns (elsewhere, absent). `elsewhere` entries name the part of the
+    document the figure was found in, so the finding can say WHICH section the
+    model should have cited rather than merely that it cited the wrong one.
+    """
+    elsewhere, absent = [], []
+    by_key = {}
+    for n in c_nums:
+        by_key.setdefault((n.text, str(n.value)), n)
+    for u in unmatched:
+        n = by_key.get((u["claim"]["text"], u["claim"]["value"]))
+        found = scope.find_number(n) if n is not None else None
+        if found:
+            part, e_dict, via = found
+            entry = {"claim": u["claim"], "found_in": part,
+                     "evidence": e_dict, "via": via}
+            elsewhere.append(entry)
+            u["found_elsewhere_in"] = part
+        else:
+            absent.append({"claim": u["claim"]})
+            u["found_elsewhere_in"] = None
+    return elsewhere, absent
+
+
+def _numbers_detail(unmatched, derived, elsewhere=None, fabricated=None,
+                    scope_label=None):
     if unmatched:
-        return ("HARD FAIL. " + "; ".join(
+        head = ("HARD FAIL. " + "; ".join(
             f"the claim states {u['claim']['text']!r} "
             f"(normalised {u['claim']['value']}) and no number with that value "
-            f"occurs in the cited span" for u in unmatched)
-            + ". A classifier cannot make a missing figure present, so this is "
-              "not escalated -- read the cited span.")
+            f"occurs in the cited span" for u in unmatched))
+        if scope_label is None:
+            return head + (". A classifier cannot make a missing figure "
+                           "present, so this is not escalated -- read the "
+                           "cited span.")
+        bits = []
+        if fabricated:
+            bits.append(
+                "FABRICATION: " + ", ".join(
+                    repr(f["claim"]["text"]) for f in fabricated)
+                + f" occurs nowhere in {scope_label} either, so it was not "
+                  "attributed to the wrong section -- it is not in the source "
+                  "at all")
+        if elsewhere:
+            bits.append(
+                "CITATION ERROR: " + ", ".join(
+                    "{!r} does occur in {}".format(e["claim"]["text"],
+                                                  e["found_in"])
+                    for e in elsewhere)
+                + ", so the figure is right and the attribution is wrong")
+        return head + ". " + ". ".join(bits) + ". A classifier cannot make a " \
+            "missing figure present, so this is not escalated -- read the " \
+            "cited span."
     if derived:
         return ("A small count in the claim has no literal counterpart in the "
                 "cited span. It may be DERIVED (correctly counting enumerated "
@@ -1073,8 +1210,31 @@ def _numbers_detail(unmatched, derived):
 
 _ACRONYM_RE = re.compile(r"\b[A-Z][A-Z0-9]{1,}\b")
 _IDENT_RE = re.compile(r"\b(?=[A-Za-z]*\d)[A-Za-z]+[-/]?\d[A-Za-z0-9-]*\b")
-_CAP_SEQ_RE = re.compile(r"\b[A-Z][\w'’.-]*(?:\s+(?:of|the|and|for|de|van|von)\s+)?"
+# " and " is NOT a connector inside a proper-noun phrase. MEASURED FALSE
+# POSITIVE: real summaries write "Bhagavad-Gītā and Srimad-Bhāgavatam", and
+# spanning the conjunction produced a "name" that occurs in no source anywhere,
+# flagged on every occurrence. Both halves are still pushed individually, so
+# nothing stops being checked -- the phrase that never existed stops being
+# invented. "of"/"the"/"de"/"van"/"von" stay, because those genuinely occur
+# inside single names.
+_CAP_SEQ_RE = re.compile(r"\b[A-Z][\w'’.-]*(?:\s+(?:of|the|for|de|van|von)\s+)?"
                          r"(?:\s*\b[A-Z][\w'’.-]*)*")
+
+# A SENTENCE dash is not a word hyphen. MEASURED FALSE POSITIVE, and it is the
+# same class of defect as the non-breaking hyphen that read "twenty-four" as 20
+# and 4 -- a lookalike normalisation that changed what a token IS.
+# `normalise_lookalikes` maps en/em dashes to "-" because the number scanner
+# needs "1485–1534" to read as a range; but `_CAP_SEQ_RE`'s token class
+# contains "-", so real output like "Gaura-līlā—are" and "consciousness—lower"
+# became the proper nouns "Gaura-līlā-are" and "Muslim-offers", which occur in
+# no source. Sentence dashes therefore become SPACES before entity extraction
+# and only there. Length-preserving, 1:1, so nothing downstream shifts.
+_ENTITY_DASHES = {ord(c): " " for c in "–—―"}
+
+
+def entity_text(text):
+    """Normalise for ENTITY extraction: sentence dashes split, hyphens join."""
+    return normalise_lookalikes((text or "").translate(_ENTITY_DASHES))
 # Words that are capitalised for reasons other than being a name.
 _CAP_STOP = frozenset("""the a an this that these those it he she they we you i and or but
 if then when while for to of in on at by with from as is are was were be been being
@@ -1100,15 +1260,25 @@ _CAP_CONNECTORS = frozenset("of the and for de van von in on at to".split())
 # below 0.70 the catch rate falls off a cliff. Note what the whole curve says --
 # even at its best this signal flags roughly ONE IN SEVEN faithful sentences,
 # which is why it does not decide anything. See ENTITY_MODE.
-ENTITY_FUZZ = 0.75
+#
+# RE-SWEPT 2026-08-18 against the entity index on 1,014 real claims and two
+# mutation batteries (docs/two-scope-and-entity-index.md 5). The knee did not
+# move, and the re-sweep found something the first one could not see: the
+# false-positive and catch curves move together and MONOTONICALLY between 0.75
+# and 0.90, so this is one dial rather than a tradeoff with a sweet spot.
+#
+# ALIASES, not second copies. The matcher lives in `entity_index` and reads its
+# own constants; two thresholds that could drift apart would be a checker whose
+# two scopes disagree about what counts as the same name.
+ENTITY_FUZZ = entity_index.WHOLE_FUZZ
 # Entities shorter than this are too collision-prone to check.
-ENTITY_MIN_LEN = 3
+ENTITY_MIN_LEN = entity_index.MIN_TOKEN
 # Require a fuzzy match to agree on the first folded character. Transliteration
 # and OCR variants of a name overwhelmingly preserve the initial letter
 # (Radharani/Radharao^, Vaikuntha/Vaikuoeha), while two genuinely different
 # names usually differ there. It buys a lower fuzz threshold without buying
 # the false matches a lower threshold would otherwise admit.
-ENTITY_REQUIRE_INITIAL = True
+ENTITY_REQUIRE_INITIAL = entity_index.REQUIRE_INITIAL
 
 # What an absent distinctive term DOES.
 #
@@ -1137,7 +1307,7 @@ def extract_entities(text):
     Returns [(surface, category)] with category in
     {"acronym", "identifier", "proper_noun"}.
     """
-    text = normalise_lookalikes(text)
+    text = entity_text(text)
     found = []
     seen = set()
 
@@ -1209,51 +1379,102 @@ def extract_entities(text):
     return found
 
 
-def _entity_supported(term, ev_fold, ev_tokens):
-    """Is `term` present in the evidence, allowing OCR-level damage?"""
-    f = fold(term)
-    compact = re.sub(r"[^0-9a-z]+", "", f)
-    if not compact:
-        return True, "empty"
-    if f in ev_fold:
-        return True, "substring"
-    # Space/hyphen-insensitive containment, for "Sri Chaitanya"/"SriChaitanya".
-    ev_compact = re.sub(r"[^0-9a-z]+", "", ev_fold)
-    if compact in ev_compact:
-        return True, "compact_substring"
-    parts = [p for p in re.split(r"[\s.-]+", f) if len(p) >= ENTITY_MIN_LEN]
-    if parts and all(p in ev_fold for p in parts):
-        return True, "all_parts_present"
-    best = 0.0
-    for t in ev_tokens:
-        if abs(len(t) - len(compact)) > max(3, len(compact) // 3):
-            continue
-        if ENTITY_REQUIRE_INITIAL and t[:1] != compact[:1]:
-            continue
-        r = SequenceMatcher(None, compact, t).ratio()
-        if r > best:
-            best = r
-            if best >= ENTITY_FUZZ:
-                return True, f"fuzzy:{best:.2f}"
-    return False, f"best_fuzzy:{best:.2f}"
+CITED_SPAN = "cited span"
+
+# Which resolution rules the entity matcher may use. `entity_index.RULES` is
+# the measured default; `entity_index.STRICT_RULES` drops fuzzy matching
+# entirely, which on a NON-OCR corpus is very likely the better setting -- see
+# the numbers in entity_index.REJECTED_RULES. One switch, so the effect on
+# both error directions can be isolated by flipping it.
+ENTITY_RULES = entity_index.RULES
 
 
-def check_entities(claim, evidence):
-    """Hard signal: distinctive terms in the claim absent from the cited span."""
+def span_entity_index(evidence, label=CITED_SPAN):
+    """A one-scope `EntityIndex` over a cited span. Build once, reuse per claim.
+
+    `build_cascade_ledger` caches these per distinct evidence text, which is
+    what makes the index affordable: hop 1 scores ~18 claims against the same
+    4096-token chunk, and extracting that chunk's entities eighteen times would
+    be eighteen times the work for one answer.
+    """
+    return entity_index.EntityIndex.from_text(evidence, label=label,
+                                              rules=ENTITY_RULES)
+
+
+def _entity_supported(term, ev_index):
+    """Is `term` one of the entities this scope actually talks about?
+
+    REPLACED, and this is Change 2. The old implementation compacted the whole
+    term to one string and fuzzy-matched it against individual SOURCE TOKENS.
+    For a multi-word name that comparison could not succeed even in principle:
+    `Śrīla Kedārnāth` compacts to 14 characters, a source token is ~8, and the
+    length band rejected the pair before `SequenceMatcher` was ever called. So
+    every multi-word transliteration in an OCR-damaged corpus was reported
+    absent -- which is most of the measured 15% false-positive rate.
+
+    Resolving against an INDEX of the scope's own entities compares a name to a
+    name. See `entity_index` for the rule ladder and for the two rules that
+    were measured and rejected as too permissive.
+    """
+    res = ev_index.resolve(term)
+    if res is None:
+        return False, "unresolved", None
+    how = res.rule if res.score is None else f"{res.rule}:{res.score:.2f}"
+    return True, how, res
+
+
+def check_entities(claim, evidence, evidence_index=None, scope=None):
+    """Hard signal: distinctive terms in the claim absent from the cited span.
+
+    TWO SCOPES, same ordering rule as `check_numbers`: the wider document index
+    is consulted only for terms the cited span could not resolve. A term that
+    resolves elsewhere in the document is a CITATION error; a term that
+    resolves nowhere is the fabrication case.
+
+    NOTE ON WHAT THIS SIGNAL MAY DO. It still only ROUTES by default
+    (`ENTITY_MODE`), and Change 2 does not promote it. The measured
+    false-positive rate is much lower than it was, but the catch rate is what
+    decides whether a signal may fail a claim, and softening a matcher can only
+    move that number down. The scope split is reported either way, because a
+    reader triaging an escalation wants to know whether the name is absent from
+    the section or absent from the book.
+    """
     terms = extract_entities(claim)
-    ev_fold = fold(evidence)
-    ev_tokens = [re.sub(r"[^0-9a-z]+", "", t) for t in fold_tokens(evidence)]
-    ev_tokens = [t for t in ev_tokens if t]
-    matched, missing = [], []
+    ev_index = evidence_index if evidence_index is not None \
+        else span_entity_index(evidence)
+    matched, missing, elsewhere, fabricated = [], [], [], []
+    approximate = []
     for surface, cat in terms:
-        ok, how = _entity_supported(surface, ev_fold, ev_tokens)
-        (matched if ok else missing).append(
-            {"term": surface, "category": cat, "match": how})
-    return {
+        ok, how, res = _entity_supported(surface, ev_index)
+        if ok:
+            entry = {"term": surface, "category": cat, "match": how}
+            if res is not None and res.rule in entity_index.FUZZY_RULES:
+                # DISCLOSED, not hidden. Every other rule is containment and
+                # cannot be wrong about presence; a fuzzy resolve is the only
+                # kind of match that could be absorbing a corrupted name, and
+                # a reader triaging this claim is entitled to know which of
+                # its terms rests on a similarity score.
+                entry["approximate"] = True
+                approximate.append(entry)
+            matched.append(entry)
+            continue
+        entry = {"term": surface, "category": cat, "match": how}
+        if scope is not None:
+            wider = scope.find_entity(surface)
+            if wider is not None:
+                entry["found_elsewhere_in"] = wider.scopes
+                entry["found_by"] = wider.rule
+                elsewhere.append(entry)
+            else:
+                entry["found_elsewhere_in"] = None
+                fabricated.append(entry)
+        missing.append(entry)
+    out = {
         "name": "entities", "kind": KIND_HARD,
         "status": "fail" if missing else "pass",
         "claim_terms": len(terms),
         "matched": matched, "missing": missing,
+        "resolved_approximately": [m["term"] for m in approximate],
         "detail": (
             "Distinctive terms in the claim that do not occur in the cited span: "
             + ", ".join(repr(m["term"]) for m in missing)
@@ -1262,6 +1483,220 @@ def check_entities(claim, evidence):
               "diacritics, so a miss here means the term is genuinely absent."
             if missing else
             "Every distinctive term in the claim occurs in the cited span.")}
+    if scope is not None:
+        out["document_scope"] = scope.label
+        out["elsewhere_in_document"] = elsewhere
+        out["absent_from_document"] = fabricated
+        if missing:
+            bits = []
+            if fabricated:
+                bits.append("absent from {} entirely: {}".format(
+                    scope.label,
+                    ", ".join(repr(m["term"]) for m in fabricated)))
+            if elsewhere:
+                bits.append("present elsewhere in {} ({}): {}".format(
+                    scope.label,
+                    "a citation error, not a fabrication",
+                    ", ".join(repr(m["term"]) for m in elsewhere)))
+            out["detail"] += " " + "; ".join(bits) + "."
+    return out
+
+
+# ===========================================================================
+# The SECOND scope: the whole document
+# ===========================================================================
+#
+# WHY A SECOND SCOPE AT ALL. Scoring a claim against its CITED SPAN is
+# well-founded and is not being replaced -- correctly-scoped evidence windows
+# are what make the number tier's 0/978 false-positive rate possible, and
+# widening the primary check to the whole document would make almost everything
+# "supported" by coincidence. What the single scope cannot do is tell a
+# CITATION ERROR from a FABRICATION, and those are not the same finding.
+#
+# So the wider scope is a SECOND PASS, entered only where the first pass
+# already failed. Three properties follow and all three are load-bearing:
+#
+#   * it can never turn a failure into a pass. A figure supported by chunk 12
+#     is still not supported by chunk 3, which is what the model cited.
+#   * it costs nothing on the common path. A claim whose figures are all
+#     present never touches it.
+#   * the indexes are built LAZILY and ONCE per document, so a document with
+#     no hard failures at all never pays for building them.
+#
+# WHICH SIGNALS GET THE TREATMENT, AND WHICH DELIBERATELY DO NOT.
+#
+#   numbers   YES. A value is a value; "does 1534 occur anywhere in this
+#             document" is the same `in` at either scope.
+#   entities  YES, via the canonical index (`entity_index`), which is the
+#             mechanism that makes "is this a person the document talks about"
+#             answerable at all.
+#   lexical overlap, trigram similarity  NO. These are proportions of the
+#             claim covered by the evidence, and a whole document trivially
+#             covers most of any claim's vocabulary. Widening them would not
+#             distinguish anything; it would just report "supported" for
+#             everything, which is laundering with extra steps.
+#   polarity, quantifier scope, dropped qualifier  NO, and this is the
+#             important refusal. Each works by finding the claim's CLOSEST
+#             evidence sentence and comparing structure against it. Searching
+#             the whole document for a closest sentence would find some
+#             sentence, somewhere, whose polarity happens to agree -- and would
+#             then report the claim as unobjectionable on the strength of a
+#             passage the model never cited and may never have read. That is
+#             the exact failure the wider scope is supposed to expose.
+
+class DocumentScope:
+    """The whole document, as the parts it was chunked into.
+
+    `parts` is [(label, text)] and the labels are what a finding quotes back
+    ("does occur in chunk 12"), so they should name something an operator can
+    navigate to. Indexes are built on first use, not on construction.
+    """
+
+    __slots__ = ("label", "parts", "_numbers", "_entities", "_built")
+
+    def __init__(self, parts, label="the document"):
+        self.parts = [(str(a), b or "") for a, b in parts]
+        self.label = label
+        self._numbers = None
+        self._entities = None
+        self._built = {"numbers": False, "entities": False}
+
+    @property
+    def numbers(self):
+        if self._numbers is None:
+            self._numbers = [(lbl, NumberEvidence(text))
+                             for lbl, text in self.parts]
+            self._built["numbers"] = True
+        return self._numbers
+
+    @property
+    def entities(self):
+        if self._entities is None:
+            self._entities = entity_index.EntityIndex.from_parts(
+                self.parts, rules=ENTITY_RULES)
+            self._built["entities"] = True
+        return self._entities
+
+    def find_number(self, num):
+        """(part_label, evidence_dict, via) for the first part that has it."""
+        if num is None:
+            return None
+        for lbl, ev in self.numbers:
+            e_dict, via, _n = ev.lookup(num)
+            if e_dict is not None:
+                return lbl, e_dict, via
+        return None
+
+    def find_entity(self, term):
+        """An `entity_index.Resolution`, or None if the document never says it."""
+        return self.entities.resolve(term)
+
+    def stats(self):
+        d = {"label": self.label, "parts": len(self.parts),
+             "chars": sum(len(t) for _, t in self.parts),
+             "number_index_built": self._built["numbers"],
+             "entity_index_built": self._built["entities"]}
+        if self._entities is not None:
+            d["entity_index"] = self._entities.stats()
+        if self._numbers is not None:
+            d["distinct_values"] = len(
+                {v for _, ev in self._numbers for v in ev.by_value})
+        return d
+
+
+def document_scope_from_chunks(document, chunk_records, label="the document"):
+    """Build the wider scope from the SAME spans the pipeline chunked into.
+
+    Deliberately per-chunk rather than one blob: "present in another chunk of
+    the same document" is the finding an operator can act on, and it names the
+    section they should have been pointed at.
+    """
+    parts = []
+    for rec in chunk_records or []:
+        idx = rec["index"] if "index" in rec else rec.get("idx")
+        start, end = rec.get("start_char"), rec.get("end_char")
+        if start is None or end is None:
+            continue
+        parts.append((f"chunk {idx}", document[start:end]))
+    if not parts and document:
+        parts = [("the whole document", document)]
+    return DocumentScope(parts, label)
+
+
+def document_scope_from_corpus(blob, label="the document"):
+    """The wider scope for a bench corpus file, from its stored `chunk_text`."""
+    parts = []
+    for c in blob.get("chunks") or []:
+        if not c.get("chunk_text"):
+            continue
+        parts.append((f"chunk {c.get('index')}", c["chunk_text"]))
+    return DocumentScope(parts, label)
+
+
+# ---------------------------------------------------------------------------
+# A THIRD scope -- the rest of the corpus. ANNOTATION ONLY, and permanently so.
+# ---------------------------------------------------------------------------
+#
+# `db.corpus_documents` holds other documents' text, so a cross-document entity
+# index is nearly free to build. It is exposed because knowing that a name the
+# summary asserts turns up in a DIFFERENT document is genuinely useful triage:
+# it tells the reader the model may be bleeding context between documents,
+# which is a real failure mode and a different one from invention.
+#
+# IT MAY NEVER GRANT SUPPORT, and that is not caution, it is the definition of
+# the job. The summary is supposed to represent THIS document. A checker that
+# resolved a name from some other document and called the claim supported would
+# be a fabrication detector laundering across the corpus -- it would pass
+# exactly the failure it exists to catch, and it would do so silently, because
+# the reader would see a green tick and no mention of where the name came from.
+#
+# So this index only ever ADDS a field to a finding that already exists. It
+# cannot create a finding, remove one, or change one's category.
+
+def corpus_annotation_index(db_path, exclude_sha256=None, exclude_ids=(),
+                            limit=None):
+    """An `EntityIndex` over OTHER corpus documents. Annotation only.
+
+    `exclude_sha256` / `exclude_ids` drop the document being audited, so the
+    annotation never says "this name is also in another document" about the
+    document itself.
+    """
+    from . import db  # lazy: keeps this module importable without the app
+    rows = db.list_corpus_documents(db_path, status="ready", with_text=True)
+    idx = entity_index.EntityIndex(rules=ENTITY_RULES)
+    n = 0
+    for r in rows:
+        if r.get("id") in exclude_ids:
+            continue
+        if exclude_sha256 and r.get("text_sha256") == exclude_sha256:
+            continue
+        if not r.get("text"):
+            continue
+        idx.add(r.get("filename") or r.get("id"), r["text"])
+        n += 1
+        if limit and n >= limit:
+            break
+    return idx
+
+
+def _annotate_from_corpus(finding, signal, corpus_index):
+    """Add `also_in_other_documents` to an entity finding. Never changes it."""
+    if corpus_index is None or not corpus_index.scopes:
+        return
+    absent = signal.get("absent_from_document") or []
+    hits = {}
+    for m in absent:
+        res = corpus_index.resolve(m["term"])
+        if res is not None:
+            hits[m["term"]] = list(res.scopes)
+    if hits:
+        finding["also_in_other_documents"] = hits
+        finding["also_in_other_documents_note"] = (
+            "ANNOTATION ONLY. These terms occur in a DIFFERENT corpus "
+            "document. That does not support the claim -- the summary is of "
+            "THIS document -- but a name that is absent here and present next "
+            "door is more likely context bleed than invention, and that is a "
+            "different thing for a reader to check.")
 
 
 # ===========================================================================
@@ -1421,12 +1856,62 @@ class CascadeResult:
         self.scores = scores or []
 
 
+DEC_NUMBER = "hard_fail_number"
+DEC_NUMBER_FABRICATED = "hard_fail_number_fabricated"
+DEC_NUMBER_ELSEWHERE = "hard_fail_number_misattributed"
+DEC_ENTITY = "hard_fail_entity"
+DEC_ENTITY_FABRICATED = "hard_fail_entity_fabricated"
+DEC_ENTITY_ELSEWHERE = "hard_fail_entity_misattributed"
+
+_NUMBER_DECISIONS = (DEC_NUMBER, DEC_NUMBER_FABRICATED, DEC_NUMBER_ELSEWHERE)
+_ENTITY_DECISIONS = (DEC_ENTITY, DEC_ENTITY_FABRICATED, DEC_ENTITY_ELSEWHERE)
+
+_DECISION_CATEGORY = {
+    DEC_NUMBER: CAT_NUMBER,
+    DEC_NUMBER_FABRICATED: CAT_NUMBER_FABRICATED,
+    DEC_NUMBER_ELSEWHERE: CAT_NUMBER_ELSEWHERE,
+    DEC_ENTITY: CAT_ENTITY,
+    DEC_ENTITY_FABRICATED: CAT_ENTITY_FABRICATED,
+    DEC_ENTITY_ELSEWHERE: CAT_ENTITY_ELSEWHERE,
+}
+
+
+def _hard_decision(signal, base, fabricated_dec, elsewhere_dec):
+    """Which of the three hard verdicts a failed signal earns.
+
+    A claim carrying BOTH a fabricated figure and a misattributed one is
+    reported as a fabrication: the worse of the two is the one that decides,
+    because a reader who is told "citation error" will not go looking for an
+    invention.
+    """
+    if "document_scope" not in signal:
+        return base                       # no wider scope was supplied
+    if signal.get("absent_from_document"):
+        return fabricated_dec
+    if signal.get("elsewhere_in_document"):
+        return elsewhere_dec
+    return base
+
+
 def route(claim, evidence, cues=None, escalate_hard=False,
-          entity_mode=None):
+          entity_mode=None, scope=None, evidence_numbers=None,
+          evidence_index=None):
     """Run tiers 1 and 2 and say what should happen next.
 
     Returns (decision, signals) where decision is one of:
-      "hard_fail_number", "hard_fail_entity", "pass", "escalate".
+      "hard_fail_number", "hard_fail_number_fabricated",
+      "hard_fail_number_misattributed", the three "hard_fail_entity*"
+      equivalents, "pass", or "escalate".
+
+    `scope` is an optional `DocumentScope`. With it, a hard failure is split
+    into FABRICATION (absent from the whole document) and CITATION ERROR
+    (present in another chunk). Without it the verdict stays the undivided
+    `hard_fail_number`, because a checker given nothing wider to look in must
+    not claim to know which it was.
+
+    `evidence_numbers` / `evidence_index` are precomputed indexes over
+    `evidence`; the ledger builder caches them per distinct evidence text so
+    that scoring eighteen claims against one chunk indexes that chunk once.
 
     `escalate_hard` also sends hard failures to the classifier. OFF by default:
     a hard failure already names a specific, checkable fact -- "the claim says
@@ -1435,8 +1920,9 @@ def route(claim, evidence, cues=None, escalate_hard=False,
     against the ensemble, not for production.
     """
     mode = entity_mode or ENTITY_MODE
-    numbers = check_numbers(claim, evidence)
-    entities = check_entities(claim, evidence)
+    numbers = check_numbers(claim, evidence, evidence_numbers, scope)
+    entities = check_entities(claim, evidence, evidence_index,
+                              scope if mode != "off" else None)
     entities["mode"] = mode
     if entities["status"] == "fail" and mode != "hard":
         # Downgrade in the OUTPUT too, not just in the branch below, so that a
@@ -1449,9 +1935,15 @@ def route(claim, evidence, cues=None, escalate_hard=False,
     signals = [numbers, entities] + soft
 
     if numbers["status"] == "fail":
-        return ("escalate" if escalate_hard else "hard_fail_number"), signals
+        if escalate_hard:
+            return "escalate", signals
+        return _hard_decision(numbers, DEC_NUMBER, DEC_NUMBER_FABRICATED,
+                              DEC_NUMBER_ELSEWHERE), signals
     if entities["status"] == "fail":
-        return ("escalate" if escalate_hard else "hard_fail_entity"), signals
+        if escalate_hard:
+            return "escalate", signals
+        return _hard_decision(entities, DEC_ENTITY, DEC_ENTITY_FABRICATED,
+                              DEC_ENTITY_ELSEWHERE), signals
 
     if numbers["status"] == "warn":
         return "escalate", signals          # unresolved derived count
@@ -1470,6 +1962,30 @@ def _unit_id(unit, category):
         "h1" if unit["hop"] == HOP_CHUNK else "h2",
         claim["chunk_index"] if claim["chunk_index"] is not None else "final",
         claim["sentence_index"], claim.get("clause_index", 0), category)
+
+
+def _scope_extra(signal, scope):
+    """The scope verdict, hoisted to the top of the finding.
+
+    A consumer must not have to walk into `signals[0]` to find out whether the
+    tool is reporting an invention or a wrong section number.
+    """
+    if scope is None or "document_scope" not in signal:
+        return {"scope_checked": "cited span only",
+                "scope_note": ("No document scope was supplied, so this "
+                               "finding does not distinguish a fabrication "
+                               "from a citation error.")}
+    absent = signal.get("absent_from_document") or []
+    elsewhere = signal.get("elsewhere_in_document") or []
+    return {
+        "scope_checked": f"cited span, then {signal['document_scope']}",
+        "absent_from_document": [a["claim"]["text"] if "claim" in a
+                                 else a.get("term") for a in absent],
+        "found_elsewhere_in": sorted({
+            e["found_in"] if "found_in" in e
+            else ", ".join(e.get("found_elsewhere_in") or [])
+            for e in elsewhere}),
+    }
 
 
 def _finding(unit, category, tier, detail, signals, scores=None, extra=None):
@@ -1493,7 +2009,7 @@ def _finding(unit, category, tier, detail, signals, scores=None, extra=None):
 def build_cascade_ledger(units, classifier=None, cues=None,
                          escalate_hard=False, include_passing=False,
                          job_id=None, progress=None, notes=None,
-                         source=None):
+                         source=None, scope=None, corpus_index=None):
     """Run the cascade over prepared claim units and return a ledger.
 
     `units` is the shape `audit._claim_units` produces, or `citation_units`
@@ -1516,9 +2032,23 @@ def build_cascade_ledger(units, classifier=None, cues=None,
     t0 = time.time()
     findings, passing = [], []
     escalated = []          # indices routed to tier 3
-    counts = {"pass": 0, "hard_fail_number": 0, "hard_fail_entity": 0,
-              "escalate": 0, "unscoreable": 0}
+    counts = {"pass": 0, "escalate": 0, "unscoreable": 0}
+    for d in _NUMBER_DECISIONS + _ENTITY_DECISIONS:
+        counts[d] = 0
     routed = []
+
+    # One index per DISTINCT evidence text, not one per claim. Hop 1 scores
+    # ~18 claims against the same chunk; indexing that chunk eighteen times
+    # would be eighteen times the work for one answer, and it is what made the
+    # entity index look unaffordable on paper.
+    ev_cache = {}
+
+    def indexes_for(text):
+        got = ev_cache.get(text)
+        if got is None:
+            got = (NumberEvidence(text), span_entity_index(text))
+            ev_cache[text] = got
+        return got
 
     for u_i, unit in enumerate(units):
         if unit.get("unscoreable"):
@@ -1529,8 +2059,11 @@ def build_cascade_ledger(units, classifier=None, cues=None,
                 [], extra={"refused_by": "cascade"}))
             routed.append(None)
             continue
+        ev_nums, ev_idx = indexes_for(unit["evidence_text"])
         decision, signals = route(unit["claim_text"], unit["evidence_text"],
-                                  cues, escalate_hard)
+                                  cues, escalate_hard, scope=scope,
+                                  evidence_numbers=ev_nums,
+                                  evidence_index=ev_idx)
         counts[decision] += 1
         routed.append((decision, signals))
         if decision == "escalate":
@@ -1570,15 +2103,18 @@ def build_cascade_ledger(units, classifier=None, cues=None,
             continue
         decision, signals = r
 
-        if decision == "hard_fail_number":
+        if decision in _NUMBER_DECISIONS:
             findings.append(_finding(
-                unit, CAT_NUMBER, TIER_HARD,
-                signals[0]["detail"], signals))
+                unit, _DECISION_CATEGORY[decision], TIER_HARD,
+                signals[0]["detail"], signals,
+                extra=_scope_extra(signals[0], scope)))
             continue
-        if decision == "hard_fail_entity":
-            findings.append(_finding(
-                unit, CAT_ENTITY, TIER_HARD,
-                signals[1]["detail"], signals))
+        if decision in _ENTITY_DECISIONS:
+            f = _finding(unit, _DECISION_CATEGORY[decision], TIER_HARD,
+                         signals[1]["detail"], signals,
+                         extra=_scope_extra(signals[1], scope))
+            _annotate_from_corpus(f, signals[1], corpus_index)
+            findings.append(f)
             continue
         if decision == "pass":
             if include_passing:
@@ -1599,12 +2135,18 @@ def build_cascade_ledger(units, classifier=None, cues=None,
             continue
 
         if not classifier:
-            findings.append(_finding(
+            f = _finding(
                 unit, CAT_NEEDS_CLASSIFIER, TIER_SOFT,
                 "The cheap tier could not resolve this sentence and no "
                 "classifier is configured, so IT HAS NOT BEEN CHECKED for "
                 "support -- only for the deterministic signals listed. "
-                + _why_escalated(signals), signals))
+                + _why_escalated(signals), signals,
+                extra=_scope_extra(signals[1], scope) if scope else None)
+            # In ENTITY_MODE="route" an absent name escalates rather than
+            # failing, so this is where the entity scope verdict lands most of
+            # the time. The annotation belongs here too or it is invisible.
+            _annotate_from_corpus(f, signals[1], corpus_index)
+            findings.append(f)
             continue
 
         pos = pos_of[u_i]
@@ -1656,6 +2198,8 @@ def build_cascade_ledger(units, classifier=None, cues=None,
     n = len(units)
     n_checkable = n - counts["unscoreable"]
     esc_rate = (len(escalated) / n_checkable) if n_checkable else None
+    n_number_fails = sum(counts[d] for d in _NUMBER_DECISIONS)
+    n_entity_fails = sum(counts[d] for d in _ENTITY_DECISIONS)
 
     return {
         "schema_version": CASCADE_SCHEMA_VERSION,
@@ -1680,6 +2224,11 @@ def build_cascade_ledger(units, classifier=None, cues=None,
             "pass_trigram": PASS_TRIGRAM,
             "entity_fuzz": ENTITY_FUZZ,
             "entity_mode": ENTITY_MODE,
+            "entity_matcher": "entity_index",
+            "entity_rules": list(ENTITY_RULES),
+            "entity_whole_fuzz": entity_index.WHOLE_FUZZ,
+            "entity_rules_rejected": sorted(entity_index.REJECTED_RULES),
+            "two_scope_checking": scope is not None,
             "decompose_clauses": DECOMPOSE,
             "derived_count_max": DERIVED_COUNT_MAX,
             "support_threshold": SUPPORT_THRESHOLD,
@@ -1691,11 +2240,20 @@ def build_cascade_ledger(units, classifier=None, cues=None,
         "cascade": {
             "claims": n,
             "claims_checkable": n_checkable,
-            "resolved_by_hard_tier": counts["pass"] + counts["hard_fail_number"]
-            + counts["hard_fail_entity"],
+            "resolved_by_hard_tier": counts["pass"] + n_number_fails
+            + n_entity_fails,
             "passed_cheaply": counts["pass"],
-            "hard_fail_number": counts["hard_fail_number"],
-            "hard_fail_entity": counts["hard_fail_entity"],
+            # Total, so an existing consumer keeps reading what it read before;
+            # the split is reported alongside rather than instead.
+            "hard_fail_number": n_number_fails,
+            "hard_fail_entity": n_entity_fails,
+            "hard_fail_number_fabricated": counts[DEC_NUMBER_FABRICATED],
+            "hard_fail_number_misattributed": counts[DEC_NUMBER_ELSEWHERE],
+            "hard_fail_number_scope_unknown": counts[DEC_NUMBER],
+            "hard_fail_entity_fabricated": counts[DEC_ENTITY_FABRICATED],
+            "hard_fail_entity_misattributed": counts[DEC_ENTITY_ELSEWHERE],
+            "hard_fail_entity_scope_unknown": counts[DEC_ENTITY],
+            "document_scope": scope.stats() if scope is not None else None,
             "escalated": len(escalated),
             "escalation_rate": round(esc_rate, 4) if esc_rate is not None else None,
             "unscoreable": counts["unscoreable"],
@@ -1746,6 +2304,18 @@ def _why_escalated(signals):
                 bits.append(f"low trigram similarity ({s['value']})")
             elif s["name"] == "polarity":
                 bits.append("a negation-cue difference")
+            elif s["name"] == "entities":
+                if s.get("absent_from_document"):
+                    bits.append(
+                        "a distinctive term absent from the whole document ("
+                        + ", ".join(repr(m["term"])
+                                    for m in s["absent_from_document"]) + ")")
+                elif s.get("elsewhere_in_document"):
+                    bits.append(
+                        "a distinctive term that occurs elsewhere in the "
+                        "document but not in the cited span")
+                else:
+                    bits.append("a distinctive term absent from the cited span")
         if s["name"] == "numbers" and s.get("unit_disagreements"):
             bits.append("a number matched but its unit did not")
     return "Escalated because: " + (", ".join(bits) if bits else "unspecified") + "."
@@ -1975,6 +2545,18 @@ def load_corpus(path):
     return units, meta
 
 
+def load_corpus_scope(path, label="the document"):
+    """The WIDER scope for a corpus file: every chunk's stored `chunk_text`.
+
+    The union of the chunk texts IS the document (the chunker's spans are
+    contiguous and overlapping), so "absent from every chunk" and "absent from
+    the document" are the same statement here.
+    """
+    with open(path, encoding="utf-8") as fh:
+        blob = json.load(fh)
+    return document_scope_from_corpus(blob, label=label)
+
+
 # ===========================================================================
 # CLI
 # ===========================================================================
@@ -2004,6 +2586,25 @@ def main(argv=None):
     common.add_argument("--escalate-hard", action="store_true",
                         help="Also send hard failures to the classifier. For "
                              "validating the cascade, not for production.")
+    common.add_argument("--entity-rules", choices=["measured", "strict"],
+                        default="measured",
+                        help="'strict' drops fuzzy entity matching entirely. "
+                             "MEASURED on the OCR-damaged bench corpus: false "
+                             "positives 8.5%% -> 17.3%%, but a 1-character "
+                             "corruption of a real name is caught 100%% of the "
+                             "time instead of 14.6%%. On source that is NOT "
+                             "OCR output, 'strict' is very likely the right "
+                             "setting -- untested there.")
+    common.add_argument("--corpus-db",
+                        help="Annotate findings with names that occur in OTHER "
+                             "corpus documents. ANNOTATION ONLY: it never "
+                             "supports a claim and never changes a category.")
+    common.add_argument("--no-document-scope", action="store_true",
+                        help="Do NOT run the second pass over the rest of the "
+                             "document. Hard failures then stay the undivided "
+                             "'number_unsupported' -- i.e. the tool stops "
+                             "distinguishing a fabrication from a citation "
+                             "error. For measuring what the second pass costs.")
 
     j = sub.add_parser("job", parents=[common],
                        help="Cascade one job from the jobs database (read-only).")
@@ -2017,12 +2618,27 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
     classifier = _build_classifier(args.classifier, args.cache_dir)
-    notes, source, job_id = [], None, None
+    notes, source, job_id, scope = [], None, None, None
+    if args.entity_rules == "strict":
+        global ENTITY_RULES
+        ENTITY_RULES = entity_index.STRICT_RULES
+        notes.append(
+            "Entity matching is STRICT: no fuzzy resolution. Measured on the "
+            "OCR-damaged bench corpus this roughly doubles the false-positive "
+            "rate and takes 1-character-corruption catch from 14.6% to 100%.")
+    corpus_index = None
+    if args.corpus_db:
+        corpus_index = corpus_annotation_index(args.corpus_db)
+        notes.append(
+            f"Corpus annotation index over {len(corpus_index.scopes)} other "
+            "documents. It annotates findings and never supports a claim.")
 
     if args.cmd == "corpus":
         units, meta = load_corpus(args.path)
         source = dict(meta, path=os.path.abspath(args.path))
         job_id = meta.get("job_id")
+        if not args.no_document_scope:
+            scope = load_corpus_scope(args.path)
         notes.append(
             "Evidence is the corpus file's `chunk_text`, which the producer "
             "asserts equals the whitespace-normalised source span at write "
@@ -2031,6 +2647,8 @@ def main(argv=None):
         document, records, final = audit.load_job(args.db, args.job_id)
         job_id = args.job_id
         source = {"db": os.path.abspath(args.db), "mode": args.mode}
+        if not args.no_document_scope:
+            scope = document_scope_from_chunks(document, records)
         if args.mode == "citations":
             units, parsed = citation_units(document, records, final)
             notes.append(
@@ -2040,10 +2658,18 @@ def main(argv=None):
         else:
             units = hop_units(document, records, final)
 
+    if scope is not None:
+        notes.append(
+            "Two-scope checking is ON. A figure or name absent from its cited "
+            "span is re-checked against every chunk of the SAME document, and "
+            "only that document: a name resolved from a DIFFERENT document "
+            "would be a fabrication detector laundering across the corpus.")
+
     ledger = build_cascade_ledger(
         units, classifier=classifier, escalate_hard=args.escalate_hard,
         include_passing=args.include_passing, job_id=job_id,
-        progress=lambda m: print(m, file=sys.stderr), notes=notes, source=source)
+        progress=lambda m: print(m, file=sys.stderr), notes=notes,
+        source=source, scope=scope, corpus_index=corpus_index)
 
     text = json.dumps(ledger, indent=2, ensure_ascii=False)
     if args.out:
