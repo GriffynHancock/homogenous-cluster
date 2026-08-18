@@ -31,3 +31,15 @@ llama.log
 # and this repository is published. The measurements derived from these runs
 # belong in docs/measurements.md; the raw content must never leave the box.
 bench/out/
+
+# The job store, and with it the BENCHMARK CORPUS (corpus_documents holds the
+# operator's real legislative / religious / standards source text). In
+# deployment it lives at /opt/missing-link/jobs.sqlite -- outside this
+# repository entirely, which is the actual protection. This rule is the guard
+# against the other case: a dev or test run with MISSING_LINK_DB pointing
+# inside the checkout, which would otherwise drop megabytes of real source
+# material into `git status` for someone to stage by accident. Same reasoning
+# as bench/out/ above, and this repository is published.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

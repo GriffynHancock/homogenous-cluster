@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from missing_link import db, extract, worker
+from missing_link import corpus, db, extract, worker
 
 DB_PATH = os.environ.get("MISSING_LINK_DB", "/opt/missing-link/jobs.sqlite")
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8080")
@@ -270,6 +270,137 @@ async def batch_confirm(request: Request, batch_id: str):
         raise HTTPException(400, "no workflow was ticked for any accepted document")
 
     return RedirectResponse("/", status_code=303)
+
+
+# --- Benchmark corpus ---------------------------------------------------------
+# Source documents held as INPUTS TO MEASUREMENT, never as work. Nothing on
+# these routes creates a job, and nothing on them touches an inference
+# endpoint: every figure shown is string analysis (missing_link/corpus.py).
+# See the comment above CORPUS_TABLE_SCHEMA in db.py for the measurement this
+# unblocks.
+
+@app.get("/corpus", response_class=HTMLResponse)
+def corpus_view(request: Request, genre: str | None = None):
+    """The corpus, with the numbers that decide what each document can answer.
+
+    `genre` filters, and is the same key `db.list_corpus_documents(genre=...)`
+    takes, so what the operator sees on this page and what a benchmark sweep
+    selects are the same partition of the same table.
+
+    status=None: refusals are listed too. A refused upload that vanished
+    silently would leave the operator believing a document is in the corpus
+    when it is not -- which is the failure shape this project keeps hitting
+    from the other direction (F38: a result that looks fine and is worthless).
+    """
+    rows = db.list_corpus_documents(DB_PATH, genre=genre, status=None)
+    for r in rows:
+        r["notes"] = corpus.usability_notes(r)
+    genres = db.corpus_genres(DB_PATH)
+    return TEMPLATES.TemplateResponse(
+        request, "corpus.html",
+        {"docs": rows, "genres": genres, "genre": genre, "active": "corpus",
+         "suggestions": sorted(set(genres) | set(corpus.GENRE_SUGGESTIONS)),
+         "chunk_tokens": worker.CHUNK_TOKENS,
+         "min_chunks": corpus.MIN_CHUNKS_FOR_BOUNDARY,
+         "accept": extract.ACCEPT_ATTR})
+
+
+@app.post("/corpus")
+async def corpus_upload(files: list[UploadFile] = File(...),
+                        genre: str = Form(""),
+                        note: str = Form("")):
+    """Add documents to the corpus. Multi-file, one genre per submission.
+
+    Each file is extracted with the SAME extract.extract() a job upload uses --
+    magic-byte sniffing, refuse rather than degrade (F38). A refusal is stored
+    as its own row with the reason, so it is visible and deletable and, above
+    all, DOES NOT BLOCK THE REST OF THE BATCH: uploading twelve legislative
+    texts of which one is a scanned PDF must leave eleven in the corpus.
+
+    Deliberately creates NO jobs and makes NO inference call. Profiling is
+    string analysis; the whole point of a corpus is that holding a document
+    costs nothing until a measurement chooses to use it.
+    """
+    named = [f for f in files if f.filename]
+    if not named:
+        raise HTTPException(400, "no files supplied")
+
+    g = corpus.normalise_genre(genre)
+    note = (note or "").strip() or None
+    for f in named:
+        raw = await f.read()
+        digest = corpus.sha256_hex(raw)
+        record = {"filename": f.filename, "genre": g, "note": note,
+                  "sha256": digest, "n_bytes": len(raw), "text": ""}
+
+        existing = db.find_corpus_by_sha256(DB_PATH, digest)
+        if existing:
+            # Not an error, but not silently ignored either: a duplicate that
+            # quietly succeeded would be double-counted by every sweep that
+            # enumerates the corpus.
+            record.update(status="refused", error=(
+                f"identical bytes are already held as {existing['id']} "
+                f"({existing['filename']}, genre '{existing['genre']}', added "
+                f"{existing['created_at'][:19].replace('T', ' ')}). Not stored twice."))
+            db.add_corpus_document(DB_PATH, record)
+            continue
+
+        try:
+            text = extract.extract(raw, f.filename).strip()
+            if not text:
+                raise extract.ExtractionError("no text after extraction")
+        except extract.ExtractionError as exc:
+            record.update(status="refused", error=str(exc))
+            db.add_corpus_document(DB_PATH, record)
+            continue
+
+        record.update(status="ready", text=text,
+                      text_sha256=corpus.sha256_hex(text),
+                      **corpus.profile(text))
+        db.add_corpus_document(DB_PATH, record)
+
+    return RedirectResponse("/corpus", status_code=303)
+
+
+@app.post("/corpus/{doc_id}/delete")
+def corpus_delete(doc_id: str):
+    """Remove one corpus document. 404 on a stale link rather than pretending."""
+    if not db.delete_corpus_document(DB_PATH, doc_id):
+        raise HTTPException(404, "no such corpus document")
+    return RedirectResponse("/corpus", status_code=303)
+
+
+@app.get("/corpus/{doc_id}/text", response_class=PlainTextResponse)
+def corpus_text(doc_id: str):
+    """The extracted text, as text/plain -- the curl-and-pipe half of the
+    accessor pair, next to /api/corpus/{id}'s JSON. In-process code should call
+    db.get_corpus_document() directly rather than going over HTTP."""
+    doc = db.get_corpus_document(DB_PATH, doc_id)
+    if doc is None:
+        raise HTTPException(404, "no such corpus document")
+    if doc["status"] != "ready":
+        raise HTTPException(409, f"corpus document is {doc['status']}: {doc['error']}")
+    return doc["text"]
+
+
+@app.get("/api/corpus")
+def api_corpus_list(genre: str | None = None, status: str | None = "ready"):
+    """Enumerate the corpus as JSON, metadata only (documents are megabytes).
+
+    `status` defaults to 'ready' so a harness that just iterates this can never
+    pick up a refused row with no text; pass status= (empty) for everything,
+    which is what the HTML page shows.
+    """
+    return db.list_corpus_documents(DB_PATH, genre=genre, status=status or None)
+
+
+@app.get("/api/corpus/{doc_id}")
+def api_corpus_get(doc_id: str):
+    """One corpus document, INCLUDING its text."""
+    doc = db.get_corpus_document(DB_PATH, doc_id)
+    if doc is None:
+        raise HTTPException(404, "no such corpus document")
+    return doc
 
 
 @app.get("/api/jobs")

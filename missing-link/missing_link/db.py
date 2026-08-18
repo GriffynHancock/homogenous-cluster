@@ -193,9 +193,9 @@ def init_db(path):
     """Create or upgrade the ENTIRE schema. Call once, at process startup.
 
     This is the single migration entry point: jobs, chunk_summaries,
-    batch_documents and job_failures all get created and upgraded here, so
-    that after one call every table this module touches is present and
-    current.
+    batch_documents, job_failures and corpus_documents all get created and
+    upgraded here, so that after one call every table this module touches is
+    present and current.
 
     That is deliberate, and it is a change from how this worked. The chunk and
     batch tables used to be initialised LAZILY, from inside each read and write
@@ -233,6 +233,7 @@ def init_db(path):
     init_chunks(path)
     init_batch_documents(path)
     init_job_failures(path)
+    init_corpus_documents(path)
 
 
 def create_job(path, kind, document, instruction=None):
@@ -1127,3 +1128,223 @@ def get_batch(path, batch_id):
     finally:
         conn.close()
     return [dict(r) for r in rows]
+
+
+# --- Benchmark corpus ---------------------------------------------------------
+# A CORPUS, NOT A QUEUE. Rows here are INPUTS TO MEASUREMENT -- legislative
+# text, religious/narrative text, standards documents -- held so that
+# `chunk_boundary_audit.py`, `bench/chunk_size_driver.py` and anything else that
+# needs a real document can name one deliberately, instead of reaching into
+# `jobs` for whatever happened to be submitted last. Nothing in this table ever
+# becomes a job, and nothing here costs cluster time: every stored figure is
+# string analysis (see missing_link/corpus.py).
+#
+# WHY IT EXISTS, concretely. docs/chunk-boundary-measurement.md returned 0 of 84
+# events and could not answer its own question, because the only legal-styled
+# document in the store is 2,202 characters -- too short to produce a single
+# chunk boundary at any size -- while the two documents long enough to produce
+# boundaries are narrative prose with 50-500x lower clause-marker density. That
+# measurement was blocked on CORPUS COMPOSITION, not on method. So composition
+# is what this table records and displays: chunk count at the current
+# CHUNK_TOKENS, clause-marker density, numeric density -- the three numbers that
+# decide whether a given document can answer a given question at all.
+#
+# Separate from `jobs` and from `batch_documents` for the same reason those two
+# are separate from each other: a corpus document has no workflow, no status
+# transitions and no result, and putting it in `jobs` is exactly how
+# measurements ended up running against arbitrary submitted work.
+
+CORPUS_TABLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS corpus_documents (
+    id            TEXT PRIMARY KEY,
+    filename      TEXT NOT NULL,
+    genre         TEXT NOT NULL,   -- free text, NOT an enum -- see corpus.normalise_genre
+    status        TEXT NOT NULL,   -- 'ready' (extracted and profiled) or
+                                   -- 'refused' (see error; never usable as input)
+    error         TEXT,
+    text          TEXT NOT NULL,   -- extracted text, '' for a refused row
+    note          TEXT,            -- operator's own note (provenance, licence, source)
+    sha256        TEXT NOT NULL,   -- of the RAW UPLOADED BYTES
+    text_sha256   TEXT,            -- of the EXTRACTED TEXT -- see add_corpus_document
+    n_bytes       INTEGER,
+    n_chars       INTEGER,
+    n_words       INTEGER,
+    n_chunks      INTEGER,         -- at chunk_tokens, from the real worker.chunk_spans
+    chunk_tokens  INTEGER,         -- stored so n_chunks stays interpretable if the
+                                   -- default ever moves
+    n_sentences        INTEGER,
+    n_marker_sentences INTEGER,
+    marker_rate        REAL,
+    n_numbers          INTEGER,
+    numbers_per_1k_words REAL,
+    created_at    TEXT NOT NULL
+);
+"""
+CORPUS_INDEX_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_corpus_documents_genre
+    ON corpus_documents (genre, created_at);
+-- Deliberately NOT UNIQUE: the duplicate check lives in the upload route so the
+-- operator gets a message naming the row that already holds those bytes, rather
+-- than an IntegrityError; and a corpus that somehow held one document twice is
+-- better VISIBLE (two rows, identical hashes) than an upload that fails.
+CREATE INDEX IF NOT EXISTS idx_corpus_documents_sha
+    ON corpus_documents (sha256);
+"""
+# None yet. Present, and wired into init_corpus_documents below, so the FIRST
+# column added to this table does not have to reintroduce the migration
+# plumbing -- and, more to the point, cannot arrive via a LAZY per-operation
+# init_*() call, which is the race that marked real jobs failed. See init_db.
+_CORPUS_NEW_COLUMNS = []
+
+
+def init_corpus_documents(path):
+    """Create/upgrade corpus_documents. Called from init_db at startup ONLY.
+
+    Same three-step shape as init_db itself -- tables, then missing columns,
+    then indexes -- rather than one executescript, so that an index naming a
+    column added later cannot fail against an already-deployed database. See
+    the comment above TABLE_SCHEMA for the incident that established that rule.
+    """
+    conn = _connect(path)
+    try:
+        conn.executescript(CORPUS_TABLE_SCHEMA)
+        _add_missing_columns(conn, "corpus_documents", _CORPUS_NEW_COLUMNS)
+        conn.executescript(CORPUS_INDEX_SCHEMA)
+    finally:
+        conn.close()
+
+
+def find_corpus_by_sha256(path, sha256):
+    """The existing corpus row holding these exact raw bytes, or None.
+
+    Used to REFUSE a re-upload with a message naming the row that already has
+    it, rather than accumulating duplicates that any sweep enumerating the
+    corpus would then silently double-count.
+    """
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT id, filename, genre, created_at FROM corpus_documents "
+            "WHERE sha256=? ORDER BY created_at LIMIT 1", (sha256,)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+_CORPUS_FIELDS = (
+    "filename", "genre", "status", "error", "text", "note", "sha256",
+    "text_sha256", "n_bytes", "n_chars", "n_words", "n_chunks", "chunk_tokens",
+    "n_sentences", "n_marker_sentences", "marker_rate", "n_numbers",
+    "numbers_per_1k_words",
+)
+
+
+def add_corpus_document(path, record):
+    """Store one corpus document (or one refusal). Returns the new id.
+
+    `record` carries filename/genre/status/error/text/note/sha256 plus whatever
+    figures corpus.profile() produced -- all optional, stored as NULL when
+    absent, because a REFUSED row has no text to profile and a fabricated 0
+    would be indistinguishable from a genuine measurement of zero (this
+    project's standing rule; see the ttft_s note in _CHUNK_NEW_COLUMNS).
+
+    Two hashes, deliberately. `sha256` is of the RAW UPLOADED BYTES -- the
+    answer to "is this still the same document the measurement ran against".
+    `text_sha256` is of the EXTRACTED TEXT, which is what analysis actually
+    consumes: a pypdf upgrade can change the extracted text without changing a
+    byte of the PDF, and a measurement re-run after that is not comparable with
+    the one before it even though the file is untouched.
+    """
+    doc_id = uuid.uuid4().hex[:12]
+    values = [record.get(f) for f in _CORPUS_FIELDS]
+    placeholders = ",".join("?" * (len(_CORPUS_FIELDS) + 2))
+    conn = _connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO corpus_documents (id, " + ", ".join(_CORPUS_FIELDS) +
+            f", created_at) VALUES ({placeholders})",
+            [doc_id] + values + [_now()])
+    finally:
+        conn.close()
+    return doc_id
+
+
+def list_corpus_documents(path, genre=None, status="ready", with_text=False):
+    """The corpus, newest first. THE accessor for benchmark and analysis code.
+
+    `genre=None` means every genre; pass e.g. "legislative" to sweep just one.
+    `status="ready"` is the default because a refused row has no text and must
+    never reach a measurement; pass status=None to list everything including
+    refusals (what the corpus PAGE does, so the operator can see and delete
+    them).
+
+    `with_text=False` by default: documents run to megabytes and neither the
+    page nor a "which of these could answer this question" pass needs the
+    bytes. A harness that wants the text calls get_corpus_document(), or this
+    with with_text=True.
+    """
+    cols = "*" if with_text else \
+        ", ".join(["id"] + [f for f in _CORPUS_FIELDS if f != "text"] + ["created_at"])
+    sql = f"SELECT {cols} FROM corpus_documents"
+    where, params = [], []
+    if genre is not None:
+        where.append("genre=?")
+        params.append(genre)
+    if status is not None:
+        where.append("status=?")
+        params.append(status)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC, rowid DESC"
+    conn = _connect(path)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_corpus_document(path, doc_id):
+    """One corpus document INCLUDING its text, or None. The other half of the
+    benchmark-facing accessor pair -- list to choose, get to fetch."""
+    conn = _connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM corpus_documents WHERE id=?", (doc_id,)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def corpus_genres(path):
+    """Distinct genres currently held, alphabetically.
+
+    Feeds the upload form's <datalist>, which is why `genre` is free text
+    rather than a CHECK constraint: the operator named legislative / religious
+    / standards, and the next useful category (case law, clinical guidelines,
+    committee minutes) is not knowable now. Suggest what exists; accept
+    anything.
+    """
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT genre FROM corpus_documents ORDER BY genre").fetchall()
+    finally:
+        conn.close()
+    return [r["genre"] for r in rows]
+
+
+def delete_corpus_document(path, doc_id):
+    """Remove one corpus document. True if a row was actually deleted.
+
+    Returns whether it hit anything rather than None, so the route can 404 a
+    stale link instead of redirecting as though it had worked -- same posture
+    as request_cancel/revive_job. Nothing references these rows (they never
+    become jobs), so there is no cascade to consider.
+    """
+    conn = _connect(path)
+    try:
+        cur = conn.execute("DELETE FROM corpus_documents WHERE id=?", (doc_id,))
+        return cur.rowcount > 0
+    finally:
+        conn.close()

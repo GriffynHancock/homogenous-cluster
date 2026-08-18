@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}Benchmark corpus{% endblock %}
+{% block sub %}Source documents held for measurement —
+  {{ docs | selectattr("status", "equalto", "ready") | list | length }} held,
+  {{ docs | selectattr("status", "equalto", "refused") | list | length }} refused.
+  These are <strong>inputs to benchmarks, not work</strong>: nothing here is queued,
+  and nothing here costs cluster time.{% endblock %}
+{% block body %}
+
+<fieldset>
+  <legend>Add documents</legend>
+  <form method="post" action="/corpus" enctype="multipart/form-data">
+    <label for="files">Files (select several at once)</label>
+    <input type="file" name="files" id="files" multiple required accept="{{ accept }}">
+
+    <label for="genre">Genre</label>
+    <input type="text" name="genre" id="genre" list="genre-options"
+           placeholder="legislative / religious / standards / …" style="width:100%;
+           padding:.5rem;font:inherit;background:var(--bg);color:var(--fg);
+           border:1px solid var(--line);border-radius:6px">
+    <datalist id="genre-options">
+      {% for g in suggestions %}<option value="{{ g }}">{% endfor %}
+    </datalist>
+    <p class="hint">Free text, not a fixed list — anything you type becomes a
+      group a benchmark can sweep (<code>/api/corpus?genre=…</code>). It is
+      lowercased and stripped of punctuation so the grouping key stays stable.
+      Blank becomes <code>unclassified</code>. One genre per upload; upload
+      each genre separately.</p>
+
+    <label for="note">Note (optional)</label>
+    <input type="text" name="note" id="note"
+           placeholder="where it came from, licence, which Act/standard…"
+           style="width:100%;padding:.5rem;font:inherit;background:var(--bg);
+           color:var(--fg);border:1px solid var(--line);border-radius:6px">
+
+    <p class="hint">Same formats as everywhere else: PDF with a text layer, or
+      plain text (.txt/.md/.csv). A file that cannot be read is listed below
+      with the reason and <strong>does not block the rest of the batch</strong>.
+      Uploading identical bytes twice is refused, naming the row that already
+      holds them.</p>
+    <button type="submit">Add to corpus</button>
+  </form>
+</fieldset>
+
+<p class="hint">
+  {% if genre %}Showing genre <code>{{ genre }}</code> — <a href="/corpus">show all</a>.
+  {% elif genres %}Genres held:
+    {% for g in genres %}<a href="/corpus?genre={{ g }}"><code>{{ g }}</code></a>{{ ", " if not loop.last }}{% endfor %}.
+  {% endif %}
+  Machine-readable: <a href="/api/corpus">/api/corpus</a>{% if genre %} ·
+  <a href="/api/corpus?genre={{ genre }}">/api/corpus?genre={{ genre }}</a>{% endif %}.
+</p>
+
+<p class="hint"><strong>What the columns are for.</strong>
+  <em>Chunks</em> is what <code>worker.chunk_spans</code> actually produces at the
+  current {{ chunk_tokens }}-token default — a document yielding fewer than
+  {{ min_chunks }} chunks has no internal boundary and cannot exercise
+  chunk-boundary behaviour at all.
+  <em>Clause markers</em> is the fraction of sentences carrying
+  <code>unless / except / provided that / or until / whichever later / subject to /
+  other than / apart from</code> — the single number that says whether a document
+  can speak to the severed-clause question (measured: 15.4% on legal-styled text
+  vs 0.03% on narrative prose).
+  <em>Numbers/1k</em> is checkable figures per 1000 words; a document with none
+  cannot exercise the faithfulness cascade's hard number tier.</p>
+
+<div class="tbl-wrap">
+<table>
+  <thead><tr>
+    <th>Document</th><th>Genre</th><th>Chars</th><th>Words</th>
+    <th>Chunks<br><span style="font-weight:400;text-transform:none">@{{ chunk_tokens }}</span></th>
+    <th>Clause markers</th><th>Numbers/1k</th><th>SHA-256</th><th>Added</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for d in docs %}
+    {% if d.status == "ready" %}
+    <tr>
+      <td><a href="/corpus/{{ d.id }}/text">{{ d.filename }}</a><br>
+        <code style="font-size:.7rem;color:var(--mut)">{{ d.id }}</code>
+        {%- if d.note %}<br><span class="preview">{{ d.note }}</span>{% endif %}</td>
+      <td>{{ d.genre }}</td>
+      <td>{{ "{:,}".format(d.n_chars) }}</td>
+      <td>{{ "{:,}".format(d.n_words) }}</td>
+      <td>{{ d.n_chunks }}</td>
+      <td>{{ "%.2f"|format(d.marker_rate * 100) }}%<br>
+        <span style="font-size:.7rem;color:var(--mut)">{{ d.n_marker_sentences }} / {{ d.n_sentences }} sentences</span></td>
+      <td>{{ "%.1f"|format(d.numbers_per_1k_words) }}<br>
+        <span style="font-size:.7rem;color:var(--mut)">{{ d.n_numbers }} total</span></td>
+      <td><code style="font-size:.7rem">{{ d.sha256[:16] }}…</code><br>
+        <span style="font-size:.7rem;color:var(--mut)">bytes; text {{ d.text_sha256[:8] }}…</span></td>
+      <td>{{ d.created_at[:19].replace("T"," ") }}</td>
+      <td>
+        <form method="post" action="/corpus/{{ d.id }}/delete" class="inline-form">
+          <button type="submit" class="btn-sm">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% if d.notes %}
+    <tr><td colspan="10" style="border-bottom:1px solid var(--line);padding-top:0">
+      {% for n in d.notes %}<div class="reason" style="color:#b8860b;font-size:.78rem">⚠ {{ n }}</div>{% endfor %}
+    </td></tr>
+    {% endif %}
+    {% else %}
+    <tr class="refused-row">
+      <td>{{ d.filename }}<br><code style="font-size:.7rem;color:var(--mut)">{{ d.id }}</code></td>
+      <td>{{ d.genre }}</td>
+      <td colspan="6"><span class="badge failed">refused</span>
+        <span class="reason">{{ d.error }}</span></td>
+      <td>{{ d.created_at[:19].replace("T"," ") }}</td>
+      <td>
+        <form method="post" action="/corpus/{{ d.id }}/delete" class="inline-form">
+          <button type="submit" class="btn-sm">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endif %}
+  {% else %}
+    <tr><td colspan="10" class="hint">Nothing held yet. Add legislative,
+      religious and standards texts above — genre diversity is the point:
+      clause structure, sentence length and formatting differ enough between
+      them that the pipeline's behaviour on one says little about the others.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}
