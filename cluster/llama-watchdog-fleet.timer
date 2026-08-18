@@ -1,0 +1,11 @@
+[Unit]
+Description=Sweep the fleet for wedged llama-servers every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=llama-watchdog-fleet.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,35 @@
+[Unit]
+Description=Liveness watchdog sweep across every INFERENCE_ENDPOINTS target
+
+[Service]
+Type=oneshot
+
+# FLEET instance. This is the unit that belongs on the OUT-OF-BAND appliance --
+# a separate machine, per docs/REQUIREMENTS.md 2026-08-17: "even if it's a laptop
+# with eight gigabytes of RAM, that would be better than the whole cluster just
+# locking itself out of the inference that it needs to recover itself." It runs
+# curl and ssh, not a model.
+#
+# It is harmless (and useful) to enable on a cluster node as well, but doing so
+# does NOT satisfy that requirement: an on-node copy cannot report that its own
+# node is down.
+Environment=WATCHDOG_MODE=auto
+EnvironmentFile=-/etc/default/llama-watchdog
+ExecStart=/usr/local/sbin/llama-watchdog
+
+StateDirectory=llama-watchdog
+RuntimeDirectory=llama-watchdog
+RuntimeDirectoryPreserve=yes
+
+# N targets are probed in parallel, so the wall-clock cost is roughly one
+# window plus one SSH round trip regardless of N. 90 s leaves generous margin
+# on a saturated 100 Mb link (F28) while still bounding a stuck run below two
+# timer periods.
+TimeoutStartSec=90
+
+# A non-zero exit means "something is wedged or unreachable", which is exactly
+# what the journal should record -- it is not a unit failure.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

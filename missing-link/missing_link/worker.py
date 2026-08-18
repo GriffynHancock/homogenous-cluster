@@ -28,7 +28,16 @@ WHY MAP-REDUCE, decided on evidence rather than preference:
 import re
 import time
 import json
+import http.client
+import sqlite3
+import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
+
+# Sibling module, no heavy imports at its top level (pypdf is imported lazily
+# inside its own functions). Named here so classify_failure can treat an
+# unreadable upload as a PERMANENT failure by intent rather than by default.
+from missing_link.extract import ExtractionError
 
 # --- Task profile -----------------------------------------------------------
 # Each kind is a (map prompt, reduce prompt) pair. This dict IS the extension
@@ -58,18 +67,18 @@ REDUCE_PROMPTS = {
         "Below are summaries of consecutive sections of one document. Combine "
         "them into a single coherent summary. Remove repetition caused by "
         "overlapping sections. Do not add anything not present in the "
-        "sections.{instruction}\n\n---\n{summaries}\n---\n\nCombined summary:"
+        "sections.{instruction}{citation}\n\n---\n{summaries}\n---\n\nCombined summary:"
     ),
     "report": (
         "Below are drafted sections of one report, in order. Combine them into "
         "a single coherent report, removing repetition introduced by "
-        "overlapping sections. Do not add new material.{instruction}\n\n"
+        "overlapping sections. Do not add new material.{instruction}{citation}\n\n"
         "---\n{summaries}\n---\n\nCombined report:"
     ),
     "qa": (
         "Below are fact lists extracted from consecutive sections of one "
         "document. Combine them into a single deduplicated list, preserving "
-        "figures exactly.{instruction}\n\n---\n{summaries}\n---\n\nCombined facts:"
+        "figures exactly.{instruction}{citation}\n\n---\n{summaries}\n---\n\nCombined facts:"
     ),
 }
 
@@ -84,8 +93,11 @@ OVERLAP_TOKENS = 410
 WORDS_PER_TOKEN = 0.70
 
 # llama-server on this hardware takes minutes per request, not seconds.
-# BOTH LlamaIndex and LangChain default to a 60 s timeout and retry 3-6 times;
-# against a multi-minute backend that is a retry storm, not a summary.
+# BOTH LlamaIndex and LangChain default to a 60 s timeout; against a
+# multi-minute backend that is a retry storm, not a summary. Corrected
+# 2026-08-18: max_retries defaults to 2 in the underlying OpenAI/Anthropic
+# SDKs both libraries build on, not the 3-6 originally assumed here -- the
+# retry-storm risk is still real, since each retry re-waits the full timeout.
 DEFAULT_TIMEOUT_S = 3600
 
 # Per-model reasoning suppression. There is NO universal flag, and assuming one
@@ -140,6 +152,119 @@ def reasoning_kwargs_for(model_name):
 MAP_MAX_TOKENS = 1024
 REDUCE_MAX_TOKENS = 2048
 
+# CITATION MARKERS SPEND THIS BUDGET, AND THIS BUDGET IS NOT BEING RAISED.
+#
+# `[Section 12]` is ~5 tokens. The reduce step is asked for one marker group per
+# PARAGRAPH, not per sentence (see _CITATION_CLAUSE), so a 40-60 sentence combined
+# summary of ~10-20 paragraphs carrying 1-2 markers each costs roughly 50-200
+# output tokens -- under 10% of 2048, against a reduce output that in practice
+# lands well under its cap. docs/citation-research.md Q5 estimates 150-300 for
+# the per-sentence variant this deliberately does not ask for, so 50-200 is the
+# same arithmetic at the coarser granularity actually being requested. NOTE both
+# figures are ESTIMATES from token arithmetic, not measurements: nobody has yet
+# run a reduce call with this clause in it (the model's compliance is the one
+# thing this change cannot verify without inference).
+#
+# Raising REDUCE_MAX_TOKENS to "make room" would be the wrong move and is not
+# done here. F34 is exactly this failure: a token budget silently produced a
+# summary truncated mid-sentence and stored it `done`. The guard for that is
+# extract_content's TruncatedCompletion on finish_reason == "length", and it is
+# untouched by citations -- markers make truncation marginally MORE likely, and
+# more likely to be CAUGHT, because the guard fires before the text is ever
+# stored or parsed. A reduce output that runs out of budget therefore fails the
+# job loudly rather than arriving with its last few paragraphs' citations
+# missing, which is the outcome to want: a partly-cited summary would look
+# finished. If real jobs start failing on `length` after this change, the fix to
+# reach for first is fewer chunks or a shorter instruction, not a bigger budget.
+# The escape hatch for the whole feature is CITE_SECTIONS below.
+
+
+# --- Guidance length guard ----------------------------------------------------
+# Operator guidance -- typed, or extracted from an uploaded file (a style
+# guide, a report template, a question list) -- is embedded via `{instruction}`
+# in build_prompt/build_reduce_prompt (_instruction_clause). That means it is
+# repeated on EVERY map call, once per chunk, not once per document -- so it
+# must fit, alongside ONE chunk and the model's own output, inside a single
+# llama-server SLOT, not inside the whole context window. A 40-page style
+# guide "multiplied across 26 chunks" does not cost 26x the tokens (each
+# request is independent), but it DOES have to fit in the slot 26 times over,
+# and if it does not fit even once, every one of those 26 requests either
+# errors or (worse) silently drops the start of the chunk to make room.
+#
+# n_ctx_slot is NOT `-c / --parallel` by assumption -- CLAUDE.md is explicit
+# that this must be read from the server's own startup log, not inferred:
+#   journalctl -u llama-server@8080 | grep n_ctx_slot
+# Confirmed on node 1, 2026-08-18 (most recent server startup, `-c 32768
+# --parallel 4`): id_slot 0-3 all report n_ctx_slot=8192.
+N_CTX_SLOT = 8192
+
+# The static template text around {document}/{instruction} in PROMPTS /
+# REDUCE_PROMPTS -- roughly 35-45 words per kind (~50-65 tokens at
+# WORDS_PER_TOKEN). Rounded up well past that so this guard never undercounts
+# and blames the wrong thing when a request is still rejected.
+_PROMPT_WRAPPER_TOKENS = 150
+
+# One slot must hold, at once: one chunk (CHUNK_TOKENS) + the guidance
+# (repeated on every map call) + the model's own answer (MAP_MAX_TOKENS) + the
+# wrapper text. Solve for the guidance budget, then keep the project's
+# standard 15% safety margin (CLAUDE.md: "leave 15% memory headroom... do not
+# spec configurations that fit only marginally") rather than spend the
+# arithmetic ceiling exactly -- KV growth and the reduce step (which embeds
+# the guidance once more, alongside every chunk summary) both draw on the same
+# slot.
+_INSTRUCTION_HEADROOM_TOKENS = (
+    N_CTX_SLOT - CHUNK_TOKENS - MAP_MAX_TOKENS - _PROMPT_WRAPPER_TOKENS)
+_ARCH_SAFETY_MARGIN = 0.85  # the standard 15% headroom above
+
+# WORDS_PER_TOKEN (0.70) IS UNDER MEASUREMENT AND KNOWN OPTIMISTIC, separately
+# from the architecture margin above -- do not read it as settled. A real PDF
+# measured ~0.62 words/token (STATUS.md), and the chunk-size sweep in flight on
+# node 2 is showing llama-server's own prompt_n running ~30% over what the
+# words-per-token estimate predicted for the same chunk. Since this guard
+# converts a word count to an assumed token count via WORDS_PER_TOKEN, an
+# optimistic WORDS_PER_TOKEN makes the guard let through MORE words than
+# actually fit -- the unsafe direction, for a check whose entire job is
+# refusing what does not fit. This factor is separate insurance against THAT,
+# not a substitute for the real fix: MAX_INSTRUCTION_WORDS is derived FROM
+# WORDS_PER_TOKEN below, so when the sweep lands a corrected (lower) value,
+# this guard tightens automatically without needing to change. Do not fold
+# this into _ARCH_SAFETY_MARGIN above -- they guard different things and
+# should be able to move independently (this one goes away once
+# WORDS_PER_TOKEN is corrected; the architecture one does not).
+_TOKENIZER_UNCERTAINTY_MARGIN = 0.75
+
+MAX_INSTRUCTION_TOKENS = int(
+    _INSTRUCTION_HEADROOM_TOKENS * _ARCH_SAFETY_MARGIN * _TOKENIZER_UNCERTAINTY_MARGIN)
+MAX_INSTRUCTION_WORDS = int(MAX_INSTRUCTION_TOKENS * WORDS_PER_TOKEN)
+
+
+class GuidanceTooLong(ValueError):
+    """Operator guidance (typed, or extracted from a file) would not fit in
+    one context slot alongside a document chunk and its output.
+
+    Refused, not truncated -- for the same reason extract.py refuses a file it
+    cannot read rather than degrading it (F38): a silently shortened style
+    guide is a plausible-looking input that quietly means something other than
+    what the operator gave it, and the operator has no way to notice.
+    """
+
+
+def check_instruction_length(instruction):
+    """Raise GuidanceTooLong if `instruction` would not fit the per-chunk
+    budget. No-op for empty/None guidance -- there is nothing to check."""
+    if not instruction or not instruction.strip():
+        return
+    words = len(instruction.split())
+    if words > MAX_INSTRUCTION_WORDS:
+        raise GuidanceTooLong(
+            f"guidance is about {words} words (~{int(words / WORDS_PER_TOKEN)} "
+            f"tokens); the limit is {MAX_INSTRUCTION_WORDS} words "
+            f"(~{MAX_INSTRUCTION_TOKENS} tokens) so it still fits in one "
+            f"context slot (n_ctx_slot={N_CTX_SLOT}) alongside a document "
+            f"chunk ({CHUNK_TOKENS} tokens) and its output ({MAP_MAX_TOKENS} "
+            "tokens) -- it is repeated on every chunk, not sent once. Shorten "
+            "it, or trim it down to the parts that matter most.")
+
 
 def chunk_document(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
     """Split text into overlapping chunks, measured in whitespace words."""
@@ -184,12 +309,268 @@ def build_prompt(kind, document, instruction=None):
                                 instruction=_instruction_clause(instruction))
 
 
-def build_reduce_prompt(kind, summaries, instruction=None):
+# --- Section-level citation (Tier B) ------------------------------------------
+# docs/citation-research.md recommends exactly this and no more: ask the reduce
+# step to repeat the `[Section N]` labels IT WAS ALREADY SHOWN, then resolve
+# those labels back to stored character offsets IN CODE.
+#
+# What this deliberately is NOT:
+#
+#   * It is not "ask the model where this came from". Models score ~38% on the
+#     EASIER task of merely validating an existing citation, and 12.8 Snippet-F1
+#     generating fine spans from scratch (citation-research.md Q1). Repeating a
+#     visible label is a closed-set choice over N options, not span generation.
+#     The model never sees a character offset and is never asked for one.
+#   * It is not sentence-level. CONFIRMED (arXiv:2604.01432): forcing
+#     sentence-level citation degrades BOTH attribution quality and answer
+#     correctness by 16-276% versus paragraph-level. Finer is worse here, so
+#     the ask is per PARAGRAPH -- which also costs fewer output tokens.
+#   * It is not a faithfulness check. `[Section 3]` asserts reference, not
+#     support. Tier C (audit.py's two-model ensemble re-run against the cited
+#     chunk) is the thing that would assert support, and it is GATED on the
+#     full-chunk-size battery re-run that docs/audit-ledger.md 6 demands and
+#     that has not happened. The seam for it is parse_section_citations'
+#     return value: each resolved citation already carries the exact
+#     (index, start, end) an ensemble check would need. Do not wire it in
+#     before that measurement exists.
+#
+# APPLIED UNCONDITIONALLY to every multi-chunk reduce call, via this switch.
+# It changes model output, which CLAUDE.md says must be paired with a coherence
+# check on real output -- so this constant exists to be flipped to False in one
+# place, reverting the prompt to byte-identical-to-before, if that check fails.
+CITE_SECTIONS = True
+
+_CITATION_CLAUSE = (
+    " Each section below is labelled [Section 1], [Section 2] and so on. At the "
+    "end of each paragraph you write, repeat the label or labels of the section "
+    "or sections that paragraph drew on, exactly as shown -- for example "
+    "[Section 2], or [Section 2][Section 5] for a paragraph combining two. Use "
+    "only labels that actually appear below; never invent a section number, and "
+    "never label a paragraph with a section you did not draw on."
+)
+
+
+def _citation_clause(cite_sections):
+    """Prompt fragment asking for `[Section N]` tags, or "" for none.
+
+    Returns "" when off, so REDUCE_PROMPTS renders byte-for-byte identical to
+    what it produced before citations existed -- same property, and same
+    reason, as _instruction_clause above.
+    """
+    return _CITATION_CLAUSE if cite_sections else ""
+
+
+def _section_items(summaries):
+    """[(label, summary_text)] for the reduce prompt, LABEL BOUND TO THE CHUNK.
+
+    `summaries` may be bare strings (the untraced `summarise` path, which has no
+    chunk identity to bind to) or chunk records / DB rows carrying their own
+    chunk index under "index" or "idx".
+
+    WHY THIS IS NOT `enumerate`. The label the model is shown is the label a
+    citation resolves back through, so it has to name the CHUNK, not the chunk's
+    position in whatever list happened to reach this function. Records arriving
+    here can come from a resume path that reuses rows persisted by an earlier
+    process (F37#4), so position and identity are two different things even
+    though they coincide today. A citation that is off by one is worse than no
+    citation at all: it points confidently at the wrong span, and the reader who
+    checks it finds text that does not support the claim and cannot tell whether
+    the model lied or the plumbing did.
+    """
+    items = []
+    for pos, s in enumerate(summaries):
+        if isinstance(s, dict):
+            idx = s.get("index", s.get("idx"))
+            if idx is None:
+                raise ValueError(
+                    "chunk record reached build_reduce_prompt with no 'index' "
+                    "or 'idx'; the section label must name the chunk, not its "
+                    f"position in this list (record keys: {sorted(s)})")
+            items.append((int(idx) + 1, s["summary"]))
+        else:
+            items.append((pos + 1, s))
+    return items
+
+
+def build_reduce_prompt(kind, summaries, instruction=None,
+                        cite_sections=CITE_SECTIONS):
     joined = "\n\n".join(
-        f"[Section {i + 1}]\n{s}" for i, s in enumerate(summaries)
+        f"[Section {label}]\n{text}" for label, text in _section_items(summaries)
     )
-    return REDUCE_PROMPTS[kind].format(summaries=joined,
-                                       instruction=_instruction_clause(instruction))
+    return REDUCE_PROMPTS[kind].format(
+        summaries=joined,
+        instruction=_instruction_clause(instruction),
+        citation=_citation_clause(cite_sections))
+
+
+# A WELL-FORMED marker: literally what the prompt showed the model. Tolerant of
+# case and internal whitespace and nothing else -- this is the only pattern that
+# is allowed to become a link.
+_SECTION_MARKER_RE = re.compile(r"\[\s*Section\s+(\d+)\s*\]", re.IGNORECASE)
+# Anything marker-SHAPED, so "[Sections 1 and 4]" or "[Section four]" can be
+# counted and reported rather than passing unnoticed as ordinary prose.
+_MARKERISH_RE = re.compile(r"\[\s*Sections?\b[^\]\n]*\]", re.IGNORECASE)
+
+
+def _citation_targets(records):
+    """{label -> {"section", "index", "start", "end"}} for resolvable sections.
+
+    Accepts worker chunk records ("index"/"start"/"end") and db.get_chunk_summaries
+    rows ("idx"/"start_char"/"end_char") alike; they are the same three facts
+    under two spellings, and the job page has the DB spelling.
+    """
+    targets = {}
+    for r in records or []:
+        idx = r.get("index", r.get("idx"))
+        start = r.get("start", r.get("start_char"))
+        end = r.get("end", r.get("end_char"))
+        if idx is None or start is None or end is None:
+            continue
+        idx = int(idx)
+        targets[idx + 1] = {"section": idx + 1, "index": idx,
+                            "start": int(start), "end": int(end)}
+    return targets
+
+
+def parse_section_citations(text, records):
+    """Resolve `[Section N]` markers in a reduce output back to source spans.
+
+    Pure text + stored offsets. NO model call, no fuzzy matching, no guessing:
+    a marker either names a chunk that exists, in which case its span is that
+    chunk's PERSISTED start/end, or it does not, in which case it is refused.
+
+    Returns a dict:
+      segments        ordered render list; {"kind": "text", "text": ...} and
+                      {"kind": "cite", "section", "index", "start", "end"}.
+                      Dropped markers appear in NEITHER -- see below.
+      cited_sections  sorted distinct section numbers that resolved
+      marker_count    well-formed markers seen
+      valid_count     of those, ones that resolved
+      dropped         [{"marker", "section", "count"}] -- well-formed but
+                      unresolvable, aggregated by literal marker text
+      dropped_count   total occurrences dropped
+      unparsed        [{"marker", "count"}] -- marker-SHAPED but not
+                      well-formed, left in the prose verbatim
+      unparsed_count  total occurrences of those
+      has_citations   valid_count > 0
+
+    THREE OUTCOMES, ALL FIRST-CLASS, none of them an error:
+
+    1. Valid marker -> a citation with an exact span. Exact because it is a
+       dict lookup on a number the model was handed, not a match on content.
+
+    2. INVENTED marker -- `[Section 47]` on a 26-section document, or any label
+       with no record behind it -- is DROPPED from the rendered prose and
+       counted. It is never rendered as a link. This is the codebase's standing
+       rule (F21/F34/F36/F38: "a completion path must refuse, not degrade"):
+       a link to a span that does not exist is exactly the plausible-looking
+       worthless output those four findings are about, and it would be worse
+       than no citation because it survives a reader's spot check by pointing
+       somewhere real-looking. The count is returned so the job page can show
+       it -- a job that drops many markers is a signal about the model, not a
+       cosmetic detail to swallow.
+
+    3. NO markers at all -> has_citations False, segments is the whole text,
+       nothing is wrong. The summary is exactly as valid as it was before this
+       feature existed; it simply is not attributed. There is deliberately NO
+       fuzzy-match fallback here: docs/citation-research.md offers audit.py's
+       `best_match` content-word heuristic for this, and it would produce
+       INFERRED locations indistinguishable, once rendered, from ones the model
+       actually claimed. If it is ever added it must come back under its own
+       key and be labelled distinctly in the UI, never merged into `segments`.
+
+    Malformed-but-marker-shaped text ("[Sections 1 and 4]") is left in the prose
+    untouched and reported under `unparsed`: deleting text the model wrote is a
+    bigger sin than leaving a non-link, and it stays visible to the reader.
+    """
+    text = text or ""
+    targets = _citation_targets(records)
+
+    segments = []
+    dropped, unparsed = {}, {}
+    marker_count = valid_count = 0
+    cited = set()
+    pos = 0
+
+    def _emit_text(chunk, after_drop=False):
+        # A dropped marker leaves a hole with whitespace on both sides of it.
+        # Join them back into ONE separator, keeping whichever side carried more
+        # newlines -- so "text. [Section 47]\n\nNext para" keeps its paragraph
+        # break instead of collapsing into one run-on line, and "a [Section 47] b"
+        # does not gain a visible double space. Whitespace only: this never
+        # removes a non-whitespace character the model wrote, and never runs
+        # except immediately after a refused marker.
+        if after_drop and not segments:
+            # Dropped marker at the very start: nothing precedes it to join to.
+            chunk = chunk.lstrip()
+        elif after_drop and not chunk and segments[-1]["kind"] == "text":
+            # ...and at the very end: nothing follows, so the separator the
+            # marker was hanging off is now trailing whitespace.
+            segments[-1]["text"] = segments[-1]["text"].rstrip()
+            if not segments[-1]["text"]:
+                segments.pop()
+        elif after_drop and segments[-1]["kind"] == "text":
+            prev = segments[-1]["text"]
+            prev_body = prev.rstrip()
+            prev_ws = prev[len(prev_body):]
+            next_body = chunk.lstrip()
+            next_ws = chunk[:len(chunk) - len(next_body)]
+            if prev_ws or next_ws:
+                if prev_ws.count("\n") != next_ws.count("\n"):
+                    sep = max(prev_ws, next_ws, key=lambda w: w.count("\n"))
+                else:
+                    sep = max(prev_ws, next_ws, key=len)
+                segments[-1]["text"] = prev_body + sep
+                chunk = next_body
+        if not chunk:
+            return
+        if segments and segments[-1]["kind"] == "text":
+            segments[-1]["text"] += chunk
+        else:
+            segments.append({"kind": "text", "text": chunk})
+
+    dropped_here = False
+    for m in _MARKERISH_RE.finditer(text):
+        raw = m.group(0)
+        _emit_text(text[pos:m.start()], after_drop=dropped_here)
+        pos = m.end()
+        dropped_here = False
+
+        strict = _SECTION_MARKER_RE.fullmatch(raw)
+        if strict is None:
+            unparsed[raw] = unparsed.get(raw, 0) + 1
+            _emit_text(raw)
+            continue
+
+        marker_count += 1
+        label = int(strict.group(1))
+        target = targets.get(label)
+        if target is None:
+            dropped[raw] = dropped.get(raw, 0) + 1
+            dropped_here = True
+            continue
+
+        valid_count += 1
+        cited.add(label)
+        segments.append({"kind": "cite", **target})
+
+    _emit_text(text[pos:], after_drop=dropped_here)
+
+    return {
+        "segments": segments,
+        "cited_sections": sorted(cited),
+        "marker_count": marker_count,
+        "valid_count": valid_count,
+        "dropped": [{"marker": k,
+                     "section": (lambda mm: int(mm.group(1)) if mm else None)(
+                         _SECTION_MARKER_RE.fullmatch(k)),
+                     "count": v}
+                    for k, v in sorted(dropped.items())],
+        "dropped_count": sum(dropped.values()),
+        "unparsed": [{"marker": k, "count": v} for k, v in sorted(unparsed.items())],
+        "unparsed_count": sum(unparsed.values()),
+        "has_citations": valid_count > 0,
+    }
 
 
 class LlamaClient:
@@ -212,6 +593,26 @@ class LlamaClient:
         # /props on first use. Lazy rather than in __init__ so constructing a
         # client never does I/O and never fails because a node is down.
         self._reasoning = None
+        # /props itself, cached so _detect_reasoning_kwargs and model_name()
+        # share one HTTP round trip instead of each fetching it independently.
+        self._props_cache = None
+
+    def _props(self):
+        """Fetch and cache GET /props. {} on any failure.
+
+        A node that will not answer /props is a problem for the caller to
+        discover on the actual completion request, not here -- so failure
+        here is silent and the caller gets an empty dict, never an exception.
+        """
+        if self._props_cache is not None:
+            return self._props_cache
+        try:
+            req = urllib.request.Request(f"{self.base_url}/props")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                self._props_cache = json.load(r)
+        except Exception:
+            self._props_cache = {}
+        return self._props_cache
 
     def _detect_reasoning_kwargs(self):
         """Ask the server which model it is serving, once, and map to a knob.
@@ -224,19 +625,20 @@ class LlamaClient:
         """
         if self._reasoning is not None:
             return self._reasoning
-        name = ""
-        try:
-            req = urllib.request.Request(f"{self.base_url}/props")
-            with urllib.request.urlopen(req, timeout=10) as r:
-                props = json.load(r)
-            name = props.get("model_name") or props.get("model_path") or ""
-        except Exception:
-            # A node that will not answer /props is a problem for the caller to
-            # discover on the actual request, not here. No kwargs is the safe
-            # default: it never silently misleads.
-            name = ""
-        self._reasoning = reasoning_kwargs_for(name)
+        self._reasoning = reasoning_kwargs_for(self.model_name())
         return self._reasoning
+
+    def model_name(self):
+        """The model this server is currently serving, per its own /props.
+
+        "" if /props could not be reached -- callers (run_one's resumability
+        check) must treat that the same as "unknown", not as a match against
+        anything. This is also what makes resuming a job safe: chunk summaries
+        are persisted alongside the model that produced them, and a resume is
+        only trusted when this matches the recorded value exactly.
+        """
+        props = self._props()
+        return props.get("model_name") or props.get("model_path") or ""
 
     def assert_reachable(self, timeout=20):
         """Raise unless the server answers /health promptly."""
@@ -293,6 +695,25 @@ class BackendUnavailable(RuntimeError):
     """The inference server is not answering. Distinct from a bad completion."""
 
 
+class JobCancelled(RuntimeError):
+    """Raised when a cooperative stop request is observed between chunks.
+
+    HOW FAR "stop a running job" ACTUALLY GOES, stated plainly rather than
+    overclaimed: there is no way to interrupt an in-flight HTTP call to
+    llama-server from here. That request keeps running server-side regardless
+    of what the client does -- closing the socket does not reliably stop
+    generation, and llama-server exposes no cancellation endpoint. So a stop
+    request cannot preempt whichever chunk is currently being summarised.
+
+    What IS achievable, and is what this implements: the flag is checked
+    BETWEEN chunks (and once more before the reduce step), so a stop takes
+    effect at the next chunk boundary rather than waiting out the rest of a
+    multi-hour document. Chunks already completed are not lost -- they were
+    persisted as they finished (see save_chunk_summaries) -- so a stopped job
+    can be resumed later exactly like a crashed one.
+    """
+
+
 class TruncatedCompletion(RuntimeError):
     """The model ran out of tokens mid-answer, so the text is incomplete.
 
@@ -312,6 +733,219 @@ class TruncatedCompletion(RuntimeError):
     source material for the reduce step, where its missing content is
     indistinguishable from content the document never had.
     """
+
+
+# --- Retry policy: transient vs permanent ------------------------------------
+# THE PROBLEM THIS SOLVES. Until now every exception escaping the pipeline took
+# the same exit: run_one's broad `except` -> db.fail_job -> terminal. So the
+# overnight sequence was "the backend dies at 02:00, the watchdog restarts it at
+# 02:05, and nothing happens until morning" -- with, since chunk summaries are
+# now persisted as they complete, a pile of finished work sitting unused in the
+# database. That happened twice in two days (F39, and ik_llama.cpp fatal-erroring
+# in its flash-attention kernel on node 2).
+#
+# THE DANGER OF THE OBVIOUS FIX. A blanket retry is worse than no retry. A
+# document that cannot be chunked, a guidance note that is too long, a 400 from
+# the server: retrying those reproduces them exactly, forever, on a queue nobody
+# is watching. So failures are classified, and ONLY the transient class is
+# retried.
+#
+# TRANSIENT means "the infrastructure moved under a document that was fine":
+# the backend died mid-request, refused the connection, or never answered.
+# PERMANENT means "the input or the request is wrong", and no number of retries
+# will change that.
+#
+# AN UNRECOGNISED EXCEPTION IS PERMANENT. This is the same discipline as
+# reasoning_kwargs_for returning {} for a model it does not know rather than
+# guessing a knob: a mystery error retried all night is worse than one that
+# stops and is visible in the morning. Widening the transient class is a
+# deliberate act, done by naming a type here.
+
+_TRANSIENT_EXCEPTIONS = (
+    # Our own pre-flight probe (F36). The backend is up as a process and
+    # answering TCP, but not answering /health -- wedged, restarting, or
+    # reloading 65 GB of model.
+    BackendUnavailable,
+    # ConnectionResetError / ConnectionRefusedError / ConnectionAbortedError /
+    # BrokenPipeError. http.client.RemoteDisconnected is a ConnectionResetError
+    # too, so this is the class that catches "the server went away mid-request"
+    # -- exactly what destroyed job 06af2911d7fc when the watchdog restarted the
+    # unit under it.
+    ConnectionError,
+    # RemoteDisconnected (again, via BadStatusLine), IncompleteRead,
+    # CannotSendRequest and friends. Every member of this hierarchy is a
+    # transport-level failure of the HTTP conversation, never a statement about
+    # the document.
+    http.client.HTTPException,
+    # socket.timeout is an alias for the builtin TimeoutError on 3.10+. The
+    # request outlived DEFAULT_TIMEOUT_S against a server that may well come
+    # back -- and on this hardware "slow" and "dead" are genuinely hard to tell
+    # apart from the client side (F39), so the benefit of the doubt goes to
+    # retrying, bounded.
+    TimeoutError,
+    # urllib wraps socket-level errors (refused, DNS, unreachable) in URLError.
+    # NOTE: HTTPError is a SUBCLASS of URLError and is decided by status code
+    # in classify_failure BEFORE this tuple is consulted.
+    urllib.error.URLError,
+)
+
+_PERMANENT_EXCEPTIONS = (
+    # F21 and F34. Both are TOKEN-BUDGET failures, and this is the one
+    # classification worth arguing for explicitly, because at first glance they
+    # look retryable -- generation is stochastic, so surely another roll of the
+    # dice might fit?
+    #
+    # No, for three reasons:
+    #   1. A retry re-sends the identical prompt with the identical max_tokens
+    #      to the identical model. The overwhelmingly likely outcome is the
+    #      identical failure, bought at the price of a full prefill -- ~79% of
+    #      document wall-clock on this hardware. Repeating identical work
+    #      identically and hoping is the definition of waste.
+    #   2. The circumstance in which a retry WOULD help is a model change --
+    #      and that is precisely the circumstance in which the persisted chunk
+    #      summaries are discarded (run_one's model check), so the "retry" is a
+    #      full restart of the document anyway. An operator resubmitting after
+    #      changing the model gets that, with full visibility.
+    #   3. These guards exist to make a specific class of silent degradation
+    #      VISIBLE (F21/F34/F38: a plausible-looking result that is worthless).
+    #      Automatically retrying them buries the signal in a retry loop, which
+    #      is the opposite of what they are for.
+    EmptyCompletion,
+    TruncatedCompletion,
+    # Guidance that does not fit alongside a chunk in one slot. Deterministic in
+    # the input; the operator must shorten it.
+    GuidanceTooLong,
+    # "document contains no words" (summarise_traced), and the chunking config
+    # guard in chunk_spans. Both are statements about the input.
+    ValueError,
+    # An upload that could not be turned into text. Normally raised at submit
+    # time, before a job exists, but named here so that if it ever reaches the
+    # worker it is classified by intent rather than by the default.
+    ExtractionError,
+)
+
+# Total STARTS allowed per job, counted by db.claim_next_pending. 4 means the
+# original attempt plus three retries. The bound matters more than its exact
+# value: it is what stops a permanently-broken backend turning the queue into a
+# log-filling retry loop, and what guarantees the operator eventually sees a
+# terminal state with an explanation rather than a job that has been "about to
+# work" all night.
+MAX_ATTEMPTS = 4
+
+# Backoff between retries, doubling and capped: 60s, 120s, 240s. Deliberately
+# not longer, because the PRIMARY defence against spinning is elsewhere and is
+# stronger -- app._worker_loop probes /health before claiming anything, so
+# while the backend is actually down no attempt is consumed at all; the job
+# simply is not claimed. This backoff covers the nastier case the health probe
+# cannot see: a server that answers /health and then fails every completion.
+RETRY_BACKOFF_BASE_S = 60
+RETRY_BACKOFF_CAP_S = 600
+
+
+def _is_locked_sqlite_error(exc):
+    """True for sqlite3's "two workers briefly wanted the same write lock"
+    condition. TRANSIENT -- the document is fine, the backend is fine, a
+    contended write lost a race it will very likely win on the next attempt.
+
+    THIS IS THE ONE PLACE IN THIS FILE THAT MATCHES BY MESSAGE, AND IT IS
+    DELIBERATE, not a lapse in a file that otherwise classifies strictly by
+    exception type. sqlite3 gives every SQL-level failure the SAME exception
+    class, OperationalError -- it covers both this transient lock contention
+    AND genuine, permanent bugs: "no such table", "no such column", and
+    "duplicate column name" (the exact error `db._add_missing_columns` guards
+    against, from a real startup race hit earlier in this project). Treating
+    OperationalError as a class would retry a schema bug identically, forever,
+    on a queue nobody is watching -- precisely the failure mode this file's
+    "unrecognised exceptions default to permanent" rule exists to prevent. So
+    only the specific locked-database message matches; every other
+    OperationalError -- including messages this function does not recognise --
+    falls through to the permanent default below, exactly as before.
+
+    Expected to be RARE: the store is WAL with a 30s busy_timeout (see
+    db._connect) and every transaction here is short. But this queue is meant
+    to run for months and R grows as nodes are added, so "rare" compounds --
+    and losing a multi-hour document to lock contention would have nothing to
+    do with what the document contains.
+    """
+    return (isinstance(exc, sqlite3.OperationalError)
+            and "database is locked" in str(exc).lower())
+
+
+def classify_failure(exc):
+    """"transient" (worth retrying) or "permanent" (never). Unknown -> permanent."""
+    if isinstance(exc, urllib.error.HTTPError):
+        # 5xx is the server failing at its job; 429 is it asking us to wait.
+        # Everything else in the 4xx range -- a 400 from a malformed request, a
+        # 404 from a wrong path -- is our request being wrong, and will be
+        # exactly as wrong next time.
+        return "transient" if (exc.code >= 500 or exc.code == 429) else "permanent"
+    if _is_locked_sqlite_error(exc):
+        return "transient"
+    if isinstance(exc, _PERMANENT_EXCEPTIONS):
+        return "permanent"
+    if isinstance(exc, _TRANSIENT_EXCEPTIONS):
+        return "transient"
+    return "permanent"
+
+
+def is_recognised_failure(exc):
+    """True when classify_failure matched a NAMED type rather than defaulting.
+
+    Kept separate from the classification itself so the operator-facing message
+    can distinguish "we know what this is and it is not worth retrying" from
+    "we have never seen this before, so we stopped rather than looping on it".
+    Those are different things to read at 8am and they warrant different next
+    steps.
+    """
+    if _is_locked_sqlite_error(exc):
+        return True
+    return isinstance(exc, (urllib.error.HTTPError,)
+                      + _PERMANENT_EXCEPTIONS + _TRANSIENT_EXCEPTIONS)
+
+
+def retry_delay_seconds(attempts_so_far):
+    """Seconds to wait before attempt `attempts_so_far` + 1. Doubling, capped."""
+    n = max(1, int(attempts_so_far))
+    return min(RETRY_BACKOFF_CAP_S, RETRY_BACKOFF_BASE_S * (2 ** (n - 1)))
+
+
+def retry_error_message(exc, attempts, delay_s, chunks_done):
+    """What the job page shows while a job is waiting to be retried."""
+    kept = (f" The {chunks_done} chunk summar"
+            f"{'y' if chunks_done == 1 else 'ies'} already completed are kept "
+            f"and will be reused, so the retry resumes rather than restarts."
+            if chunks_done else "")
+    return (f"attempt {attempts} of {MAX_ATTEMPTS} failed and will be retried in "
+            f"{delay_s}s. The inference backend went away -- this is not a problem "
+            f"with the document.{kept} Last error: {type(exc).__name__}: {exc}")
+
+
+def final_error_message(exc, attempts, chunks_done, endpoint, retried):
+    """What the job page shows once a job has failed FOR GOOD.
+
+    The distinction this has to carry, at 8am, to somebody who was asleep for
+    all of it: "your document is bad" versus "the cluster was broken all
+    night". Those need different actions from the operator, and a bare
+    "TypeError: ..." tells them neither.
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    kept = (f" The {chunks_done} chunk summar"
+            f"{'y' if chunks_done == 1 else 'ies'} completed before the last "
+            f"failure are kept on disk and would be reused by a further attempt."
+            if chunks_done else "")
+    if retried:
+        return (f"FAILED AFTER {attempts} ATTEMPTS. Every attempt ended with the "
+                f"inference backend unreachable or dying mid-document, so this is "
+                f"a CLUSTER problem, not a problem with this document -- check "
+                f"llama-server on {endpoint or 'the endpoint that ran it'} before "
+                f"resubmitting.{kept} Last error: {detail}")
+    if is_recognised_failure(exc):
+        return (f"{detail} -- NOT RETRIED: this is a problem with the document or "
+                f"the request, and retrying it would reproduce it exactly.{kept}")
+    return (f"{detail} -- NOT RETRIED: this failure is not one Missing Link "
+            f"recognises, so it was stopped rather than looped on. An unknown "
+            f"error retried all night is worse than one that stops and is "
+            f"visible.{kept}")
 
 
 def extract_content(choice, max_tokens):
@@ -384,6 +1018,29 @@ def _first_prefill_s(timings_log):
     return round(ms / 1000.0, 2) if isinstance(ms, (int, float)) else None
 
 
+def _last_timings(client):
+    """The server's own `timings` object for the MOST RECENT client.complete()
+    call, as {"prompt_n", "prompt_ms", "predicted_n", "predicted_ms"} (only
+    the keys actually present), or {} if the client never reported timings.
+
+    Used to attach per-chunk prefill/generation numbers to a chunk record as
+    it is produced -- see summarise_traced's map loop and chunk_rate_stats,
+    which derives live tok/s and a per-job ETA from these. Deliberately reads
+    only LlamaClient.timings_log (already populated from llama-server's own
+    response, never from wall-clock -- see LlamaClient.complete). {} rather
+    than raising for a client with no such attribute (FakeClient in most
+    tests) or with nothing logged yet.
+    """
+    log = getattr(client, "timings_log", None)
+    if not log:
+        return {}
+    t = log[-1]
+    if not isinstance(t, dict):
+        return {}
+    return {k: t[k] for k in ("prompt_n", "prompt_ms", "predicted_n", "predicted_ms")
+            if k in t}
+
+
 def _strip_think(text):
     """Remove <think>...</think>, including an unclosed trailing block."""
     out, i, low = [], 0, text.lower()
@@ -401,7 +1058,7 @@ def _strip_think(text):
 
 def summarise(kind, document, base_url, client,
               max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS,
-              instruction=None):
+              instruction=None, cite_sections=CITE_SECTIONS):
     """Map-reduce over the document. Returns the final text."""
     chunks = chunk_document(document)
 
@@ -419,25 +1076,74 @@ def summarise(kind, document, base_url, client,
     # bigger budget than any single map step. Using the same value is how you
     # get a truncated final answer on a long document.
     return client.complete(
-        build_reduce_prompt(kind, partials, instruction), max_tokens=reduce_max_tokens)
+        build_reduce_prompt(kind, partials, instruction,
+                            cite_sections=cite_sections),
+        max_tokens=reduce_max_tokens)
 
 
 def count_chunks(document):
     return len(chunk_document(document))
 
 
-def run_one(db_path, base_url, client=None):
-    """Process one job. Returns True if a job was handled, False if idle."""
+def run_one(db_path, base_url, client=None, on_claim=None):
+    """Process one job. Returns True if a job was handled, False if idle.
+
+    `on_claim`, if given, is called with the claimed job dict right after the
+    atomic claim succeeds. Optional and additive -- existing callers are
+    unaffected. It exists for job-level fan-out (see app.py's per-endpoint
+    worker loop): the loop needs to know which job a given endpoint is
+    currently working on for the status page, and this is cheaper and safer
+    than a second query racing against the worker that already holds the row.
+
+    RESUMABILITY. Previously, save_chunk_summaries was called exactly
+    once, after summarise_traced returned -- i.e. after the WHOLE document
+    (every map chunk, plus reduce) had finished. A job killed mid-document
+    (OOM, power cut, an operator stop) lost every completed chunk summary with
+    it: a 40-chunk document that died at chunk 39 restarted from zero on the
+    next claim. Chunks are now persisted one at a time as they complete (see
+    _persist_chunk below), and a job that already has persisted chunks for it
+    resumes from them instead of redoing that work -- safe because map outputs
+    are independent (chunk N's summary does not depend on chunk M's), PROVIDED
+    the same model produced them (see the model check below).
+
+    RETRIES. Resumability only pays off if something actually resumes. Nothing
+    did: every failure went to db.fail_job and stayed there, so a backend that
+    died at 02:00 left a terminal job and a pile of completed chunk summaries
+    that no watchdog restart could ever pick up. A TRANSIENT failure (see
+    classify_failure) now returns the job to 'pending' with a backoff, up to
+    MAX_ATTEMPTS starts in total; a PERMANENT one still fails immediately. A
+    retried job then takes the resume path above, so the retry costs only the
+    chunks that were still outstanding.
+    """
     from missing_link import db
 
     job = db.claim_next_pending(db_path)
     if job is None:
         return False
+    if on_claim is not None:
+        on_claim(job)
+    # Persisted immediately, not just held in the in-memory ENDPOINT_STATE
+    # (app.py): that dict is cleared the moment this worker moves on, so a
+    # FAILED job would otherwise lose all record of which node it died on --
+    # and under fan-out, "which endpoint" is the difference between "1/R of
+    # throughput is gone" and "the whole cluster is mysteriously slower".
+    db.set_job_endpoint(db_path, job["id"], base_url)
 
     if client is None:
         client = LlamaClient(base_url)
 
     started = time.monotonic()
+    current_model = None       # resolved below; closed over by _persist_chunk
+    completed_chunks = [0]     # mutable counter closed over by _persist_chunk
+
+    def _persist_chunk(record):
+        db.save_chunk_summaries(db_path, job["id"], [record], model=current_model,
+                                instruction=job.get("instruction"))
+        completed_chunks[0] += 1
+
+    def _should_stop():
+        return db.is_cancel_requested(db_path, job["id"])
+
     try:
         # A wedged llama-server accepts TCP and never answers. Observed
         # 2026-08-17: a client disconnecting mid-generation left the server alive
@@ -447,16 +1153,89 @@ def run_one(db_path, base_url, client=None):
         probe = getattr(client, "assert_reachable", None)
         if probe is not None:
             probe()
+
+        # Identify the current model so a resume can be checked for safety.
+        # getattr keeps FakeClient (and any other injected client) working
+        # without a model_name() method -- and simply never resumes, which is
+        # the safe default (see below).
+        model_fn = getattr(client, "model_name", None)
+        if model_fn is not None:
+            try:
+                current_model = model_fn()
+            except Exception:
+                current_model = None
+
         n_chunks = count_chunks(job["document"])
+
+        prior = db.get_chunk_summaries(db_path, job["id"])
+        resume_records = None
+        if prior:
+            recorded_model = db.get_recorded_model(db_path, job["id"])
+            # The tie goes to caution: only resume when BOTH the recorded and
+            # current model are known AND equal. An unknown current model
+            # (no model_name(), or /props unreachable) or an unknown recorded
+            # model (rows saved before this column existed) means the match
+            # cannot be POSITIVELY confirmed -- and mixing chunk summaries
+            # produced by two different models into one reduce step is exactly
+            # the kind of silent-mixing failure this project keeps getting
+            # burned by (F21, F25). Chosen response is "discard and restart"
+            # rather than "refuse": an unattended overnight queue should not
+            # need an operator to unstick a job just because the server was
+            # restarted onto a different model, and restarting the map phase
+            # is always correct, just slower than a true resume.
+            model_ok = bool(recorded_model) and bool(current_model) \
+                and recorded_model == current_model
+            # SAME REASONING, for the operator's guidance rather than the
+            # model. `instruction` is embedded in every map call (build_prompt)
+            # exactly like the document chunk is, so it is just as capable of
+            # making two runs' chunk summaries incompatible. Unlike the model
+            # check, "no instruction" (None) is trusted when BOTH sides agree
+            # it is None -- that was already true of every job before this
+            # column existed, so it is not new information to distrust; what
+            # is untrustworthy is DISAGREEMENT or an unconfirmable record
+            # (get_recorded_instruction's first element being False).
+            instr_ok, recorded_instruction = db.get_recorded_instruction(
+                db_path, job["id"])
+            instruction_ok = instr_ok and recorded_instruction == job.get("instruction")
+            if model_ok and instruction_ok:
+                resume_records = [
+                    {"index": r["idx"], "start": r["start_char"],
+                     "end": r["end_char"], "summary": r["summary"]}
+                    for r in prior
+                ]
+                completed_chunks[0] = len(resume_records)
+            else:
+                db.delete_chunk_summaries(db_path, job["id"])
+
+        # Recorded EXPLICITLY every attempt, including as 0, so the job page can
+        # state whether this attempt resumed or restarted rather than inferring
+        # it from the presence of chunk rows -- which would be wrong exactly
+        # when it matters, since the branch above DELETES those rows when the
+        # resume is rejected. This is the number that says whether retrying was
+        # worth doing at all.
+        db.record_resume(db_path, job["id"], len(resume_records or ()))
+
+        if _should_stop():
+            raise JobCancelled("stop requested before any work began")
+
         # summarise_traced keeps each chunk's identity and offsets, so the final
         # output stays traceable to spans of the source. See "Provenance" above.
         # job.get() rather than job["instruction"]: older rows created before
         # this column existed, and FakeClient-driven tests that build a job dict
         # by hand, must not KeyError here.
+        #
+        # No trailing save_chunk_summaries: on_chunk_done persists each chunk AS
+        # IT COMPLETES. Persisting only after the whole document finished is
+        # exactly the bug that made a 40-chunk job dying at chunk 39 restart from
+        # zero -- and it is not hypothetical, job 06af2911d7fc lost 10m55s of a
+        # 97299-character document with zero chunk_summaries rows to show for it.
         result, chunk_records = summarise_traced(
             job["kind"], job["document"], client,
-            instruction=job.get("instruction"))
-        db.save_chunk_summaries(db_path, job["id"], chunk_records)
+            instruction=job.get("instruction"),
+            resume_records=resume_records,
+            on_chunk_done=_persist_chunk,
+            should_stop=_should_stop,
+        )
         db.complete_job(db_path, job["id"], result, {
             "total_s": round(time.monotonic() - started, 2),
             "chunks": n_chunks,
@@ -465,14 +1244,78 @@ def run_one(db_path, base_url, client=None):
             # The schema has reserved this column since the beginning and nothing
             # ever filled it, which mattered because prefill is ~79% of document
             # wall-clock on this hardware -- the metric most worth tracking.
-            # getattr keeps FakeClient (and any other injected client) working.
             "ttft_s": _first_prefill_s(getattr(client, "timings_log", None)),
+        })
+    except JobCancelled:
+        # Not an error -- see the docstring on JobCancelled for how far a stop
+        # actually goes. Chunks completed before the stop are already
+        # persisted (via _persist_chunk), so this job is resumable later
+        # exactly like a crashed one.
+        db.finish_cancelled(db_path, job["id"], {
+            "total_s": round(time.monotonic() - started, 2),
+            "chunks": completed_chunks[0],
         })
     except Exception as exc:  # noqa: BLE001 -- a failed job must not kill the worker
         # Record and move on. One bad document must not stall every job behind
         # it in a queue whose jobs take hours.
-        db.fail_job(db_path, job["id"], f"{type(exc).__name__}: {exc}")
+        #
+        # BUT: "record and move on" used to mean TERMINAL, for every failure
+        # equally -- so a backend that died at 02:00 and was restarted by the
+        # watchdog at 02:05 left a failed job and a pile of completed chunk
+        # summaries that nothing would ever pick up again. Transient failures
+        # are now returned to the queue, bounded and backed off; permanent ones
+        # still fail immediately, because retrying them is pure waste and, on an
+        # unattended queue, an infinite loop. See classify_failure.
+        attempts = int(job.get("attempts") or 1)
+        done_chunks = completed_chunks[0]
+        if classify_failure(exc) == "transient" and attempts < MAX_ATTEMPTS:
+            delay = retry_delay_seconds(attempts)
+            db.schedule_retry(
+                db_path, job["id"],
+                retry_error_message(exc, attempts, delay, done_chunks),
+                _retry_at(delay))
+            # No notify_completion: this job has NOT reached a terminal state,
+            # and notify_completion's contract (see its docstring) is that it
+            # fires once, on done/failed/cancelled. Firing it here would email
+            # the operator about a job that is about to run again.
+            return True
+        db.fail_job(db_path, job["id"], final_error_message(
+            exc, attempts, done_chunks, job.get("endpoint") or base_url,
+            retried=attempts > 1))
+
+    # Part 3: documented hook point for a future notification integration.
+    # Deliberately fired here, after the terminal status is committed, so a
+    # future webhook/email body can be built from the job's final state.
+    notify_completion(db.get_job(db_path, job["id"]))
     return True
+
+
+def _retry_at(delay_s):
+    """ISO-8601 UTC timestamp `delay_s` in the future, for db.schedule_retry.
+
+    Same format as db._now() writes, because claim_next_pending compares the
+    two as STRINGS -- which is sound only while both are UTC-aware isoformat
+    output (identical width, identical '+00:00' suffix).
+    """
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay_s)).isoformat()
+
+
+def notify_completion(job):
+    """Hook point for a future completion notification (email, webhook, ...).
+
+    A NO-OP TODAY, deliberately: CLAUDE.md rules out adding an SMTP dependency
+    or any outbound network call from this project. What Missing Link offers
+    instead, right now, is dependency-free and already wired up: the `seen_at`
+    column (db.mark_seen / db.mark_all_seen / db.count_unseen) that lets the
+    UI show returning users what finished while they were away, without any
+    notification channel at all.
+
+    When a real integration is wanted, it plugs in HERE: called from run_one
+    with the finished job's full row (id, kind, status, result or error, timing)
+    every time a job reaches done/failed/cancelled. Receiving the whole row
+    rather than just an id means a webhook payload or email template has
+    everything it needs without a second database read.
+    """
 
 
 def run_forever(db_path, base_url, poll_s=5.0):
@@ -521,6 +1364,102 @@ def estimate_seconds(document, seconds_per_chunk=None):
     if n > 1:
         total += seconds_per_chunk * 0.5
     return total, basis
+
+
+def remaining_seconds(n_chunks, chunks_done, reduce_pending,
+                      seconds_per_chunk=None, basis=None):
+    """Estimated seconds LEFT for a job already in flight. Returns (seconds, basis).
+
+    Distinct from estimate_seconds, which predicts a whole document from
+    scratch before it starts. This one is calibrated against progress already
+    made -- chunks_done comes from persisted chunk_summaries rows, which is
+    real per-chunk progress, not a guess -- for the live-progress poll (see
+    app.py's /jobs/{id}/progress).
+
+    `basis` labels WHICH rate the caller is passing, and must be preserved
+    through to display, never collapsed into a single "measured" bucket --
+    an inferred number must look inferred, and (per the operator's own
+    request) a rate calibrated on THIS job's own first couple of chunks is a
+    materially weaker claim than the cluster-wide average, which is in turn
+    weaker than nothing. Three tiers, caller's choice:
+      "job"      -- THIS job's own chunk timings (see chunk_rate_stats)
+      "measured" -- the cluster-wide average (db.seconds_per_chunk)
+      "estimate" -- the benchmark fallback constant (seconds_per_chunk=None
+                    always forces this, regardless of what basis was passed --
+                    there is nothing else it could mean).
+
+    reduce_pending: True once every map chunk is done but the reduce call (a
+    real, separately-timed inference call) has not returned yet -- there is no
+    finer-grained signal than that available from persisted state alone.
+    """
+    if seconds_per_chunk is None:
+        seconds_per_chunk, basis = FALLBACK_SECONDS_PER_CHUNK, "estimate"
+    elif basis is None:
+        basis = "measured"
+    remaining_chunks = max(n_chunks - chunks_done, 0)
+    total = remaining_chunks * seconds_per_chunk
+    if n_chunks > 1 and (remaining_chunks > 0 or reduce_pending):
+        total += seconds_per_chunk * 0.5
+    return total, basis
+
+
+# Below this many of THIS JOB's own chunks have real timings, its own rate is
+# too noisy to trust over the cluster-wide average -- the same min_samples
+# posture db.seconds_per_chunk takes for the cluster figure. A per-job rate
+# from one sample is just that one chunk's random variance, not a rate.
+MIN_JOB_TIMED_CHUNKS = 2
+
+
+def chunk_rate_stats(timings):
+    """Turn a job's OWN persisted per-chunk timings (db.get_chunk_timings)
+    into live-progress numbers. Returns None if there is nothing timed yet --
+    e.g. every chunk so far was resumed from an earlier run, or the client in
+    use does not report timings (tests' FakeClient) -- rather than fabricate a
+    rate from zero real samples.
+
+    PREFILL AND GENERATION ARE KEPT SEPARATE, deliberately, never blended into
+    one tok/s: they run at very different speeds on this hardware (measured:
+    prefill ~16-25 t/s, generation ~5-6 t/s; prefill is ~79% of document
+    wall-clock, F27), so a single blended number would be dominated by
+    whichever phase happened to be running when it was read, and would mean a
+    different thing every time it was sampled.
+
+    Returns a dict:
+      n_timed            -- how many of this job's chunks have real timings
+      last_prefill_tok_s / last_gen_tok_s  -- from the MOST RECENTLY
+          completed chunk only (there is no partial/in-flight number to show:
+          LlamaClient sends stream=false, so a number only exists once a call
+          returns)
+      avg_prefill_tok_s / avg_gen_tok_s    -- pooled across every timed chunk
+          so far (sum of tokens / sum of milliseconds, not a mean of ratios --
+          correct when chunks vary in size)
+      seconds_per_chunk   -- mean (prompt_ms + predicted_ms) per timed chunk,
+          for remaining_seconds's ETA math; None if nothing is timed
+    """
+    if not timings:
+        return None
+
+    def rate(n, ms):
+        return (n / (ms / 1000.0)) if n and ms else None
+
+    last = timings[-1]
+    total_prompt_n = sum(t.get("prompt_n") or 0 for t in timings)
+    total_prompt_ms = sum(t.get("prompt_ms") or 0 for t in timings)
+    total_pred_n = sum(t.get("predicted_n") or 0 for t in timings)
+    total_pred_ms = sum(t.get("predicted_ms") or 0 for t in timings)
+    per_chunk_s = [
+        ((t.get("prompt_ms") or 0) + (t.get("predicted_ms") or 0)) / 1000.0
+        for t in timings
+    ]
+
+    return {
+        "n_timed": len(timings),
+        "last_prefill_tok_s": rate(last.get("prompt_n"), last.get("prompt_ms")),
+        "last_gen_tok_s": rate(last.get("predicted_n"), last.get("predicted_ms")),
+        "avg_prefill_tok_s": rate(total_prompt_n, total_prompt_ms),
+        "avg_gen_tok_s": rate(total_pred_n, total_pred_ms),
+        "seconds_per_chunk": (sum(per_chunk_s) / len(per_chunk_s)) if per_chunk_s else None,
+    }
 
 
 def humanise_seconds(s):
@@ -596,8 +1535,9 @@ def chunk_spans(text, chunk_tokens=CHUNK_TOKENS, overlap_tokens=OVERLAP_TOKENS):
 
 def summarise_traced(kind, document, client,
                      max_tokens=MAP_MAX_TOKENS, reduce_max_tokens=REDUCE_MAX_TOKENS,
-                     instruction=None):
-    """Map-reduce that RETAINS provenance.
+                     instruction=None, cite_sections=CITE_SECTIONS,
+                     resume_records=None, on_chunk_done=None, should_stop=None):
+    """Map-reduce that RETAINS provenance, and can RESUME a partial run.
 
     Returns (final_text, chunk_records) where each record is
     {"index", "start", "end", "summary"} -- enough to show a reader which span of
@@ -607,22 +1547,78 @@ def summarise_traced(kind, document, client,
     `instruction` is an optional per-job operator note (see build_prompt) applied
     to every map call and to the reduce call, so guidance like "focus on the
     financial terms" shapes both the per-chunk summaries and how they are combined.
+    It is part of what makes a resumed chunk reusable or not: see run_one, which
+    owns the higher-level safety question.
+    resume_records: chunk records already produced by an earlier, interrupted
+        attempt at this SAME document. A chunk whose index has an entry here,
+        AND whose start/end still match the current chunking of the document,
+        is reused instead of re-sent to the model. This is sound (not just
+        convenient) because map outputs are independent -- chunk N's summary
+        never depends on chunk M's -- so it is fine for some summaries in one
+        reduce step to come from an earlier process than others. The
+        start/end check is a defensive guard against the (currently
+        impossible, but cheap to guard) case of CHUNK_TOKENS/OVERLAP_TOKENS
+        changing between the two runs, which would shift chunk boundaries and
+        make a stale record wrong even at the same index. Caller (run_one) is
+        responsible for the higher-level question of whether resuming is safe
+        AT ALL -- i.e. whether the same MODEL produced these records; see
+        run_one and db.get_recorded_model.
+    on_chunk_done: optional callback(record), invoked right after each NEWLY
+        computed chunk (not a resumed one) completes. This is the hook that
+        makes resumability possible in the first place -- run_one uses it to
+        persist progress to the database one chunk at a time, rather than only
+        after summarise_traced returns. See run_one for what that used to mean
+        for a job killed mid-document.
+    should_stop: optional callable, checked before each chunk that would
+        require a real model call (not before a resumed/free one) and once
+        more before the reduce step. If it returns True, raises JobCancelled
+        immediately rather than starting that call -- see JobCancelled for
+        exactly how far this goes.
     """
     chunks = chunk_spans(document)
     if not chunks:
         raise ValueError("document contains no words")
 
+    resume_by_index = {r["index"]: r for r in (resume_records or [])}
     records = []
     for ch in chunks:
+        cached = resume_by_index.get(ch["index"])
+        if (cached is not None
+                and cached["start"] == ch["start"] and cached["end"] == ch["end"]):
+            records.append(cached)
+            continue
+        if should_stop is not None and should_stop():
+            raise JobCancelled(
+                f"stop requested before chunk {ch['index'] + 1}/{len(chunks)}")
         summary = client.complete(build_prompt(kind, ch["text"], instruction),
                                   max_tokens=max_tokens)
-        records.append({"index": ch["index"], "start": ch["start"],
-                        "end": ch["end"], "summary": summary})
+        record = {"index": ch["index"], "start": ch["start"],
+                  "end": ch["end"], "summary": summary}
+        # The server's own timings for THIS call, if the client reports them --
+        # never fabricated, never derived from wall-clock (F17: a wall-clock
+        # TTFT once reported 0.015s against a real 89s, off by ~5800x, and
+        # survived because nothing cross-checked it against the server log).
+        # Absent for a resumed chunk (this branch never runs for one) and for
+        # any client that does not expose timings_log (e.g. FakeClient in most
+        # tests) -- record.get(...) downstream then sees None, not a fabricated
+        # zero, per this project's standing rule (ttft_s is None, not 0.0).
+        record.update(_last_timings(client))
+        records.append(record)
+        if on_chunk_done is not None:
+            on_chunk_done(record)
 
     if len(records) == 1:
         return records[0]["summary"], records
 
+    if should_stop is not None and should_stop():
+        raise JobCancelled("stop requested before the reduce step")
+
+    # RECORDS, not [r["summary"] for r in records]. The section label the model
+    # is shown has to be derived from the chunk's own index, because that label
+    # is what a citation resolves back through -- see _section_items. The old
+    # call site threw the identity away one line before it became load-bearing.
     final = client.complete(
-        build_reduce_prompt(kind, [r["summary"] for r in records], instruction),
+        build_reduce_prompt(kind, records, instruction,
+                            cite_sections=cite_sections),
         max_tokens=reduce_max_tokens)
     return final, records
