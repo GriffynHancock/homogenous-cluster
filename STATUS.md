@@ -2,6 +2,25 @@
 
 **Updated:** 2026-08-18 (afternoon)
 **Phase:** **N=2. Node 2 joined, provisioned, characterised and serving.**
+
+## At a glance — read this before touching anything
+
+| | |
+|---|---|
+| **What this is** | An **N-node**, CPU-only llama.cpp cluster doing real work on real sensitive documents, fronted by **Missing Link** — an async job queue where slowness is not a defect. `CLAUDE.md` has the argument and the standing constraints. |
+| **What is running** | `llama-server` on **nodes 1 and 2**, `rpc-server@50052` on both, and **Missing Link** on the coordinator (node 1) — all as systemd units. N = 2. Details, and what was and was not re-verified this session, in the two sections below. |
+| **Which engine, and why** | **MAINLINE llama.cpp b10369** (`/opt/llama.cpp/bin`), fleet-wide. **Not ik_llama.cpp** — it was adopted on a prefill win (F27) and then dropped, because it fatal-errors on the 5th request of any `--parallel 4` job, i.e. on any document longer than four chunks, leaving a hang `Restart=always` cannot see (**F40**). ik stays installed at `/opt/ik_llama.cpp/bin` for the still-untested `--parallel 1` configurations only. **Do not point a serving node at it.** |
+| **Next task** | **§0, the corpus-driven benchmark** — the operator's stated priority. Re-run the three measurements that were blocked or weakened by the corpus (chunk-boundary severance, the entity signal's false-positive rate, the faithfulness cascade) against the real public documents now on the `/corpus` page — legislation, standards, regulator determinations — instead of the two narrative texts every earlier measurement had to use. Full brief under **NEXT TASKS, in order** below. |
+| **Never do this to the live services** | Do not stop, restart or reconfigure `llama-server`, `rpc-server@50052` or `missing-link` without first checking whether a job is running — a restart destroys that job's in-flight work, which is exactly how F39 lost 10m55s of completed work. Do not benchmark a node while it or its peer is doing real work. Never `pkill -f`; never `git add -A` — `.claude/hooks/cluster-guard.py` blocks both, and gates service control, `git push`, writes to `/opt/models`, and mutating SQL against the live job store. |
+| **Where the history went** | The session-by-session "MERGED" / "completed this session" narrative that used to sit here is now in **`docs/CHANGELOG.md`**, intact. |
+
+Everything below expands on that table. If you only have time for one more
+thing, read the **Index** at the top of `docs/FINDINGS.md`.
+
+---
+
+## Current state, in detail
+
 **The engine choice has flipped and flipped back: both nodes now run MAINLINE
 llama.cpp fleet-wide** (`/opt/llama.cpp/bin`), not ik_llama.cpp — see F40 below
 and the "Engine" row in "Where things stand". ik_llama.cpp stays installed
@@ -15,8 +34,8 @@ backend failure, live per-chunk telemetry with separate prefill/generation
 rates, per-workflow guidance (text or file), section-level citations on the
 reduce output, a revive route, a per-job failure-history table, and a
 deterministic faithfulness cascade, a corpus benchmark page and the
-provenance/licence gap it surfaced — **552 tests** (`.venv/bin/python -m
-pytest tests/ -q`, reproduced this session: 0 failures, 25s; up from 469 at
+provenance/licence gap it surfaced — **552 tests** (`cd missing-link &&
+.venv/bin/python -m pytest tests/ -q`, reproduced this session: 0 failures, 25s; up from 469 at
 the previous entry — the corpus feature added its own test files). **45
 findings** in `docs/FINDINGS.md` (F45 landed this session). **60 commits are
 unpushed to `origin/main`** (confirmed `git rev-list --count
@@ -52,6 +71,11 @@ claim, which still stands, was kept).
   produces is invisible to `Restart=always` and a port check. **Mainline is the
   fleet-wide default now; this is F40, and it is the most consequential
   correction since the last full rewrite of this file.**
+
+**Session history — what merged when, and the reasoning behind each batch — is
+now in `docs/CHANGELOG.md`.** It used to sit between here and "NEXT TASKS" and
+was the main thing a cold reader had to wade through to reach the actionable
+part. Nothing was deleted, only moved.
 
 ---
 
@@ -140,295 +164,6 @@ detached tmux session named `cluster` is waiting on it. **The address is in
 ```bash
 ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'   # then: claude --continue
 ```
-
----
-
-## MERGED 2026-08-18 morning → afternoon, AFTER the entry below
-
-**~30 more commits landed after the batch documented below**, roughly
-06:36–12:34 on 2026-08-18 (`git log --format='%h %ci %s' 03fdee9..HEAD`
-gives the exact chain). In rough chronological order, the decision-relevant
-ones:
-
-- **Agent-hygiene hooks** (`95b2fac`). `.claude/hooks/cluster-guard.py`
-  now DENYs (blocks outright) `git add -A`, `git commit -a`, `pkill -f`, and
-  inline Python that fails to `compile()`, and GATEs (requires
-  `CLUSTER_OPS_CONFIRMED=1`, which only the operator sets) cluster service
-  control, mutating SQL against the live job store, `git push`, writes to
-  `/opt/models`, and git operations in the live checkout itself. Two
-  mechanism findings shaped it and are recorded in `docs/AGENT-HARDENING.md`,
-  not duplicated into `docs/FINDINGS.md`: hook `if:` matchers do best-effort
-  bash parsing and **fail open** on a parse failure, so the guard uses its
-  own `shlex` parsing instead of relying on one; and
-  `permissionDecision: "ask"` is a **silent allow** under
-  `--dangerously-skip-permissions` (there is no prompt to show), so the guard
-  downgrades GATE to DENY whenever the session cannot actually prompt.
-- **Multi-node, multi-service watchdog** (`3b07cf2`, `156c824`). The
-  single-node, single-service watchdog from the batch below was generalised
-  to cover `llama-server`, `rpc-server` and `missing-link` on both nodes,
-  each with its own liveness predicate (`docs/measurements.md`'s "Per-service
-  signals" table — the CPU-flat rule that works for `llama-server` would
-  falsely restart the other two, which are legitimately idle a lot of the
-  time).
-- **Retry-and-resume on backend failure** (`b7114cf`). A job whose inference
-  backend disappears mid-run now retries (up to a bounded attempt count)
-  rather than failing outright, reusing whatever chunk summaries already
-  persisted. **This is not hypothetical**: job `6c0358825609` hit exactly
-  this in production — see "Real production events" below.
-- **A revive route for terminal jobs** (`569d4ce`). `POST
-  /jobs/{id}/revive` lets an operator re-run a `failed`/`cancelled` job,
-  previewing what `db.revive_job`'s resume would actually reuse before
-  committing.
-- **F40: ik_llama.cpp reversed, mainline restored fleet-wide** (`4ba807d`,
-  `b419b60`, `9f417aa`). The single most consequential correction in this
-  window — see the header of this file and F40 in `docs/FINDINGS.md` for the
-  full mechanism (a forked-abort deadlock that hangs the server invisibly to
-  `Restart=always` and a port check).
-- **A two-model faithfulness audit ledger** (`f460cb3`), then **found not to
-  survive production scale** (`10f5b40`, F41) and **superseded by a
-  deterministic cascade** (`7a78d82`, F42) that caught a real fabrication in
-  production — see "Real production events" below. The audit ledger's
-  engineering (refuse-rather-than-degrade, two correctly-scoped hops) is
-  still sound per F41; its empirical justification for being wired in as a
-  safety net was not, and the deterministic cascade is what should actually
-  be trusted.
-- **Section-level citations on the reduce output** (`7c1266b`). The reduce
-  step is asked to tag each combined-summary paragraph with `[Section N]`
-  markers referencing the chunk(s) it drew from; resolved back to source
-  character offsets in code, not asked of the model a second time
-  (`CLAUDE.md`'s "never ask the model where something came from" rule,
-  applied). **Verified this session against a real completed job
-  (`18339bace8f0`)** — see "What is actually in flight right now" above: the
-  model did produce well-formed `[Section 1]`…`[Section 7]` markers on real
-  output. Citation *accuracy* (whether each marker is correct, not just
-  present) is still unverified.
-- **A real failure-history table, and an explicit-`accept` fix on file
-  uploads** (`94da7d7`). The job page now shows every failed attempt for a
-  job, not just its current status.
-- **Opt-in chunk-boundary snapping, default OFF** (`910c3d5`), plus the
-  research it rests on (`docs/chunking-research.md`) and a follow-up
-  measurement (`978c1e3`) finding the real document's chunk boundaries do
-  not in fact sever any clause pairs — but the corpus available cannot
-  answer the general question either way. Does not change default
-  behaviour; see "What is actually in flight" above for why this did not
-  need a service restart.
-- **Watchdog production hardening** (`5f7e1a1`): the node-2 `HOME`
-  unbound-variable bug (F43 below), a process-count tripwire for the
-  forked-abort hang (addendum to F40 below), and an opt-in synthetic
-  transaction (issue a tiny real completion and validate its content, not
-  just ask if the service is up) — left disabled
-  (`WATCHDOG_SYNTH_ENABLE=0`) while real jobs were running, per its own
-  commit message.
-
-**Test count over this window: 193 → 469**, per `git log` and reproduced
-this session (`.venv/bin/python -m pytest tests/ -q`, 469 passed). Per
-`CLAUDE.md`'s own standing rule, that is what ran, not evidence on its own —
-the concurrency, retry-and-resume and watchdog claims above are backed by
-reproduction and production evidence, cited where it exists, not by the
-count alone.
-
----
-
-## MERGED THIS SESSION (2026-08-17 late night → 2026-08-18 early morning) — historical, see above for what landed after it
-
-**All three feature agents from the previous entry finished, were independently
-verified, and are now on `main` — along with a fourth fix and a rewritten
-watchdog found along the way.** Nothing is awaiting merge. Five commits landed,
-in order:
-
-| Commit | What | Tests after |
-|---|---|---:|
-| `151ed32` | **fan-out across R inference endpoints** (`fbb7f4d`) merged together with **queue control + resumability** (`a41666e`, via `e9ca351`) | 145 |
-| `9f968a1` | **fixed a concurrency race in `db.init_chunks`** found only by the merge of the two branches above | 145 |
-| `8849fd0` | **rewrote the llama-server watchdog** (`5ba25d6`) + added finding **F39** | 145 (watchdog has no Python tests) |
-| `33ddc79` (`2c1be61`) | **live telemetry on the job page** + **per-workflow guidance input** | **193** |
-
-`git log --oneline` confirms the chain:
-
-```
-33ddc79 Merge branch 'worktree-agent-afe0a29dc429a3445'
-2c1be61 feat(ui): live telemetry on the job page, and per-workflow guidance input
-8849fd0 Merge branch 'worktree-agent-acde2185fb6ed82e2'
-5ba25d6 fix(watchdog): /health cannot judge liveness on this engine; use cgroup CPU progress
-9f968a1 fix(db): init_chunks raced under R workers and marked real jobs failed
-151ed32 Merge branch 'worktree-agent-a525fd5f262ad64fb' (fan out across R endpoints)
-e9ca351 Merge queue control + resumability
-fbb7f4d feat(worker): fan out across R inference endpoints
-a41666e feat(queue): cancel/reorder/cooperative-stop, and resume from persisted chunk summaries
-```
-
-**What each one actually does:**
-
-- **Fan-out (`151ed32`).** `main` runs one `_worker_loop` task per
-  `LLAMA_URLS` entry — **job-level** fan-out, deliberately, not chunk-level (see
-  Task 2 below for why that split matters and what is still owed).
-  Health-aware routing probes `/health` **before** claiming a job, so a dead
-  endpoint just stops claiming — costing 1/R of throughput — instead of
-  claim-then-immediately-fail. Per-endpoint status is surfaced on `/health` and
-  the index page.
-- **Queue control + resumability (`151ed32`, via `a41666e`).** Cancel a
-  pending job; reorder pending jobs (`POST /jobs/reorder`, applied on the next
-  claim); cooperative stop of a running job (checked between chunks and once
-  before reduce — it **cannot** interrupt an in-flight HTTP call, there is no
-  llama.cpp cancellation endpoint, so a stop lands after the current chunk).
-  **Chunk summaries now persist as each chunk completes** (`_persist_chunk` in
-  `worker.py`), not only after the whole document finishes — the bug that made
-  a 40-chunk job dying at chunk 39 restart from zero. **A resume is trusted
-  only if the recorded model AND the recorded instruction both match** what is
-  currently serving; on either mismatch it discards and restarts rather than
-  mixing outputs from two different runs. Notification is a `seen_at` flag +
-  unseen-jobs banner (`POST /jobs/ack`).
-- **`init_chunks` race (`9f968a1`).** The lazy check-then-`ALTER TABLE`
-  migration ran on every chunk write; safe with one worker, but main now runs
-  R concurrent workers and the loser of the race got `OperationalError:
-  duplicate column name: model`, which `run_one`'s broad except turned into a
-  **failed** job — a whole night of work marked dead by a migration that had
-  in fact succeeded. Reproduced 20/20 before the fix, 0/20 after (8 full-suite
-  runs, 0 failures). `init_db` is now the single complete migration entry
-  point for `jobs`, `chunk_summaries` and `batch_documents`; the six lazy
-  per-operation calls are gone. **Two agents (the fan-out one and the
-  queue-control one) found the shape of this independently** — neither branch
-  was wrong on its own, the race existed only in their combination, which is
-  why neither branch's own tests caught it.
-- **Watchdog rewrite (`8849fd0`, F39).** `/health`, `/slots` and `/metrics`
-  all post onto the **same task queue** `update_slots()` drains for token
-  generation, so none of them is an out-of-band signal — the F36 watchdog
-  restarted a perfectly healthy server mid-prefill on 2026-08-17 and destroyed
-  a job with 10m55s of completed work. **`/health`'s own slot counters read
-  `n_idle_slots=4 n_processing_slots=0` while the server was busiest prefilling
-  a document** — `3 idle / 1 processing` only showed up during the (much
-  shorter) generation phase. The rewritten watchdog instead reads the unit's
-  own `CPUUsageNSec` (cgroup-scoped, immune to other load on the box) and only
-  restarts after 300 s of unbroken **silent AND CPU-flat** evidence. Read F39
-  in `docs/FINDINGS.md` directly; it is the authoritative account and this
-  paragraph is a summary of it, not a replacement.
-- **Live telemetry + per-workflow guidance (`33ddc79`).** The job page now
-  shows chunk N of M, separate prefill/generation tok/s **derived from the
-  server's own `timings`, never wall-clock** (F17's lesson applied), a
-  three-tier labelled ETA (measured this job / measured this model /
-  estimated), and which endpoint actually ran the job — persisted to a new
-  `jobs.endpoint` column so a **failed** job still shows which node it died
-  on. Per-workflow guidance is a textarea **or** a file upload, extracted via
-  `extract.py`, **refused, not silently truncated**, against a measured size
-  cap (`check_instruction_length` in `worker.py` — see "Owed after the merge"
-  below, this is what closes that item). The resume check from the previous
-  bullet was extended in this commit to require the **instruction** to match,
-  not just the model.
-
-**Verified, not just counted:** 193 tests pass over the current tree
-(`.venv/bin/python -m pytest tests/ -q`, 8 seconds, 0 failures) — but per
-`CLAUDE.md`'s own standing rule, a test count is not evidence of working
-software on its own. The concurrency fix specifically was verified by
-reproduction (20/20 failures → 0/40), not merely by a passing suite, and the
-`init_db` migration was run twice against a **copy of the live**
-`/opt/missing-link/jobs.sqlite` — 8 job ids preserved, rows identical, second
-run a no-op.
-
-**Open item the UI agent raised and nobody has answered:** batch review rows
-and `jobs.document` are kept **forever**. For sensitive documents that is a
-policy decision, not a default to inherit.
-
-**"Owed after the merge" from the previous entry, updated:**
-
-- ~~Add a slot-budget guard~~ — **done, in a different form than described.**
-  `worker.check_instruction_length()` asserts the guidance text fits inside
-  `N_CTX_SLOT - CHUNK_TOKENS - MAP_MAX_TOKENS - wrapper` and fails loudly
-  rather than silently truncating. It guards the instruction budget, not a
-  live `/props` read of `n_ctx`/`total_slots` — that live-introspection form
-  was not built, so a future `-c`/`--parallel` change that shrinks
-  `N_CTX_SLOT` still needs to be caught by hand, the same way the original
-  `-c 16384` regression was.
-- `WORDS_PER_TOKEN = 0.70` is **still unmeasured, and this entry corrects the
-  previous one, which said a chunk-size sweep would land a real value here.**
-  The completed sweep (`docs/measurements.md`, "Chunk-size sweep" section)
-  measured wall-clock by `CHUNK_TOKENS`, not the words-per-token conversion
-  ratio itself — `chunk_size_driver.py` *consumes* `WORDS_PER_TOKEN` to turn
-  a token target into a word count, it does not calibrate it, and the
-  server's reported `prompt_n` is not directly comparable to the per-chunk
-  word count because it includes the surrounding prompt template. **Still
-  genuinely owed**, not in flight.
-
----
-
-## Real production events this session — not benchmarks, the actual system doing actual work
-
-- **The rewritten watchdog fired twice for real on node 1**, both against
-  genuine wedges, both confirmed directly from
-  `/var/lib/llama-watchdog/restarts.jsonl` this session (not carried over
-  from a commit message): `2026-08-18T09:13:23+10:00` and
-  `2026-08-18T11:05:43+10:00`, both `"reason":"wedged"`,
-  `streak_s` past the 300 s threshold (355 s), `/health` and `/props` both
-  silent, `cpu=0ms/10002ms(0%)`. Zero false restarts recorded in the same
-  file over the session.
-- **Job `6c0358825609` failed, retried and resumed unattended.** Confirmed
-  from `/opt/missing-link/jobs.sqlite` (read-only) this session: `attempts =
-  2`, `resumed_chunks = 4`, final `status = done`. Its stored error is
-  explicit about what happened: *"attempt 1 of 4 failed and will be retried
-  in 60s. The inference backend went away — this is not a problem with the
-  document. The 4 chunk summaries already completed are kept and will be
-  reused, so the retry resumes rather than restarts. Last error:
-  RemoteDisconnected."* This is the retry-and-resume feature (`b7114cf`)
-  doing exactly what it was built for, on a real backend failure, not a
-  test.
-- **The deterministic cascade caught a genuine fabrication in a real
-  summary** — F42. A reduce step asserted a death year present in none of
-  the five chunk summaries nor the source document; a plain number-in-span
-  check flagged it, no model was consulted to catch it. See F42 in
-  `docs/FINDINGS.md` for the full account.
-
----
-
-## Completed this session (was "in flight")
-
-**The 65 GB model copy to node 2 finished and was verified byte-identical**
-(md5 `c859460f5dab66969a9268e2eb551b6d` both ends, 1:33:39 at 11.09 MB/s), and the
-replication measurement ran on it. Both nodes now hold gpt-oss-120b.
-
-**Re-run the measurement with `./bench/replication-bench.sh`.** It stops
-`rpc-server` fleet-wide, starts one independent `llama-server` per node, drives
-concurrent load, and restores nothing — **restart the RPC workers afterwards** with
-`./cluster/install-services.sh` or `sudo systemctl start rpc-server@50052`
-(this session left them running).
-
-<details><summary>Original transfer instructions (kept for node 3+)</summary>
-
-**A 65 GB `rsync` of `gpt-oss-120b-F16.gguf`**, at a measured 11.18 MB/s (~97 min).
-Log: `/tmp/rsync-gptoss.log`.
-
-```bash
-# is it still going / did it finish?
-pgrep -af 'rsync -a --partial' ; tail -c 200 /tmp/rsync-gptoss.log
-ssh debian1@10.10.0.39 'ls -lh /opt/models/gpt-oss-120b/'   # want 65369017728 bytes
-# if interrupted, it resumes -- --partial --inplace, so just re-run:
-rsync -a --partial --inplace --info=progress2 \
-  /opt/models/gpt-oss-120b/gpt-oss-120b-F16.gguf \
-  debian1@10.10.0.39:/opt/models/gpt-oss-120b/
-```
-
-**Do not benchmark either node while this runs.** It reads 65 GB off node 1's
-disk, burns CPU on SSH crypto at both ends, and streams 65 GB through node 2's
-page cache — every one of which perturbs an inference measurement. It also
-saturates the link, which took RTT from 0.827 ms to 9.544 ms (F28).
-
-**When it completes, do this — it is the measurement the architecture rests on:**
-
-```bash
-# Independent llama-server per node. NO --rpc, NO --tensor-split: replication,
-# not sharding. ik_llama.cpp, because prefill is 79% of document wall-clock (F27).
-# -t 4 = PHYSICAL cores. --parallel 4, never 8.
-/opt/ik_llama.cpp/bin/llama-server -m /opt/models/gpt-oss-120b/gpt-oss-120b-F16.gguf \
-  -t 4 -c 4096 --parallel 4 --host 0.0.0.0 --port 8080   # on BOTH nodes
-
-# Then: single-node baseline, then both nodes concurrently, and compare
-# AGGREGATE tokens/sec. Expect ~2x. Record in docs/measurements.md.
-```
-
-Watch for: ik_llama.cpp's CLI **differs from mainline** (`-no-cnv` does not
-exist, and there is **no `--no-webui`**), and it reports gpt-oss as `?B` rather
-than `120B` — output is still correct, but **re-verify coherence per model** (F27).
-Vary the prompt between runs or you measure the prompt cache (F17).
-
-</details>
 
 ---
 
@@ -633,7 +368,7 @@ sudo ./provisioning/setup.sh node2
 ### 2. Missing Link fan-out across R endpoints — DONE (job-level), two sub-items still owed
 
 **The main outstanding code change from the previous entry landed** (see
-"MERGED THIS SESSION" above, `151ed32` and `33ddc79`). `missing_link/worker.py`
+"MERGED THIS SESSION" in `docs/CHANGELOG.md`, `151ed32` and `33ddc79`). `missing_link/worker.py`
 no longer targets a single `base_url`; `app.py`'s lifespan starts one
 `_worker_loop` task per `LLAMA_URLS` entry, each claiming jobs independently
 against `db.claim_next_pending` (already atomic under concurrency —
@@ -846,60 +581,6 @@ of seconds of silent waiting against this backend. Compare on wall-clock
 
 ---
 
-## Joining a node
-
-**Use the same username as the coordinator (`debian1`).** Not strictly required,
-but the systemd unit, `scp`/`rsync` targets and every `ssh` in the scripts all
-assume it. A different username means editing all of them.
-
-**Generate these with `./provisioning/join-node.sh` on the coordinator** rather
-than copying from here — it substitutes the real key and LAN IP, so it cannot go
-stale. The listing below is what it prints today.
-
-On the new machine:
-
-```bash
-# 1. Same username as the coordinator
-sudo adduser debian1                     # skip if it already exists
-
-# 2. Passwordless sudo. Append to /etc/sudoers, NOT a sudoers.d drop-in --
-#    sudo is last-match-wins, and a later "(ALL:ALL) ALL" line silently
-#    overrides a NOPASSWD rule in sudoers.d. This bit us on node 1 (F9).
-echo "debian1 ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
-
-# 3. SSH server
-sudo apt-get install -y openssh-server
-sudo systemctl enable --now ssh
-
-# 4. Authorise the coordinator's key
-sudo -u debian1 mkdir -p /home/debian1/.ssh
-sudo -u debian1 tee -a /home/debian1/.ssh/authorized_keys <<'KEY'
-<PASTE THE COORDINATOR'S PUBLIC KEY -- run ./provisioning/join-node.sh to print it>
-KEY
-sudo chmod 700 /home/debian1/.ssh
-sudo chmod 600 /home/debian1/.ssh/authorized_keys
-
-# 5. Report the LAN IP
-ip -br addr | grep -v LOOPBACK
-```
-
-Coordinator is `10.10.0.34/24`, gateway `10.10.0.254`. Everything after this the
-coordinator can do over SSH.
-
-**Then harden it — key-only, once keys are confirmed working:**
-
-```bash
-./provisioning/harden-ssh.sh <node-ip>
-```
-
-It verifies key auth from the coordinator **before** disabling password auth,
-validates the sshd config with `sshd -t` before restarting, and re-checks
-reachability afterwards. If any check fails it reverts and changes nothing —
-locking yourself out of a headless box in a locked cupboard is the failure mode
-this exists to prevent.
-
----
-
 ## Where things stand
 
 **Node 1 (coordinator, user `debian1`, `10.10.0.34`)** and **node 2 (worker /
@@ -962,6 +643,88 @@ aggregate replication measurement, the chunk-size sweep at `-c 32768`
 (`docs/measurements.md`), the extended sweep at `-c 65536` (numbers on disk,
 not yet written up), the engine reversal to mainline (F40), and the
 citation-format check against a real job.
+
+---
+
+## Real production events this session — not benchmarks, the actual system doing actual work
+
+- **The rewritten watchdog fired twice for real on node 1**, both against
+  genuine wedges, both confirmed directly from
+  `/var/lib/llama-watchdog/restarts.jsonl` this session (not carried over
+  from a commit message): `2026-08-18T09:13:23+10:00` and
+  `2026-08-18T11:05:43+10:00`, both `"reason":"wedged"`,
+  `streak_s` past the 300 s threshold (355 s), `/health` and `/props` both
+  silent, `cpu=0ms/10002ms(0%)`. Zero false restarts recorded in the same
+  file over the session.
+- **Job `6c0358825609` failed, retried and resumed unattended.** Confirmed
+  from `/opt/missing-link/jobs.sqlite` (read-only) this session: `attempts =
+  2`, `resumed_chunks = 4`, final `status = done`. Its stored error is
+  explicit about what happened: *"attempt 1 of 4 failed and will be retried
+  in 60s. The inference backend went away — this is not a problem with the
+  document. The 4 chunk summaries already completed are kept and will be
+  reused, so the retry resumes rather than restarts. Last error:
+  RemoteDisconnected."* This is the retry-and-resume feature (`b7114cf`)
+  doing exactly what it was built for, on a real backend failure, not a
+  test.
+- **The deterministic cascade caught a genuine fabrication in a real
+  summary** — F42. A reduce step asserted a death year present in none of
+  the five chunk summaries nor the source document; a plain number-in-span
+  check flagged it, no model was consulted to catch it. See F42 in
+  `docs/FINDINGS.md` for the full account.
+
+---
+
+## Joining a node
+
+**Use the same username as the coordinator (`debian1`).** Not strictly required,
+but the systemd unit, `scp`/`rsync` targets and every `ssh` in the scripts all
+assume it. A different username means editing all of them.
+
+**Generate these with `./provisioning/join-node.sh` on the coordinator** rather
+than copying from here — it substitutes the real key and LAN IP, so it cannot go
+stale. The listing below is what it prints today.
+
+On the new machine:
+
+```bash
+# 1. Same username as the coordinator
+sudo adduser debian1                     # skip if it already exists
+
+# 2. Passwordless sudo. Append to /etc/sudoers, NOT a sudoers.d drop-in --
+#    sudo is last-match-wins, and a later "(ALL:ALL) ALL" line silently
+#    overrides a NOPASSWD rule in sudoers.d. This bit us on node 1 (F9).
+echo "debian1 ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
+
+# 3. SSH server
+sudo apt-get install -y openssh-server
+sudo systemctl enable --now ssh
+
+# 4. Authorise the coordinator's key
+sudo -u debian1 mkdir -p /home/debian1/.ssh
+sudo -u debian1 tee -a /home/debian1/.ssh/authorized_keys <<'KEY'
+<PASTE THE COORDINATOR'S PUBLIC KEY -- run ./provisioning/join-node.sh to print it>
+KEY
+sudo chmod 700 /home/debian1/.ssh
+sudo chmod 600 /home/debian1/.ssh/authorized_keys
+
+# 5. Report the LAN IP
+ip -br addr | grep -v LOOPBACK
+```
+
+Coordinator is `10.10.0.34/24`, gateway `10.10.0.254`. Everything after this the
+coordinator can do over SSH.
+
+**Then harden it — key-only, once keys are confirmed working:**
+
+```bash
+./provisioning/harden-ssh.sh <node-ip>
+```
+
+It verifies key auth from the coordinator **before** disabling password auth,
+validates the sshd config with `sshd -t` before restarting, and re-checks
+reachability afterwards. If any check fails it reverts and changes nothing —
+locking yourself out of a headless box in a locked cupboard is the failure mode
+this exists to prevent.
 
 ---
 

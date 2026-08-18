@@ -3,8 +3,9 @@
 **Turning the old computers an organisation already owns into a private LLM
 cluster for the work it legally cannot send offsite.**
 
-**Now:** connect seven unused office machines into a single cluster that does
-real work on real sensitive documents.
+**Now:** connect however many unused office machines are going spare — seven,
+in this build — into a single cluster that does real work on real sensitive
+documents.
 
 **Later:** package what that teaches into a Claude Skill, so an organisation
 without a specialist can do the same thing with whatever hardware it has.
@@ -24,9 +25,11 @@ Repurpose decommissioned hardware that an organisation has used in previous inst
 
 ## The cluster — the immediate deliverable
 
-**Seven Frankenstein's monster desktops — ~128 GB DDR4 ECC each, roughly 900 GB of pooled
-RAM — wired into one machine that can run models no single one of them could
-touch.** Fronted by **Missing Link**: an async job runner where slowness stops
+**Frankenstein's monster desktops — ~128 GB DDR4 ECC each, seven of them here
+for roughly 900 GB of pooled RAM — wired into one machine that can run models no
+single one of them could touch.** Seven is what this organisation had spare, not
+a number the design needs; it works the same at two or at twelve.
+Fronted by **Missing Link**: an async job runner where slowness stops
 being a defect. Submit documents, collect results later.
 
 These machines are made of the parts of many other machines sitting in a storeroom, 
@@ -95,7 +98,8 @@ sudo ./provisioning/setup.sh <hostname>   # idempotent
 | `STATUS.md` | **Start here.** Current phase, next tasks, open questions, log |
 | `docs/FINDINGS.md` | **Read second.** What running this on real hardware taught us — including several things the plan and spec got *wrong* |
 | `docs/measurements.md` | Every measured number. No performance claim may be quoted from anywhere else |
-| `CLAUDE.md` | The argument, conventions, standing constraints |
+| `CLAUDE.md` | The argument, conventions, standing constraints. Opens with the full file index |
+| `docs/REQUIREMENTS.md` | What the operator actually asked for, in their words — outranks older "settled" decisions |
 | `docs/MODEL-SELECTION.md` | Which model to run and why — criteria derived from measurement |
 | `docs/DESIGN-NOTES.md` | Analysed-but-not-built ideas, with the numbers |
 | `docs/UPSTREAM-PATCHES.md` | Corrections still to fold back into the plan and spec |

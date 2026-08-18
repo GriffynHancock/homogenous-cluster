@@ -9,6 +9,64 @@ observed directly), **REPORTED** (someone else states it), or **INFERRED**.
 
 ---
 
+## Index
+
+Every finding below, in **the order they appear in this file** — which is not
+numeric order: **F9 sits between F27 and F28**, where it was written, and an
+**Addendum to F40** sits between F42 and F43. Left as-is deliberately; the
+numbers are cited from other documents and must not move.
+
+| # | Finding | Label |
+|---|---|---|
+| **F1** | The "75% per-node RAM ceiling" is folklore — the citation is wrong and the issue is closed | CONFIRMED |
+| **F2** | An open, unmerged upstream bug specifically hits multi-worker RPC clusters | CONFIRMED / INFERRED |
+| **F3** | Model load is single-core serialized — a ~550 GB load will be slow | REPORTED |
+| **F4** | `--parallel > 1` asserts against the RPC backend (prompt cache) | REPORTED |
+| **F5** | Async/pipelined RPC is not coming soon | CONFIRMED |
+| **F6** | Pin recommendation: b10369 | CONFIRMED |
+| **F7** | Node 1 is a 4-core Broadwell with no AVX-512 — prefill is the risk | CONFIRMED |
+| **F8** | `GGML_NATIVE=ON` is a trap on a salvaged fleet | INFERRED |
+| **F10** | `-t $(nproc)` is the wrong value, and the plan bakes it in fleet-wide | CONFIRMED |
+| **F11** | Generation already runs at ~99% of memory bandwidth — software tuning is exhausted | CONFIRMED |
+| **F12** | Bandwidth is core-limited, not channel-limited — the CPU cannot saturate its own memory | CONFIRMED |
+| **F13** | `rpc-server` was renamed, and the binaries were not relocatable | CONFIRMED |
+| **F14** | RPC costs 5% on generation but 39% on prefill | CONFIRMED |
+| **F15** | `llama-cli` is conversation-first with a TUI — `-no-cnv` is not enough for scripting | CONFIRMED |
+| **F16** | Model B does not fit on the coordinator's DISK — disk, not RAM, is the binding constraint | CONFIRMED |
+| **F17** | The plan's TTFT measurement is wrong and reports ~0.015 s; real TTFT was 89 s | CONFIRMED |
+| **F18** | Raising `-ub` does not help CPU prefill — the spec's expectation was wrong | CONFIRMED |
+| **F19** | The 90 s TTFT threshold is the wrong gate for this project's actual workload | analysis from measured numbers |
+| **F20** | The plan's job-claim logic races and runs jobs twice | CONFIRMED |
+| **F21** | Reasoning models return EMPTY content when max_tokens runs out mid-thought | CONFIRMED |
+| **F22** | Two-worker RPC sharding WORKS on b10369 — bug #26500 does not fire here | CONFIRMED |
+| **F23** | Workers never read model files — only the coordinator needs the GGUF | CONFIRMED |
+| **F24** | Sparse MoE reaches only 61% of memory bandwidth — every MoE estimate was ~1.6x optimistic | CONFIRMED |
+| **F25** | Kimi K2 has the worst hallucination rate of any model checked — Model B needs reconsidering | REPORTED |
+| **F26** | Kimi K3 exists, and is firmly out of scope | CONFIRMED |
+| **F27** | ik_llama.cpp is 52% faster at prefill and 14% slower at generation — net +22% (later unsettled by F40) | CONFIRMED |
+| **F9** | Operational notes for the bring-up scripts *(out of numeric order — it sits here, after F27)* | CONFIRMED |
+| **F28** | The fleet network is 100 Mb/s, not gigabit — and that inverts a decision in F23 | CONFIRMED |
+| **F29** | Node 2 is a bandwidth twin — homogeneity is a MEASURED result, and it validates F10 independently | CONFIRMED |
+| **F30** | Five latent bugs sat in the bring-up path, and ALL of them fire only at N=2 | CONFIRMED |
+| **F31** | #26500 also clears across REAL machines — but the F21 empty-content bug made a passing cluster look broken | CONFIRMED |
+| **F32** | ik_llama.cpp was on the coordinator only, and `distribute.sh` could never have shipped it | CONFIRMED |
+| **F33** | ik_llama.cpp's `-sm graph` gives no cross-machine parallelism on CPU — the gate is a missing op | CONFIRMED / REPORTED |
+| **F34** | Missing Link had never been run — "41 tests passing" hid a silent truncation bug | CONFIRMED |
+| **F35** | There is no universal thinking-off switch; `enable_thinking` is INERT on gpt-oss and unknown kwargs are dropped silently | CONFIRMED |
+| **F36** | llama-server can hang ALIVE, and `Restart=always` cannot see it | CONFIRMED |
+| **F37** | How this project's concepts changed on 2026-08-17 — read before trusting older docs | record of conceptual drift |
+| **F38** | Uploaded PDFs were decoded as UTF-8 and summarised as binary — the first real input broke it | CONFIRMED |
+| **F39** | The F36 watchdog killed a healthy job in 79 minutes — `/health` shares the queue it is meant to probe | CONFIRMED |
+| **F40** | ik_llama.cpp fatal-errors on the 5th request of any multi-slot job and hangs the server — F36's real cause, and it unsettles F27 | CONFIRMED |
+| **F41** | A faithfulness classifier's reliability DEGRADES WITH EVIDENCE LENGTH; cross-model agreement stops being a safety net | CONFIRMED |
+| **F42** | The reduce step launders a fabrication into the final summary — caught by string comparison, not by a model | CONFIRMED |
+| **Addendum to F40** | Mainline shares the exact fork/waitpid abort path, so dropping ik_llama.cpp does NOT retire the forked-abort hang hazard | CONFIRMED |
+| **F43** | The fleet-wide watchdog was silently non-functional on node 2 from install | CONFIRMED |
+| **F44** | Even niced, a CPU-bound sidecar measurably starves `llama-server` on a 4-core node | CONFIRMED |
+| **F45** | The sentence splitter's line-based fallback distorts clause-marker density — and it now gates corpus decisions | CONFIRMED |
+
+---
+
 ## F1. The "75% per-node RAM ceiling" is folklore. The citation is wrong.
 
 **CONFIRMED.** This project has treated *"hard per-node ≤75% of physical RAM

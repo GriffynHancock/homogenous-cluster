@@ -3,45 +3,84 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > **If this file was injected into your system prompt, that copy is a snapshot
-> taken at session start and can be stale.** It has been rewritten mid-session
-> before, and the stale copy carried two claims that `docs/FINDINGS.md` proves
-> wrong. In a long session, or whenever a claim here matters, **re-read
-> `CLAUDE.md` from disk** and treat `docs/FINDINGS.md` as outranking both.
+> taken at session start and can be stale.** Re-read `CLAUDE.md` from disk
+> whenever a claim here matters, and treat `docs/FINDINGS.md` as outranking
+> both copies.
+>
+> **This has happened twice, and both times the snapshot was concretely wrong:**
+>
+> - **2026-08-17.** A cold-start agent was served a pre-rewrite snapshot still
+>   asserting *"a hard per-node ≤75% of physical RAM (llama.cpp #15055,
+>   unfixed)"* and *"`rpc-server -t` defaults to half the cores. Always set it
+>   from `nproc`."* **F1 refutes the first** — #15055 was a syscall-buffer-size
+>   bug, it is CLOSED not "unfixed", and it never implied a percentage-of-RAM
+>   rule. **F10 refutes the second** — `-t` must be PHYSICAL cores, and `nproc`
+>   is measurably slower on an SMT CPU. Both are corrected on disk below.
+> - **2026-08-18, live during the cold-start test that produced this note.**
+>   The injected copy said *"Run at most ONE Sonnet agent at a time... do not
+>   fan out"*, while the on-disk "Conventions" section below says the opposite:
+>   **fan out, up to about five at once, in separate git worktrees.**
+>
+> **Use that last one as your staleness self-test.** Scroll to "Conventions" in
+> the copy you are reading. If it says one agent at a time, your copy is stale
+> and nothing else in it can be trusted either — re-read the file from disk.
 
 
-## File index — read in this order
+## File index
+
+**Read these six, in this order. They are the whole orientation path.**
 
 | File | What it is | Authority |
 |---|---|---|
-| `STATUS.md` | **Start here.** Current state, next tasks in order, blockers | current |
-| `docs/FINDINGS.md` | What running this on hardware taught us, incl. what the plan got **wrong** | **outranks everything below** |
+| `STATUS.md` | **Start here.** What is running right now, the next task, blockers. Its first screen is designed to be enough | current |
+| `docs/FINDINGS.md` | Numbered findings from running this on hardware, incl. what the plan got **wrong**. **Indexed at the top** — scan the index, read the ones that touch your task | **outranks every other file** |
 | `docs/measurements.md` | Every measured number. **No performance claim may be quoted from anywhere else** | authoritative for numbers |
 | `network.md` | **Gitignored, site-specific.** IPs, node roles, ports, access. Read it; never commit it | current |
-| `CLAUDE.md` | This file — the argument, conventions, standing constraints | see staleness note above |
-| `docs/MODEL-SELECTION.md` | Which model to run and why; criteria derived from measurement | current |
-| `docs/DESIGN-NOTES.md` | Analysed-but-not-built ideas, with numbers (expert parallelism, speculative decoding, replication, why-not-RAG) | current |
-| `docs/EVALUATION.md` | Which datasets and faithfulness metrics to use, and why NOT to reproduce the hallucination leaderboard | current |
 | `docs/REQUIREMENTS.md` | **What the operator actually asked for, in their words.** Outranks older "settled" decisions | current |
-| `docs/AGENT-HARDENING.md` | Which agent operations are blocked/gated and why, and what a hook fundamentally cannot catch | current |
-| `docs/corpus-selection.md` | Ranked shortlist of public documents structurally matching real work product in the target sectors, with licences checked per source; demotes the ISM, promotes OAIC determinations, drops Hansard on licence grounds | current |
-| `docs/market-research.md` | What office workers actually use for document summarisation, and whether Missing Link's shape matches real user expectation | current |
-| `docs/chunking-research.md` | Research on whether/how document splitting matters for map-reduce summarisation | current |
-| `docs/chunk-boundary-measurement.md` | Measures how often a chunk cut severs a qualifying clause pair on the real corpus | current |
-| `docs/citation-research.md` | What an attributed/cited summary should look like; the design behind the reduce step's section-level citations | current |
-| `docs/faithfulness-cascade.md` | Deterministic checks (numbers/entities in span) that decide before any classifier is asked | current |
-| `docs/audit-ledger.md` | Maps a summary against its source and emits a machine-readable ledger of matches/misses | current |
-| `docs/audit-production-scale.md` | Whether the audit ledger's classifier survives production-length (4096-token) chunks — it does not (F41) | current |
-| `docs/two-scope-and-entity-index.md` | Two-scope hard checking (same claim vs. same entity) and a canonical entity index, built read-only against real output | current |
-| `docs/minicheck-spike.md` | Spike: does MiniCheck run fast enough on this hardware and survive negation | current |
-| `docs/watchdog-research.md` | Research behind the multi-node, out-of-band watchdog design — liveness, per-service signals | current |
-| `docs/UPSTREAM-PATCHES.md` | Corrections still to fold back into the plan and spec | current |
-| `provisioning/` | `join-node.sh`, `setup.sh`, `distribute.sh`, `harden-ssh.sh`, `build-*.sh`, `nodes.env`, `preseed.cfg` | — |
-| `cluster/` | `models.json` + `models.sh` (model index), `install-services.sh`, `rpc-server@.service` | — |
-| `bench/` | `overhead-test.sh`, `node-bench.sh`, `two-node-smoke.sh` | — |
-| `missing-link/` | The async job runner. Tests: `.venv/bin/python -m pytest tests/ -v` | — |
-| `docs/superpowers/specs/` | Original design; which alternatives were rejected and why | **partly stale** |
-| `docs/superpowers/plans/` | Original task-by-task plan | **stale — superseded by FINDINGS** |
+| `CLAUDE.md` | This file — the argument, conventions, standing constraints | see the staleness note above |
 
+**Everything below is looked up when you need that subject. It is not part of
+orientation and you are not expected to have read it.**
+
+### Working directories
+
+| Path | What is in it |
+|---|---|
+| `provisioning/` | `join-node.sh`, `setup.sh`, `distribute.sh`, `harden-ssh.sh`, `build-*.sh`, `nodes.env`, `preseed.cfg` |
+| `cluster/` | `models.json` + `models.sh` (model index), `install-services.sh`, `install-watchdog.sh`, the `llama-server@` / `rpc-server@` / `missing-link` / watchdog units |
+| `bench/` | `overhead-test.sh`, `node-bench.sh`, `two-node-smoke.sh`, `replication-bench.sh`, `chunk-size-bench.sh` |
+| `missing-link/` | The async job runner. Tests: `cd missing-link && .venv/bin/python -m pytest tests/ -q` |
+
+### Project-level references
+
+| File | Read it when |
+|---|---|
+| `README.md` | you want the public framing — it is what a GitHub visitor reads first |
+| `docs/CHANGELOG.md` | you need the session-by-session merge history that used to sit at the top of `STATUS.md` |
+| `docs/UPSTREAM-PATCHES.md` | folding corrections back into the plan and spec |
+| `docs/MODEL-SELECTION.md` | choosing, or defending, which model to run |
+| `docs/DESIGN-NOTES.md` | tempted by expert parallelism, speculative decoding, replication or RAG — analysed with numbers, not built |
+| `docs/AGENT-HARDENING.md` | a `PreToolUse` hook blocked you, or you are changing what is blocked/gated |
+| `docs/superpowers/specs/` | checking whether an alternative was already rejected, and why — **partly stale** |
+| `docs/superpowers/plans/` | historical task-by-task plan — **stale, superseded by FINDINGS** |
+
+### Subject research and analysis — open the one matching what you are about to do
+
+| File | Subject |
+|---|---|
+| `docs/EVALUATION.md` | which datasets and faithfulness metrics to use, and why NOT to reproduce the hallucination leaderboard |
+| `docs/corpus-selection.md` | ranked shortlist of public documents structurally matching real work product, licences checked per source |
+| `docs/chunking-research.md` | whether and how document splitting matters for map-reduce summarisation |
+| `docs/chunk-boundary-measurement.md` | how often a chunk cut severs a qualifying clause pair on the real corpus |
+| `docs/citation-research.md` | what an attributed summary should look like; the design behind the reduce step's section-level citations |
+| `docs/faithfulness-cascade.md` | deterministic checks (numbers/entities in span) that decide before any classifier is asked |
+| `docs/audit-ledger.md` | mapping a summary against its source into a machine-readable ledger of matches/misses |
+| `docs/audit-production-scale.md` | whether that ledger's classifier survives production-length (4096-token) chunks — it does not (F41) |
+| `docs/two-scope-and-entity-index.md` | two-scope hard checking (same claim vs. same entity) and a canonical entity index |
+| `docs/minicheck-spike.md` | does MiniCheck run fast enough on this hardware, and does it survive negation |
+| `docs/watchdog-research.md` | the multi-node, out-of-band watchdog design — liveness, per-service signals |
+| `docs/market-research.md` | what office workers actually use for document summarisation, and whether Missing Link's shape matches |
+| `docs/upstream-ik-2186-draft.md` | the drafted, **not yet filed**, upstream report of the ik_llama.cpp multi-slot fatal error (F40) |
 
 ## Homogenous Cluster
 
@@ -406,11 +445,18 @@ seen its output.
 **A faster build or config that changes output is not a win.** Any performance
 change must be paired with a coherence check on real output before adoption.
 
-Missing Link does have tests: `cd missing-link && .venv/bin/python -m pytest tests/ -v`
-(552 tests as of 2026-08-18, reproduced in this session — 0 failures, 25s). **But a
-test count is not evidence of working
-software:** 41 tests passed against a pipeline that had never processed a single
-document (F34). Every defect since lived in the seam between our code and something
+Missing Link does have tests. Run them from the repo root:
+
+```bash
+cd missing-link && .venv/bin/python -m pytest tests/ -q
+```
+
+552 tests as of 2026-08-18 (0 failures, 25s). The `.venv` is gitignored and
+exists only in the main checkout — an agent worktree does not have one, so
+create one there if you need to run the suite from a worktree.
+
+**But a test count is not evidence of working software:** 41 tests passed
+against a pipeline that had never processed a single document (F34). Every defect since lived in the seam between our code and something
 real — SQLite locking, the model's output shape, `finish_reason`, PDF bytes, a
 wedged server. **Report what was exercised, not how many assertions ran.**
 
