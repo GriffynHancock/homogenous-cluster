@@ -198,6 +198,24 @@ behind the work it was checking, a validation at the wrong scale. None were
 caught by more tests. All needed the real thing, at the real size, under real
 conditions.
 
+**A benchmark corpus of real public documents now exists** — legislation, NIST
+standards, and regulator determinations, not the two long narrative texts every
+earlier measurement had to make do with — so the project can finally test claims
+against material that resembles what it's actually for, instead of what happened
+to have been uploaded.
+
+**The faithfulness cascade caught a real fabrication in a real summary**, not a
+constructed test case: a reduce step asserted a death year that was present in
+none of the source chunks and none of the source document — historically
+correct for the person named, which is exactly what made it dangerous, and
+exactly why the check that caught it was a plain number-in-source-span test,
+not a model asked to judge itself.
+
+**Chunk size is now measured, not inherited.** The 4096-token default the
+pipeline already used turns out to be the actual optimum — wall-clock is
+U-shaped around it, and raising it further costs real time even when the extra
+room goes unused.
+
 Full detail in `docs/FINDINGS.md`; every number in `docs/measurements.md`.
 
 **Skill:** not started, and deliberately so — it gets written once the cluster

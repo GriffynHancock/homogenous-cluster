@@ -221,3 +221,88 @@ unchanged and still stand.
 *not* hooked, and — most important for the Skill — **what a hook fundamentally cannot
 catch.** The off-by-one SQL predicate is genuinely uncatchable by any command pattern;
 it needs a row-count-asserting helper script that does not exist yet.
+
+---
+
+## 2026-08-18 — provenance and licence must be captured AT INGESTION, as a control
+
+> *"when ingesting a text, maybe for a real org version it would need a security
+> control in the form of a text box to put in details about the original copyright
+> and licence, etc. and a link to where it is from (or a file pwd if from a shared
+> drive)."*
+
+**Decomposed:**
+
+1. **This is a control, not a courtesy.** The operator's own word is "security
+   control" — something the system requires and validates, not a field a user is
+   free to leave blank. That framing matters: it means "captured somewhere, if
+   someone remembers" does not satisfy the requirement, however good the intentions.
+2. **Two distinct pieces of information, both wanted at ingestion time, before any
+   transformation happens:**
+   - **Licence and copyright terms** — what the organisation is actually permitted
+     to do with this document once it has been chunked, summarised, or otherwise
+     transformed by the pipeline.
+   - **Source** — a link if it came from the web, or a file path if it came from a
+     shared drive — so a summary can be traced back to the system of record it came
+     from, not just to a title typed in by whoever uploaded it.
+
+**Why this has real weight, not cosmetic weight — the evidence is already in this
+repo.** `docs/corpus-selection.md` (built the same day, loaded into this benchmark's
+own document store) found that **Hansard is CC BY-NC-ND**, and that the **NoDerivs**
+term is a genuine, live conflict with this specific pipeline: *"chunking a document
+and feeding it through a summarisation pipeline that emits a transformed output is
+difficult to characterise as anything other than a derivative work"* (`corpus-
+selection.md`, Q6 table, Hansard row — "the most legally uncertain item assessed in
+this document for this project's specific use case"). That is not a hypothetical
+edge case dreamed up for this entry — it is a licence this project's own corpus
+research flagged as actually incompatible with what Missing Link does to a document.
+**An organisation feeding its own licensed material — a purchased standard, a
+publisher's guidance document, a vendor's manual — into a summariser needs to know
+whether it is permitted to transform that document *before* it transforms it, not
+discover the conflict afterwards.** ND-licensed standards and publisher material of
+exactly this kind are common outside this one corpus; Hansard is the instance that
+happened to surface the problem, not the only one that has it.
+
+**What already exists, and why it is a convention, not a control.**
+`missing_link/corpus.py`'s `corpus_documents` table already has a free-text `note`
+column, and the agent that fetched the benchmark corpus used it, by discipline, to
+record source URL, retrieval date, version, and licence for each document (visible
+in the live `note` field on several rows in `/opt/missing-link/jobs.sqlite`). **That
+is a convention someone chose to follow, not something the system requires or
+checks.** Nothing validates that `note` is filled in, nothing parses it into
+queryable fields, nothing refuses an upload that omits it, and nothing distinguishes
+"licence recorded" from "licence blank" on the corpus page's own listing. A future
+upload with an empty `note` is accepted exactly the same way as one that documents
+its licence in full.
+
+**What an actual control would look like, sketched, not built:**
+
+- **Required fields at upload/ingestion time**, not an optional free-text box:
+  a copyright/licence field the uploader must fill in (or explicitly mark
+  "unknown" / "internal, no external licence"), and a source field that is either
+  a URL or a file path, not blank.
+- **A positive affirmation**, not a default. If the operator's own quantisation
+  ceiling requirement (elsewhere in this file) is a precedent, the pattern is: the
+  system should not assume a document is fine to chunk and transform — the uploader
+  should have to say so, the same way the ND-licence conflict above shows that
+  assumption can be wrong.
+- **Surfaced on the record, not buried.** The corpus page (or, for the product, the
+  document table `docs/REQUIREMENTS.md`'s 2026-08-17 entry describes) should show
+  licence/source status per row, the same way it already shows a usability verdict
+  per row.
+
+**This is not only a benchmark-corpus concern — it applies to the product.** A real
+organisation ingesting its own documents needs the same two fields for a different
+reason than licence compliance: **knowing which system of record a summary came
+from.** A summary of "the March incident report" is only as trustworthy as knowing
+which file, in which shared drive, at which version, it was actually drawn from —
+the same provenance problem, arrived at from the operational side rather than the
+legal side.
+
+**Status: NOT BUILT.** No required fields, no validation, no positive affirmation,
+no per-row licence/source display exist anywhere in `missing_link/` today. The
+`note` field is real, present in the schema, and was used well by the corpus-fetch
+agent this session — but it is a convention that happened to be followed once, not
+a control the system enforces. Do not read this entry as "mostly done, needs
+polish" — the gap between what exists and what was asked for is the whole gap
+between an optional text box and a control.

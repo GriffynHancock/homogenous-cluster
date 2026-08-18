@@ -23,6 +23,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `docs/EVALUATION.md` | Which datasets and faithfulness metrics to use, and why NOT to reproduce the hallucination leaderboard | current |
 | `docs/REQUIREMENTS.md` | **What the operator actually asked for, in their words.** Outranks older "settled" decisions | current |
 | `docs/AGENT-HARDENING.md` | Which agent operations are blocked/gated and why, and what a hook fundamentally cannot catch | current |
+| `docs/corpus-selection.md` | Ranked shortlist of public documents structurally matching real work product in the target sectors, with licences checked per source; demotes the ISM, promotes OAIC determinations, drops Hansard on licence grounds | current |
+| `docs/market-research.md` | What office workers actually use for document summarisation, and whether Missing Link's shape matches real user expectation | current |
+| `docs/chunking-research.md` | Research on whether/how document splitting matters for map-reduce summarisation | current |
+| `docs/chunk-boundary-measurement.md` | Measures how often a chunk cut severs a qualifying clause pair on the real corpus | current |
+| `docs/citation-research.md` | What an attributed/cited summary should look like; the design behind the reduce step's section-level citations | current |
+| `docs/faithfulness-cascade.md` | Deterministic checks (numbers/entities in span) that decide before any classifier is asked | current |
+| `docs/audit-ledger.md` | Maps a summary against its source and emits a machine-readable ledger of matches/misses | current |
+| `docs/audit-production-scale.md` | Whether the audit ledger's classifier survives production-length (4096-token) chunks — it does not (F41) | current |
+| `docs/two-scope-and-entity-index.md` | Two-scope hard checking (same claim vs. same entity) and a canonical entity index, built read-only against real output | current |
+| `docs/minicheck-spike.md` | Spike: does MiniCheck run fast enough on this hardware and survive negation | current |
+| `docs/watchdog-research.md` | Research behind the multi-node, out-of-band watchdog design — liveness, per-service signals | current |
 | `docs/UPSTREAM-PATCHES.md` | Corrections still to fold back into the plan and spec | current |
 | `provisioning/` | `join-node.sh`, `setup.sh`, `distribute.sh`, `harden-ssh.sh`, `build-*.sh`, `nodes.env`, `preseed.cfg` | — |
 | `cluster/` | `models.json` + `models.sh` (model index), `install-services.sh`, `rpc-server@.service` | — |
@@ -377,7 +388,14 @@ Standing constraints when writing anything that touches the cluster:
   `-c 32768` for 8192/slot. A short test document never reveals this; a real one
   overflows. **Diagnostic:** the server logs `n_ctx_slot=N` per slot at startup —
   `journalctl -u llama-server@8080 | grep n_ctx_slot`. Check it against
-  `CHUNK_TOKENS`, do not infer it from `-c`.
+  `CHUNK_TOKENS`, do not infer it from `-c`. **`CHUNK_TOKENS=4096` and `-c 32768`
+  are now measured optima, not just headroom-sufficient defaults** — a real
+  map-reduce sweep against the real pipeline found wall-clock U-shaped in
+  `CHUNK_TOKENS` with a minimum at 4096, and a follow-up control found that
+  raising `-c` past what 4096 needs (`-c 65536`, `n_ctx_slot=16384`) costs **33%
+  more wall-clock on the identical chunking**, not a wash — larger context is not
+  free even when unused. See `docs/measurements.md`, "Chunk-size sweep" and
+  "Chunk-size sweep, extended". Do not raise `-c` for headroom alone.
 
 ## Verification
 
@@ -389,7 +407,8 @@ seen its output.
 change must be paired with a coherence check on real output before adoption.
 
 Missing Link does have tests: `cd missing-link && .venv/bin/python -m pytest tests/ -v`
-(75 tests as of 2026-08-17). **But a test count is not evidence of working
+(552 tests as of 2026-08-18, reproduced in this session — 0 failures, 25s). **But a
+test count is not evidence of working
 software:** 41 tests passed against a pipeline that had never processed a single
 document (F34). Every defect since lived in the seam between our code and something
 real — SQLite locking, the model's output shape, `finish_reason`, PDF bytes, a
