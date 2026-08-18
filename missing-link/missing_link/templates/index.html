@@ -13,7 +13,13 @@
   <legend>Batch upload — multiple files, pick workflows per file</legend>
   <form method="post" action="/batch" enctype="multipart/form-data">
     <label for="files">Document files (select several at once)</label>
-    <input type="file" name="files" id="files" multiple required>
+    <input type="file" name="files" id="files" multiple required accept="{{ accept }}">
+    <p class="hint">Accepts PDF (with a text layer) or plain text — .txt, .md,
+      .csv. If a file you expect doesn't appear in the picker, macOS hides
+      file extensions by default and TextEdit saves as .rtf unless you choose
+      Format → Make Plain Text, so check the file really is plain text (Get
+      Info); your file browser's "All Files" option always lets you pick it
+      anyway — the server checks the actual content, not the name.</p>
     <p class="hint">Each file is checked and previewed on the next page, where
       you tick which workflow(s) — summarise / report / Q&amp;A — to run on
       each one. A refused file (e.g. a scanned PDF with no text layer) does not
@@ -30,7 +36,9 @@
       {% for k in kinds %}<option value="{{ k }}">{{ k }}</option>{% endfor %}
     </select>
     <label for="upload">Document file</label>
-    <input type="file" name="upload" id="upload">
+    <input type="file" name="upload" id="upload" accept="{{ accept }}">
+    <p class="hint">Accepts PDF (with a text layer) or plain text — .txt, .md,
+      .csv — or paste below instead.</p>
     <label for="document">…or paste text</label>
     <textarea name="document" id="document" placeholder="Paste the document here."></textarea>
 
@@ -42,8 +50,8 @@
       <label for="instruction_{{ k }}_single">Guidance for “{{ k }}”</label>
       <textarea name="instruction_{{ k }}" id="instruction_{{ k }}_single"
         placeholder="Optional guidance for the {{ k }} task…"></textarea>
-      <label for="guidance_file_{{ k }}_single">…or a guidance file for “{{ k }}”</label>
-      <input type="file" name="guidance_file_{{ k }}" id="guidance_file_{{ k }}_single">
+      <label for="guidance_file_{{ k }}_single">…or a guidance file for “{{ k }}” (same formats: PDF or plain text)</label>
+      <input type="file" name="guidance_file_{{ k }}" id="guidance_file_{{ k }}_single" accept="{{ accept }}">
     {% endfor %}
 
     <button type="submit">Queue it</button>
