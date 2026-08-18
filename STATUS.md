@@ -1,12 +1,23 @@
 # Status
 
-**Updated:** 2026-08-18 (early morning — post-merge session)
-**Phase:** **N=2. Node 2 joined, provisioned, characterised and serving.** Both
-engines distributed fleet-wide. **Upstream bug #26500 gate PASSED across real
-machines.** Missing Link **fans out across R inference endpoints, supports queue
-control and resumable chunk-level persistence, and has live per-job telemetry**
-(193 tests). **A chunk-size benchmark is running on node 2 right now** — see the
-box immediately below before doing anything else.
+**Updated:** 2026-08-18 (afternoon)
+**Phase:** **N=2. Node 2 joined, provisioned, characterised and serving.**
+**The engine choice has flipped and flipped back: both nodes now run MAINLINE
+llama.cpp fleet-wide** (`/opt/llama.cpp/bin`), not ik_llama.cpp — see F40 below
+and the "Engine" row in "Where things stand". ik_llama.cpp stays installed
+side by side and its former `/etc/default/llama-server` is backed up at
+`/etc/default/llama-server.ik.bak` on both nodes (confirmed on node 1 this
+session; brief-reported, not independently re-checked, for node 2). **Upstream
+bug #26500 gate PASSED across real machines.** Missing Link has grown a lot
+since the last full rewrite of this file: fan-out across R endpoints, queue
+control, resumable chunk-level persistence, automatic retry-and-resume on
+backend failure, live per-chunk telemetry with separate prefill/generation
+rates, per-workflow guidance (text or file), section-level citations on the
+reduce output, a revive route, a per-job failure-history table, and a
+deterministic faithfulness cascade — **469 tests** (`.venv/bin/python -m
+pytest tests/ -q`, confirmed passing this session). **44 findings** in
+`docs/FINDINGS.md`. **50 commits are unpushed to `origin/main`** (confirmed
+`git rev-list --count origin/main..main` after an explicit `fetch`).
 **Repo:** https://github.com/GriffynHancock/homogenous-cluster
 
 **THE REPLICATION MEASUREMENT IS DONE, AND IT PASSES.** Aggregate throughput
@@ -15,59 +26,85 @@ across two independent `llama-server`s running gpt-oss-120b: **~1.8× on two nod
 request; 1.62×/1.55× raw). **The replication-first architecture is validated on
 real hardware.** Full detail and caveats in `docs/measurements.md`.
 
-**Two corrections to long-standing assumptions, both from measurement:**
+**A measured chunk-size sweep displaces a throughput assumption that had stood
+since the plan.** "Chunk size barely matters for map-reduce" was true for
+*quality* (its actual source, BooookScore) and is now known to be **wrong for
+*wall-clock* by 1.85×** between the worst and best size tested, on the real
+pipeline against the real 97,299-char document. **4096 tokens — the value
+`worker.py` already used — is the measured optimum.** Full table and mechanism
+in `docs/measurements.md`, "Chunk-size sweep" section; the stale throughput
+claim in `worker.py`'s comments has been corrected this session (the quality
+claim, which still stands, was kept).
+
+**Corrections to long-standing assumptions, from measurement:**
 
 - **The network is 100 Mb/s, not gigabit** (93.8 Mbit/s measured). Both NICs are
   gigabit and the switch is the cap. This **inverts** F23's peer-pull preference
   and qualifies the expert-parallelism comms analysis. See **F28**.
 - **`nodes.env` had node 1's RAM as 125629 MB, which `free -m` does not report**
   (128709 on both nodes). Corrected — it sets `--tensor-split` ratios. See F29.
+- **ik_llama.cpp fatal-errors on the 5th request of any `--parallel 4` job** —
+  a 100% failure rate on any document longer than four chunks, and the hang it
+  produces is invisible to `Restart=always` and a port check. **Mainline is the
+  fleet-wide default now; this is F40, and it is the most consequential
+  correction since the last full rewrite of this file.**
 
 ---
 
-## ⚠ TWO THINGS IN FLIGHT RIGHT NOW — read before touching node 2 or restarting Missing Link
+## What is actually in flight right now — read before assuming anything from an older copy of this file
 
-1. **A chunk-size benchmark is RUNNING ON NODE 2 as of this session.**
-   `llama-server@8080` is up on node 2 and `rpc-server@50052` there is
-   **deliberately stopped** for the duration (confirmed:
-   `systemctl is-active llama-server@8080 rpc-server@50052` on node 2 returns
-   `active` / `inactive`). **Do not start `rpc-server@50052` on node 2, do not
-   stop `llama-server@8080` there, and do not run anything else against node 2
-   that contends for the CPU** until the sweep finishes. **Whoever picks this up
-   next must restart the RPC worker on node 2** (`sudo systemctl start
-   rpc-server@50052` on node 2, or re-run `./cluster/install-services.sh`) once
-   it is done, or node 2 is silently missing from any future sharding/RPC work.
-   The bench agent owns `bench/` and `docs/measurements.md`; its results land
-   there, not here.
+**Two things this file's previous version described as "in flight" have
+finished. Verified from the live system this session, not carried over from
+the previous entry:**
 
-2. **`missing-link.service` on node 1 is still running the code it loaded
-   BEFORE tonight's five merges.** It has been up since 23:28 the evening
-   before (`systemctl status missing-link.service` shows `Active: active
-   (running) since Mon 2026-08-17 23:28:27`), which predates all five merge
-   commits below. It only picks up the new code — fan-out, queue control,
-   resumability, the db-race fix, live telemetry, per-workflow guidance — on
-   **restart**, and that restart is also the thing that migrates the **live**
-   database. Checked directly against `/opt/missing-link/jobs.sqlite`
-   (`PRAGMA table_info`): `jobs` genuinely lacks `priority`, `cancel_requested`,
-   `seen_at` and `endpoint`; `chunk_summaries` genuinely lacks `model`,
-   `instruction`, `prompt_n`, `prompt_ms`, `predicted_n`, `predicted_ms` and
-   `completed_at`. **This restart has deliberately NOT been done this session**
-   — the fan-out worker loop only starts on process start, and starting it
-   while node 2's benchmark owns node 2's `llama-server` would pull node 2 into
-   the job queue as an inference endpoint mid-sweep, contaminating the
-   benchmark. **Restart `missing-link.service` only after the node-2 benchmark
-   above is done and its RPC worker is back**, and expect the first request
-   after restart to pay the one-time `_add_missing_columns` migration (fast,
-   additive, idempotent — see `db.py`, F-shape guard tested in
-   `test_db.py`).
+1. **The `-c 65536` extended chunk-size sweep on node 2 has FINISHED.**
+   `bench/out/chunk-size-bench-c65536/results.json` has a complete `status:
+   "ok"` row for all three sizes tested (4096, 8192, 12288), and its driver
+   process is no longer running. **Its numbers are deliberately not written up
+   in `docs/measurements.md` yet** — that write-up belongs to whoever owns
+   `bench/` next; see that file's note not to quote them from elsewhere in the
+   meantime. Node 2's `rpc-server@50052` should be checked and restarted if
+   still stopped from the sweep — **not verified this session**, because
+   restarting a cluster service is out of scope for the agent that wrote this
+   update; check `systemctl is-active rpc-server@50052` on node 2 before
+   assuming it is back.
+2. **The citation-test job (`18339bace8f0`) has FINISHED, not "in flight."**
+   Read directly from `/opt/missing-link/jobs.sqlite` (read-only) this
+   session: `status = done`, 7 chunks, finished
+   `2026-08-18T03:09:43+00:00`. **Its result DOES contain `[Section 1]`
+   through `[Section 7]` markers, one per chunk, in order** — so on this real
+   document the model complied with the citation instruction. This is **not**
+   a citation-accuracy audit (whether each marker points at the right
+   underlying content was not checked here) — it only establishes that the
+   model follows the instructed format on real output, which was previously
+   unverified. A citation-accuracy pass is still owed.
+
+**The service-restart gap the previous version of this file warned about is
+now closed, and this WAS checked this session.** `systemctl show
+missing-link --property=ActiveEnterTimestamp` reads **`Tue 2026-08-18
+11:53:31 AEST`**, which is after fan-out (`151ed32`, 06:36), resumability and
+retry (`a41666e`/`b7114cf`, 06:24/07:48), live telemetry (`2c1be61`, 07:09)
+and citations (`7c1266b`, 08:46) — all of it is live in the running process,
+not just on disk. (Consistent with this: job `18339bace8f0` was claimed 10
+seconds after that restart.) Three later commits — opt-in boundary snapping
+(default OFF, so this does not change default behaviour), the faithfulness
+cascade (an offline script, not wired into any route) and a chunk-boundary
+measurement doc — landed after the restart but do not require one. **Next
+restart should still be treated as the thing that would pick up whatever
+lands after this entry**, this is just recording that the gap flagged
+previously has actually been closed, not assuming it away.
 
 ---
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **38 findings** from running this on real
+1. **Read `docs/FINDINGS.md`.** **44 findings** from running this on real
    hardware. Several correct the plan or the spec — **and F28 corrects this file
-   and F23.** Do not trust the original plan's numbers over these.
+   and F23; F40 reverses the ik_llama.cpp recommendation fleet-wide; F39/F43
+   correct the watchdog's own design twice, once for what it was probing and
+   once for a bug in the probe itself.** Do not trust the original plan's
+   numbers over these, and do not trust an older copy of this file's engine
+   choice — it changed.
 2. `docs/measurements.md` is the only place performance numbers may be quoted
    from.
 3. `docs/UPSTREAM-PATCHES.md` lists the concrete corrections still to fold back
@@ -79,9 +116,16 @@ real hardware.** Full detail and caveats in `docs/measurements.md`.
    numbers. Never report a step done without having seen its output.
 
 **Everything is built and working on nodes 1 AND 2.** llama.cpp b10369 at
-`/opt/llama.cpp/bin` and ik_llama.cpp at `/opt/ik_llama.cpp/bin` **on both**,
-models in `/opt/models`, Missing Link in `missing-link/` (coordinator only).
-`rpc-server@50052` is **active on both nodes** at `-t 4` as user `cluster`.
+`/opt/llama.cpp/bin` **is now the engine actually serving on both nodes**
+(confirmed on node 1 this session via `/etc/default/llama-server`'s
+`LLAMA_BIN=/opt/llama.cpp/bin`); ik_llama.cpp stays installed side by side at
+`/opt/ik_llama.cpp/bin` for the still-untested `--parallel 1` /
+no-flash-attention configurations (F40), not as the default. Models in
+`/opt/models`, Missing Link in `missing-link/` (coordinator only).
+`rpc-server@50052` is **active on both nodes** at `-t 4` as user `cluster`
+— **not independently re-checked on node 2 this session**, since this agent
+did not SSH to either node; the previous entry's "active on both" is carried
+forward, not re-verified.
 
 **Access:** node 1 is reachable over Tailscale with Tailscale SSH enabled, and a
 detached tmux session named `cluster` is waiting on it. **The address is in
@@ -93,7 +137,93 @@ ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'   # then: cla
 
 ---
 
-## MERGED THIS SESSION (2026-08-17 late night → 2026-08-18 early morning)
+## MERGED 2026-08-18 morning → afternoon, AFTER the entry below
+
+**~30 more commits landed after the batch documented below**, roughly
+06:36–12:34 on 2026-08-18 (`git log --format='%h %ci %s' 03fdee9..HEAD`
+gives the exact chain). In rough chronological order, the decision-relevant
+ones:
+
+- **Agent-hygiene hooks** (`95b2fac`). `.claude/hooks/cluster-guard.py`
+  now DENYs (blocks outright) `git add -A`, `git commit -a`, `pkill -f`, and
+  inline Python that fails to `compile()`, and GATEs (requires
+  `CLUSTER_OPS_CONFIRMED=1`, which only the operator sets) cluster service
+  control, mutating SQL against the live job store, `git push`, writes to
+  `/opt/models`, and git operations in the live checkout itself. Two
+  mechanism findings shaped it and are recorded in `docs/AGENT-HARDENING.md`,
+  not duplicated into `docs/FINDINGS.md`: hook `if:` matchers do best-effort
+  bash parsing and **fail open** on a parse failure, so the guard uses its
+  own `shlex` parsing instead of relying on one; and
+  `permissionDecision: "ask"` is a **silent allow** under
+  `--dangerously-skip-permissions` (there is no prompt to show), so the guard
+  downgrades GATE to DENY whenever the session cannot actually prompt.
+- **Multi-node, multi-service watchdog** (`3b07cf2`, `156c824`). The
+  single-node, single-service watchdog from the batch below was generalised
+  to cover `llama-server`, `rpc-server` and `missing-link` on both nodes,
+  each with its own liveness predicate (`docs/measurements.md`'s "Per-service
+  signals" table — the CPU-flat rule that works for `llama-server` would
+  falsely restart the other two, which are legitimately idle a lot of the
+  time).
+- **Retry-and-resume on backend failure** (`b7114cf`). A job whose inference
+  backend disappears mid-run now retries (up to a bounded attempt count)
+  rather than failing outright, reusing whatever chunk summaries already
+  persisted. **This is not hypothetical**: job `6c0358825609` hit exactly
+  this in production — see "Real production events" below.
+- **A revive route for terminal jobs** (`569d4ce`). `POST
+  /jobs/{id}/revive` lets an operator re-run a `failed`/`cancelled` job,
+  previewing what `db.revive_job`'s resume would actually reuse before
+  committing.
+- **F40: ik_llama.cpp reversed, mainline restored fleet-wide** (`4ba807d`,
+  `b419b60`, `9f417aa`). The single most consequential correction in this
+  window — see the header of this file and F40 in `docs/FINDINGS.md` for the
+  full mechanism (a forked-abort deadlock that hangs the server invisibly to
+  `Restart=always` and a port check).
+- **A two-model faithfulness audit ledger** (`f460cb3`), then **found not to
+  survive production scale** (`10f5b40`, F41) and **superseded by a
+  deterministic cascade** (`7a78d82`, F42) that caught a real fabrication in
+  production — see "Real production events" below. The audit ledger's
+  engineering (refuse-rather-than-degrade, two correctly-scoped hops) is
+  still sound per F41; its empirical justification for being wired in as a
+  safety net was not, and the deterministic cascade is what should actually
+  be trusted.
+- **Section-level citations on the reduce output** (`7c1266b`). The reduce
+  step is asked to tag each combined-summary paragraph with `[Section N]`
+  markers referencing the chunk(s) it drew from; resolved back to source
+  character offsets in code, not asked of the model a second time
+  (`CLAUDE.md`'s "never ask the model where something came from" rule,
+  applied). **Verified this session against a real completed job
+  (`18339bace8f0`)** — see "What is actually in flight right now" above: the
+  model did produce well-formed `[Section 1]`…`[Section 7]` markers on real
+  output. Citation *accuracy* (whether each marker is correct, not just
+  present) is still unverified.
+- **A real failure-history table, and an explicit-`accept` fix on file
+  uploads** (`94da7d7`). The job page now shows every failed attempt for a
+  job, not just its current status.
+- **Opt-in chunk-boundary snapping, default OFF** (`910c3d5`), plus the
+  research it rests on (`docs/chunking-research.md`) and a follow-up
+  measurement (`978c1e3`) finding the real document's chunk boundaries do
+  not in fact sever any clause pairs — but the corpus available cannot
+  answer the general question either way. Does not change default
+  behaviour; see "What is actually in flight" above for why this did not
+  need a service restart.
+- **Watchdog production hardening** (`5f7e1a1`): the node-2 `HOME`
+  unbound-variable bug (F43 below), a process-count tripwire for the
+  forked-abort hang (addendum to F40 below), and an opt-in synthetic
+  transaction (issue a tiny real completion and validate its content, not
+  just ask if the service is up) — left disabled
+  (`WATCHDOG_SYNTH_ENABLE=0`) while real jobs were running, per its own
+  commit message.
+
+**Test count over this window: 193 → 469**, per `git log` and reproduced
+this session (`.venv/bin/python -m pytest tests/ -q`, 469 passed). Per
+`CLAUDE.md`'s own standing rule, that is what ran, not evidence on its own —
+the concurrency, retry-and-resume and watchdog claims above are backed by
+reproduction and production evidence, cited where it exists, not by the
+count alone.
+
+---
+
+## MERGED THIS SESSION (2026-08-17 late night → 2026-08-18 early morning) — historical, see above for what landed after it
 
 **All three feature agents from the previous entry finished, were independently
 verified, and are now on `main` — along with a fourth fix and a rewritten
@@ -202,12 +332,43 @@ policy decision, not a default to inherit.
   was not built, so a future `-c`/`--parallel` change that shrinks
   `N_CTX_SLOT` still needs to be caught by hand, the same way the original
   `-c 16384` regression was.
-- `WORDS_PER_TOKEN = 0.70` is **under active measurement on node 2 right now**
-  (see the box at the top of this file) — **not** merely owed. Do not lower it
-  by hand while that sweep is running; it will land a real value in
-  `docs/measurements.md` when it finishes, and `worker.py`'s own comments
-  already flag every place `MAX_INSTRUCTION_WORDS` derives from it so the
-  correction propagates from one constant.
+- `WORDS_PER_TOKEN = 0.70` is **still unmeasured, and this entry corrects the
+  previous one, which said a chunk-size sweep would land a real value here.**
+  The completed sweep (`docs/measurements.md`, "Chunk-size sweep" section)
+  measured wall-clock by `CHUNK_TOKENS`, not the words-per-token conversion
+  ratio itself — `chunk_size_driver.py` *consumes* `WORDS_PER_TOKEN` to turn
+  a token target into a word count, it does not calibrate it, and the
+  server's reported `prompt_n` is not directly comparable to the per-chunk
+  word count because it includes the surrounding prompt template. **Still
+  genuinely owed**, not in flight.
+
+---
+
+## Real production events this session — not benchmarks, the actual system doing actual work
+
+- **The rewritten watchdog fired twice for real on node 1**, both against
+  genuine wedges, both confirmed directly from
+  `/var/lib/llama-watchdog/restarts.jsonl` this session (not carried over
+  from a commit message): `2026-08-18T09:13:23+10:00` and
+  `2026-08-18T11:05:43+10:00`, both `"reason":"wedged"`,
+  `streak_s` past the 300 s threshold (355 s), `/health` and `/props` both
+  silent, `cpu=0ms/10002ms(0%)`. Zero false restarts recorded in the same
+  file over the session.
+- **Job `6c0358825609` failed, retried and resumed unattended.** Confirmed
+  from `/opt/missing-link/jobs.sqlite` (read-only) this session: `attempts =
+  2`, `resumed_chunks = 4`, final `status = done`. Its stored error is
+  explicit about what happened: *"attempt 1 of 4 failed and will be retried
+  in 60s. The inference backend went away — this is not a problem with the
+  document. The 4 chunk summaries already completed are kept and will be
+  reused, so the retry resumes rather than restarts. Last error:
+  RemoteDisconnected."* This is the retry-and-resume feature (`b7114cf`)
+  doing exactly what it was built for, on a real backend failure, not a
+  test.
+- **The deterministic cascade caught a genuine fabrication in a real
+  summary** — F42. A reduce step asserted a death year present in none of
+  the five chunk summaries nor the source document; a plain number-in-span
+  check flagged it, no model was consulted to catch it. See F42 in
+  `docs/FINDINGS.md` for the full account.
 
 ---
 
@@ -383,6 +544,19 @@ against `db.claim_next_pending` (already atomic under concurrency —
   `start_char`/`end_char` per chunk; confirmed present in the live
   `/opt/missing-link/jobs.sqlite` schema.
 
+**The code is built, merged and tested, but fan-out is NOT actually enabled
+on node 1 right now.** Confirmed directly from `/etc/default/missing-link`
+this session: it sets `LLAMA_URL=http://127.0.0.1:8080` (the legacy singular
+variable) and does **not** set `LLAMA_URLS` (the plural, comma-separated
+variable `app.py` actually reads for fan-out — see `app.py` around line 38).
+`worker.py`'s own fallback logic means an unset `LLAMA_URLS` silently
+degrades to the single-endpoint behaviour rather than erroring, so this is
+easy to miss from the outside — the feature looks live because the service
+runs fine, it is just only using node 1. **Setting `LLAMA_URLS` to include
+node 2's endpoint in `/etc/default/missing-link` and restarting the service
+is a real owed step, not a completed one**, despite everything else in this
+section being done in code.
+
 **NOT done — two real gaps remain, and neither landed tonight:**
 
 - **Chunk-level fan-out within one document.** `_worker_loop`'s own docstring
@@ -536,12 +710,30 @@ of seconds of silent waiting against this backend. Compare on wall-clock
 
 ### 5. Smaller, still open
 
-- Adopt `ik_llama.cpp` for the document workload (+22% end-to-end) — its CLI
-  differs from mainline, so scripts need adapting, not just re-pointing.
-- `-fa` flash attention and `-ctk q8_0` KV quantisation: untested, cheap.
+- ~~Adopt `ik_llama.cpp` for the document workload (+22% end-to-end)~~ —
+  **REVERSED, see F40.** ik_llama.cpp fatal-errors on the 5th request of any
+  `--parallel 4` job, a 100% failure rate on real multi-chunk documents, and
+  the resulting hang is invisible to `Restart=always`. Mainline is now the
+  fleet-wide default. **What is genuinely still open, and untested per F40:**
+  ik at `--parallel 1` (removes the interleaving that triggers the bug, at
+  the cost of F24's 1.79× batching gain) and ik with flash attention
+  explicitly disabled (removes the faulty code path entirely, at the cost of
+  most of ik's prefill advantage). Neither may be adopted on reasoning alone
+  — F40's own lesson is that a plausible configuration was standardised from
+  a benchmark (`llama-bench`) that could not exercise the failure. Also
+  still owed: filing the ik_llama.cpp defect upstream — F40 already contains
+  the diagnosis and a one-line reproduction, and issue #2186 on the CUDA
+  path is the closest existing report, but nothing has been filed against
+  the CPU path.
+- `-fa` flash attention and `-ctk q8_0` KV quantisation on **mainline**:
+  untested, cheap.
 - Open WebUI (plan Task 9).
 - Measure the real per-node RAM ceiling now that the 75% rule's citation is
   disproven (F1). At 85% the pooled budget rises ~13%.
+- A long legal/records-style document, closer to this project's actual
+  target material than the philosophical-text corpus the chunk-size sweep
+  and F40's reproduction both used, to find the real boundary/context-limit
+  behaviour on the kind of document this project is actually for.
 
 ---
 
@@ -606,13 +798,13 @@ second replica, `10.10.0.39`)** — both provisioned, both serving.
 
 | Item | node 1 | node 2 |
 |---|---|---|
-| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` | **same, exec-verified** |
-| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` | **same, shipped 2026-08-17** |
-| `rpc-server@50052` | **active, `-t 4`, user `cluster`, 0 restarts** | **`active` normally, but STOPPED right now — chunk-size benchmark in progress, see the box at the top of this file. Restart it when the sweep finishes.** |
-| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB); **Qwen3-Next-80B UD-Q8_K_XL 87 GB downloading, 26%** | **gpt-oss-120b, md5-verified** |
+| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` — **the ENGINE ACTUALLY SERVING (F40)**, confirmed this session from `/etc/default/llama-server`'s `LLAMA_BIN=` | **reported same by the previous entry; not re-checked this session (no SSH to node 2)** |
+| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` — **kept installed, NOT the default any more.** Old config backed up at `/etc/default/llama-server.ik.bak` (confirmed on node 1 this session) | reported same, not re-checked |
+| `rpc-server@50052` | reported active, `-t 4`, user `cluster` — not re-checked this session | reported active normally; **the previous entry left it deliberately stopped for a chunk-size sweep that has since finished — confirm `systemctl is-active rpc-server@50052` before assuming it is back, this was not re-checked this session** |
+| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB), **Qwen3-Next-80B-A3B-Instruct UD-Q8_K_XL — download now COMPLETE, both shard files present, ~93 GB total** (confirmed by `ls` this session; the previous entry's "26%" is stale) | **gpt-oss-120b, md5-verified** (not re-checked) |
 | SSH | password auth still ON (no key installed until this session) | **key-only, hardened** |
-| Disk free | 367 GB | 437 GB |
-| Missing Link | job store + worker + web API, fan-out across R endpoints, queue control (cancel/reorder/cooperative stop), resumable per-chunk persistence, live telemetry, per-workflow guidance — **193 tests**. Running on node 1, but **still serving the code from before tonight's five merges** — see the restart note at the top of this file | n/a (coordinator only) |
+| Disk free | **248 GB** (`df -h /`, confirmed this session — down from the previous entry's 367 GB, consistent with the ~93 GB Qwen3-Next model landing) | 437 GB (not re-checked) |
+| Missing Link | job store + worker + web API, fan-out across R endpoints (code merged but **`LLAMA_URLS` unset — only node 1 is actually used**, see task 2 above), queue control, resumable per-chunk persistence, automatic retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table — **469 tests**. Confirmed running the current code: `ActiveEnterTimestamp` 11:53:31, after all of the above landed | n/a (coordinator only) |
 | Phase 0 gate | **PASSED** | — |
 | #26500 gate | **PASSED across both machines** (F31) | — |
 
@@ -631,8 +823,14 @@ session — see F30.
 
 **Not done:** nodes 3+, Model B decision, Open WebUI, evaluation harness,
 chunk-level fan-out within one document, a retrieval task profile, watchdog
-moved fully off-cluster. The aggregate replication measurement is done (see
-the top of this file); a chunk-size benchmark is in flight on node 2 now.
+moved fully off-cluster, `LLAMA_URLS` actually set so fan-out is used in
+production, ik at `--parallel 1` / flash-attention-off, a long
+legal/records-style document for the boundary measurement, filing the
+ik_llama.cpp defect upstream. **Done since the previous entry:** the
+aggregate replication measurement, the chunk-size sweep at `-c 32768`
+(`docs/measurements.md`), the extended sweep at `-c 65536` (numbers on disk,
+not yet written up), the engine reversal to mainline (F40), and the
+citation-format check against a real job.
 
 ---
 
@@ -759,8 +957,10 @@ most consequential number in model selection: crossing it costs a factor of N.
 | Qwen3-4B, single node | pp2048 28.33, tg128 **11.49** t/s |
 | TTFT @ 2214 tokens (4B model) | **89 s** |
 | Batching (MoE) | 1.79× at batch 4; **collapses at 8** |
-| ik_llama.cpp vs mainline | **prefill +52%**, generation −14%, **net +22%** |
+| ik_llama.cpp vs mainline, `llama-bench` (single sequence) | prefill +52%, generation −14%, net +22% — **superseded, see next row** |
+| ik_llama.cpp vs mainline, through `llama-server` at `--parallel 4` (the actual deployment) | prefill **+43% decaying to +15%** as KV fills, generation **indistinguishable (~5.2–5.3 t/s both)** — but **ik fatal-errors on request 5 of any such job (F40); mainline is the fleet default** |
 | **Aggregate throughput, 2 replicas** | **~1.8× (1.86× prefill / 1.77× completion, adjusted; 1.62/1.55 raw)** |
+| Chunk size vs wall-clock, real pipeline, mainline | **U-shaped, optimum at 4096 tokens** — 1.85× worse at 1024, 1.29× worse at 6144 |
 
 **Sizing rule, validated both ways:**
 `tok/s ≈ effective_bandwidth / (active_params × bytes_per_weight)`,
@@ -954,3 +1154,53 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
   pre-merge code and has not been restarted this session — see the box at the
   top of this file for why. A chunk-size benchmark is running on node 2 with
   `rpc-server@50052` there deliberately stopped for the duration.
+- **2026-08-18 (morning)** — **F40: ik_llama.cpp reversed, mainline restored
+  fleet-wide.** ik fatal-errors deterministically on the 5th request of any
+  `--parallel 4` job (a forked-abort deadlock in `ggml_abort`'s crash
+  reporter, invisible to `Restart=always` and a port check because the
+  forked children inherit the listening socket), and this — not a client
+  disconnect — is F36's real cause. Re-measured through `llama-server` at
+  four slots, ik's real prefill advantage is +43% decaying to +15%, not a
+  flat +52%, and the −14% generation penalty does not appear at all; neither
+  matters because it does not survive to the fifth request. Agent hygiene
+  hooks landed the same window (`.claude/hooks/cluster-guard.py`) after
+  `docs/REQUIREMENTS.md` asked for a hardening pass ahead of the Skill.
+  Multi-node, multi-service watchdog coverage, retry-and-resume on backend
+  failure, a revive route, section-level citations on the reduce output, a
+  real failure-history table, and opt-in chunk-boundary snapping (default
+  off) all landed. A two-model faithfulness audit ledger was built, then
+  shown not to survive production scale (F41 — recall fell from 1.00 to
+  0.43 on the exact fabrication class it was built to catch) and effectively
+  superseded by a deterministic string/number-in-span cascade, which caught
+  a real fabrication in a real reduce-step output (F42). **Test count 193 →
+  469.**
+- **2026-08-18 (afternoon)** — **This entry: closing the gap between what
+  had actually happened and what `STATUS.md`/`docs/measurements.md` said had
+  happened.** The completed chunk-size sweep (`-c 32768`, mainline, node 2,
+  the real document) was recorded in `docs/measurements.md` for the first
+  time: **4096 tokens is the measured wall-clock optimum, U-shaped, 1.85×
+  worse at 1024 and 1.29× worse at 6144** — displacing a throughput claim
+  that had stood in `CLAUDE.md`, `STATUS.md` and `worker.py`'s own comments
+  since the plan (the underlying *quality* claim was correct and was kept;
+  only the throughput claim was wrong). `worker.py`'s two stale comments
+  were corrected; `CHUNK_TOKENS` itself did not need to change, it already
+  sat at 4096. Two findings that existed only in commit messages were
+  promoted to `docs/FINDINGS.md`: **F43** (node 2's watchdog timer fired
+  every minute and failed on every tick with an unbound `$HOME`, so it was
+  silently unmonitored from install) and **F44** (a CPU-bound sidecar
+  measurably starves `llama-server` on this 4-core hardware even at `nice -n
+  15`), plus an addendum to F40 confirming — independently, by reading
+  `/opt/llama.cpp/src/ggml/src/ggml.c` on node 1 this session — that
+  mainline shares the identical fork/waitpid abort path, so the forked-abort
+  hang hazard is not retired by the engine reversal alone. Two items this
+  file previously called "in flight" had in fact already finished: the
+  extended `-c 65536` chunk-size sweep (results complete on disk, write-up
+  intentionally left to whoever owns it) and the citation-test job
+  `18339bace8f0` (finished, and its output does carry well-formed `[Section
+  N]` markers on real output — citation *accuracy* is still unverified).
+  Also confirmed live and corrected in this file: the engine actually
+  serving on node 1 is mainline, not ik (F40 had already decided this, but
+  had not been reflected in `STATUS.md`'s tables); `missing-link.service`'s
+  running process postdates all the relevant merges; `LLAMA_URLS` is unset
+  in production despite fan-out being fully built, so only node 1 is
+  actually used; and 50, not "41+", commits are unpushed to `origin/main`.

@@ -2272,3 +2272,107 @@ pass.** Its failure mode is not missing fabrications, it is crying wolf on
 correct work — and a reviewer who learns to ignore the flag list has been made
 worse off than one with no checker at all. So a checker must be validated on
 material known to be CORRECT, not only on material known to be wrong.
+
+---
+
+## Addendum to F40 (2026-08-18): mainline shares the exact fork/waitpid abort path, so switching off ik_llama.cpp does NOT retire the forked-abort hang hazard
+
+**CONFIRMED**, two ways: directly from `commit 5f7e1a1` ("feat(watchdog): node 2
+coverage, nprocs tripwire, and a synthetic transaction"), and independently by
+reading `/opt/llama.cpp/src/ggml/src/ggml.c` on node 1 in this session — lines
+196–234 contain the identical `fork()` → `execlp("gdb", ...)` /
+`execlp("lldb", ...)` → `waitpid()` sequence that F40 traced as the mechanism
+of the forked-abort deadlock in ik_llama.cpp.
+
+F40 concluded "mainline is the safe default" on the strength of one specific
+trigger (`iqk_flash_attn`'s SWA tail-slice bug) being absent from mainline
+because `kv_unified = 'false'` there. That conclusion about the *trigger*
+still stands. But the *hang mechanism* — `ggml_abort()` forking a
+crash-reporter child from a multithreaded process, the child deadlocking on
+an inherited lock before it can `exec`, and the parent blocking in `wait4()`
+forever while the listening socket survives in the zombie children — lives in
+shared `ggml.c`, not in ik-specific code. **Any future `GGML_ASSERT` failure
+in mainline, triggered by anything else, would hang the server the identical
+way**, invisible to `Restart=always` and to a port check, for exactly the
+reasons F40 documented.
+
+**Mitigation added, not a fix.** `cluster/llama-watchdog.sh` (per the same
+commit) now tracks a per-service process-count baseline — measured live on
+both real busy nodes at `llama-server=2 procs, rpc-server=1` — and treats a
+sustained count above baseline (confirmed on a second sample after a 90 s
+grace) as `WEDGED` directly, without waiting for the CPU-flat streak alone.
+This catches the forked-zombie signature specifically, on either engine,
+which is the point: the watchdog no longer implicitly assumes the hazard is
+ik-only.
+
+---
+
+## F43. The fleet-wide watchdog was silently non-functional on node 2 from install — a monitor that looks installed and evaluates nothing
+
+**CONFIRMED**, `commit 5f7e1a1`. Node 2's watchdog timer was `active` and
+firing every 60 s, and **failed on every single tick** with `line 240: HOME:
+unbound variable` — systemd service units do not set `$HOME`, and the script
+runs under `set -u`. The failure happened before the script reached any of
+its liveness predicates, so node 2 was unmonitored for the entire period
+between install and this fix being found, despite every operational signal
+(`systemctl status`, the timer's own `active` state) saying otherwise. Fixed
+with a `${HOME:-/root}` fallback.
+
+**This is the same class of defect as the thing the watchdog exists to
+catch.** F39 and F40 are both about a server that looks alive — process
+running, port open — while doing nothing. This is a monitor that looks
+installed and scheduled — timer active, correct cadence — while evaluating
+nothing. Both defeat every check built on "is the unit present and
+running," and neither surfaces without reading the monitor's own execution
+log, not just its scheduling state.
+
+**Validated in production in both directions once fixed.** Per the same
+commit and independently confirmed this session from
+`/var/lib/llama-watchdog/restarts.jsonl` on node 1: the corrected watchdog
+declined to act across a multi-hour busy sweep on node 2 (no false
+restarts), and it genuinely fired twice on node 1 against real wedges —
+`2026-08-18T09:13:23+10:00` and `2026-08-18T11:05:43+10:00`, both logged
+with `"reason":"wedged"`, `streak_s` at the 300 s threshold (355 s of
+unbroken silent-and-CPU-flat evidence), `/health` and `/props` both silent.
+Two correct restarts and zero false ones is the outcome F39's design was
+built to produce, and this is the first production evidence of it working
+end to end — but only after a second, unrelated bug in the monitor itself
+was found and fixed. **A watchdog is itself a piece of software that needs
+its own liveness check** — "the timer is active" is exactly the same kind
+of in-band-looking signal that F39 rejected for the server it watches.
+
+---
+
+## F44. Even niced, a CPU-bound sidecar measurably starves `llama-server` on a 4-core node — co-location is not free
+
+**CONFIRMED**, `docs/audit-production-scale.md` section 7.3 and 9.2 (a
+faithfulness-classifier scoring pass run alongside live document work on
+node 1). Run at `nice -n 10` / `-n 15` throughout, a `top` snapshot during
+the position sub-study caught `llama-server` at **378.9% CPU** and the
+audit process at **336.8% CPU** simultaneously on the same 4 physical
+cores (load average 8.23, up from 0.6–0.9 with nothing else running).
+RoBERTa's own per-claim rate visibly slowed during that window — 18.2–18.7
+s/claim against a clean 8.81 s/claim measured earlier in the same run. A
+later, separate pass observed `llama-server` at **287.5% CPU** concurrently
+with the (still niced) scoring process, load average 9.38, and the
+scoring process's rate degraded from 4.7 s/claim to 41.7 s/claim under that
+contention — nearly 9× slower.
+
+**`nice` sets scheduling priority, not an exemption from sharing 4 physical
+cores.** It measurably helps — the sidecar does not stall completely — but
+it does not eliminate the wall-clock cost to either process, and on this
+hardware (already bandwidth- and core-constrained per F10/F12) the effect
+is large enough to be visible in a single ad-hoc snapshot, not just in
+aggregate statistics.
+
+**Relevant to the agent-appliance design in `CLAUDE.md`**, which allows
+on-node placement for "the ACTIVE work — queue triage, requeueing stranded
+jobs, batch assembly, endpoint health-checking" on the reasoning that it
+"only needs to run when the coordinator is up anyway." That remains true for
+correctness, but this finding qualifies it for *performance*: any on-node
+CPU-bound sidecar that happens to run while a document job is prefilling or
+generating will slow that job down, and vice versa, regardless of `nice`
+level. Not a reason to move triage off-node — the appliance-relaxation
+decision was about availability, not throughput — but a real cost to note
+if triage work is ever scheduled to run concurrently with inference rather
+than between jobs.

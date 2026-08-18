@@ -974,3 +974,104 @@ needs **write** access to the `-shm` index, so `mode=ro` as the unprivileged
 watchdog user returns `-1` for every count while succeeding for the owner. The
 watchdog is not given write access to the job store; the query is re-run as the
 store's own user through one narrow `sudoers` rule.
+
+---
+
+## Chunk-size sweep — real map-reduce pipeline, node 2, mainline engine
+
+**Date:** 2026-08-18 | **Node:** node2 (`10.10.0.39:8080`) | **Engine:**
+mainline llama.cpp b10369 at `/opt/llama.cpp/bin` | **Model:** gpt-oss-120b F16
+| `-c 32768 --parallel 4` → **`n_ctx_slot = 8192`** (confirmed from the
+server's own startup log, not inferred from `-c`) | **Driver:**
+`bench/chunk_size_driver.py` via `bench/chunk-size-bench.sh`, using
+`missing_link.worker`'s own `chunk_document`, prompts, `LlamaClient` and
+reduce step end-to-end — this is the real pipeline, not a synthetic
+benchmark | **Document:** the real 97,299-character / 16,745-word document
+from job `06af2911d7fc` (kind=`summarise`), same document at every chunk size
+| **Raw data:** `bench/out/chunk-size-bench/results.json` (gitignored — real
+document text, do not commit; per-size coherence transcripts at
+`bench/out/chunk-size-bench/chunk_<N>.txt`)
+
+| CHUNK_TOKENS | chunks | prefill s | generation s | total s (prefill+gen) |
+|---:|---:|---:|---:|---:|
+| 1024 | 26 | 2330.7 | 1795.9 | 4126.6 |
+| 2048 | 13 | 1640.7 | 1490.7 | 3131.4 |
+| 3072† | 9 | 1918.1 | 1088.1 | 3006.2 |
+| **4096** | **7** | **1197.8** | **1030.9** | **2228.7 ← measured optimum** |
+| 6144 | 5 | 1857.9 | 1023.5 | 2881.4 |
+
+**4096 is the measured optimum, and the curve is U-shaped**: 1024 is **1.85×**
+worse (4126.6 / 2228.7) and 6144 is **1.29×** worse (2881.4 / 2228.7).
+
+**Generation falls monotonically with chunk size; prefill does not.**
+Generation: 1795.9 → 1490.7 → 1088.1 → 1030.9 → 1023.5 s, strictly decreasing
+across all five sizes. Prefill instead bottoms out at 4096 and rises again at
+6144. **INFERRED mechanism, not directly measured:** two effects pull in
+opposite directions as chunk size grows. Fewer, larger chunks mean less of the
+document is re-read as 10% chunk-to-chunk overlap, which should cost less
+total prefill work — but a longer per-chunk prompt also prefills at a lower
+tok/s once it exceeds the model's efficient range (consistent with the
+general prefill-degrades-with-length pattern measured elsewhere on this
+hardware, e.g. the Qwen3-4B TTFT result above). 4096 tokens is where those two
+effects cross; below it, re-read overlap dominates and adding tokens still
+buys speed, above it, per-token prefill degradation dominates and it costs
+speed again.
+
+**† The 3072 row is suspect.** Its prefill (1918.1 s) exceeds 2048's
+(1640.7 s) despite running fewer chunks (9 vs 13) — the only point in the
+sweep where prefill does not move in the direction chunk count alone would
+predict. A coherence-check script targeting the same endpoint
+(`10.10.0.39:8080`) existed on the machine during this session
+(`bench/_coherence_probe.py` in a concurrent agent's worktree, driving
+`chunk_tokens=4096` against this node) and is the suspected contaminating
+source, but this could not be independently confirmed from artifacts alone —
+its own log is empty and timestamped 08:07, before this sweep's first
+completed size (`chunk_1024.txt`, 09:25) even finished, so exact overlap with
+the 10:18–11:08 window in which the 3072 size actually ran is not established
+from file timestamps. **Treat the 3072 row as unreliable pending a clean
+re-run on an otherwise-idle node; do not treat the U-shape's exact minimum
+location as pinned by five points, only the qualitative shape and 4096's
+optimum.**
+
+**The 1024 row's job status is `FAILED`, not `ok`** — its reduce step hit
+`max_tokens` (2048) and returned truncated (`final_chars: 0`); the map step
+(26 chunk summaries) completed and its prefill/generation timings are real
+and counted, but there is no coherent final summary to read at this size.
+This does not affect the timing comparison — the reduce call still consumed
+real prefill and generation time, and is included in the totals above — but
+it means the "1.85× worse" row is also the row that produced no usable output
+at this `max_tokens` setting, a second, independent reason not to run 1024 in
+production.
+
+### This displaces a throughput claim that has been standing since the plan
+
+`CLAUDE.md`, `STATUS.md` and `missing_link/worker.py`'s own module docstring
+have said, since before this sweep: *"chunk size barely matters for
+map-reduce, so ~4K with 10% overlap is fine and is not worth tuning."* That
+claim traces to BooookScore-style **quality** scoring on book-length text
+(arXiv:2310.00785), which is what it actually measured, and it **still
+stands for quality** — nothing here contradicts it. It is **wrong for
+wall-clock**: this sweep, on real hardware with the real pipeline, shows a
+**1.85× spread** between the worst and best chunk size tested. `worker.py`'s
+`CHUNK_TOKENS = 4096` already happens to sit at the measured optimum, so no
+code behaviour changes; only the comment claiming chunk size "barely
+matters" (in the sense of throughput) has been corrected in `worker.py` to
+say what is now actually known. `CLAUDE.md`'s "Map-reduce for long
+documents, ~4K chunks with 10% overlap" line is consistent with this result
+and was left as-is.
+
+### A second, extended sweep exists on disk and is deliberately NOT written up here
+
+A second sweep at `-c 65536` (`n_ctx_slot = 16384`) covering
+CHUNK_TOKENS ∈ {4096, 8192, 12288} ran on node 2
+(`bench/out/chunk-size-bench-c65536/`, `results.json` + per-size `.txt`
+transcripts). **As of this entry its driver process has already exited and its
+`results.json` has a complete `status: ok` row for all three sizes** — so by
+the time this was written it was no longer "in flight," contrary to what this
+agent was initially briefed. Its numbers are deliberately **not** transcribed
+into this section: this entry covers the `-c 32768` / `n_ctx_slot=8192` sweep
+only, the two are not directly comparable without accounting for the
+different slot size, and write-up of the extended sweep was assigned
+elsewhere. **Do not quote figures from `chunk-size-bench-c65536/` until they
+have their own dated section in this file** — see that directory for the raw
+data in the meantime.
