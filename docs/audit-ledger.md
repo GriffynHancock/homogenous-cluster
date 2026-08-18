@@ -19,6 +19,21 @@ Code: `missing-link/missing_link/audit.py`, fixture
 
 ---
 
+> **UPDATE 2026-08-18, later the same day -- read `docs/audit-production-scale.md`
+> before acting on anything below.** Everything in this file was measured on
+> one-to-three-sentence constructed documents, which section 6 already flagged
+> as the open question. That question has now been answered, at production
+> scale (~4096-token evidence, the same 36 pairs, plus real gpt-oss chunk
+> summaries): **disagreement's recall as an error signal falls from the 1.00
+> measured here to 0.43-0.75, precision falls to 0.75-0.90, and the flagship
+> `retention_seven_years` case that this file's VERDICT is built on goes from
+> caught to a silent failure at the `middle` position.** The verdict below
+> ("trustworthy enough to be a review aid") **does not survive at production
+> scale** and must not be quoted on its own. This file's engineering
+> observations (two hops, refuse-not-degrade, offsets computed not asked for)
+> still stand; its headline accuracy and disagreement numbers do not
+> generalise past the short-document regime they were measured in.
+
 ## VERDICT FIRST
 
 **The two-model ensemble is trustworthy enough to be a review aid, and on this
