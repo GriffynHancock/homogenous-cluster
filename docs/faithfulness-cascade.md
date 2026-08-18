@@ -18,6 +18,18 @@ Reads with: **F41** and `docs/audit-production-scale.md` (which inverted this
 design mid-build), `docs/audit-ledger.md`, `docs/citation-research.md` Q4
 (reference is not faithfulness), `docs/market-research.md` §6 item 8.
 
+> **PARTLY SUPERSEDED 2026-08-18 by `docs/two-scope-and-entity-index.md`.**
+> Two things below have moved. (1) A hard number failure is now split into
+> `number_fabricated` (absent from every chunk) and `number_misattributed`
+> (present in another chunk); §3's third finding — the `15th` century
+> unsupported by its own chunk — is now categorised as the citation error that
+> section already established it to be by hand. (2) §6's entity false-positive
+> rate was re-measured on 1,014 real claims against a canonical entity index
+> and falls from 11.34% to 8.48%, with the fabricated-name catch rate unchanged
+> at 98.8% — but with a MEASURED REGRESSION on 1-character name corruptions
+> (36.1% → 14.6%). §6's conclusion is unchanged and reinforced: **entity
+> absence still routes and may never fail a claim.**
+
 **No inference was run. Nothing here calls llama-server.** All measurement is
 CPU string work against already-generated output, read-only.
 
