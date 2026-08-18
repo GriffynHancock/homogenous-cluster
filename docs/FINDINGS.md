@@ -2376,3 +2376,74 @@ level. Not a reason to move triage off-node — the appliance-relaxation
 decision was about availability, not throughput — but a real cost to note
 if triage work is ever scheduled to run concurrently with inference rather
 than between jobs.
+
+---
+
+## F45. The sentence splitter's line-based fallback distorts clause-marker density — and it is now the metric that gates corpus decisions
+
+**CONFIRMED by measurement, 2026-08-18**, on the first real legislative corpus.
+Third independent manifestation of one root cause.
+
+**What was expected and what happened.** A corpus of Australian legislation was
+loaded to answer the chunk-boundary question, which had returned 0 of 84 events
+because the only legal-styled document in the store was too short to produce a
+boundary. Legislation should have shown *dramatically* higher clause-marker
+density than the narrative texts. It showed **1.8–4.9% against 0.00–1.4%** — only
+2–4×.
+
+**The diagnosis, and it is not an extraction failure.** The extracted text is
+clean and correctly ordered. But **63.8% of extracted lines are under 80
+characters**: legislation's HTML is one `<p>` per subsection and one line per
+table-of-contents entry, `extract.py` correctly turns each block-tag close into a
+newline, and `chunk_boundary_audit.sentence_spans`' regex fallback then treats
+every newline-delimited fragment as its own pseudo-sentence. Thousands of short
+headings and list items enter the denominator and structurally cannot carry
+`unless` / `except` / `subject to`. A raw grep found **123 marker phrases** in
+the current Privacy Act compilation.
+
+### The same root cause, now seen three ways
+
+| Manifestation | Measured effect on marker density |
+|---|---|
+| PDF hard line wraps | 75.00% → 53.85% |
+| Raw HTML markup passed through unextracted | 0.1176 → 0.0455 |
+| **Legislation's paragraph-per-clause HTML** | **denominator inflated by structural lines** |
+
+The splitter is the common factor. nltk is deliberately excluded from the
+production venv (~1.5 GB, audit-only) and its own fallback is no better — F41
+measured nltk producing 9.1% degenerate fragments on real markdown, splitting
+`"K.P. Dutt"` into `"P."`.
+
+### Why this one matters more than the other two
+
+The first two distorted a research measurement. **This one distorts the number
+the corpus page shows an operator to decide whether a document is worth
+using at all** — and marker density is not comparable across genres while the
+denominator counts structural lines. A document-selection verdict built on it is
+built on the instrument, not the document.
+
+**Consequence:** treat marker density as **within-genre comparable only** until
+the denominator excludes non-sentence fragments. A legislative document scoring
+2% and a narrative one scoring 1.4% are not two points on one scale.
+
+### The lesson, which is this project's most repeated
+
+`docs/measurements.md` exists because a number with an unexamined provenance
+propagates into architecture. This is the same failure at one remove: the number
+was measured correctly, by an instrument nobody had characterised on the material
+it was about to be pointed at. **F40 was a benchmark that did not reproduce the
+deployment's concurrency; F41 a validation that did not reproduce its evidence
+length; this is a metric that does not survive a change of document genre.**
+
+**Also worth recording from the same fetch:**
+
+- **`ombudsman.gov.au` sits behind a Cloudflare JS challenge** and returns 403 to
+  plain HTTP. The agent skipped it rather than scripting around a bot wall —
+  correct, and a real constraint on corpus assembly from government sources.
+- **`legislation.gov.au` site chrome can be avoided entirely** by fetching the
+  epub-internal HTML rendering, which is self-contained legislative text. OAIC
+  pages have no such alternative and carry a **5–9% mega-menu** before the report
+  body. Real content, correctly extracted, but it dilutes every density figure.
+- **All four government PDFs extracted cleanly — but they were single-column.**
+  The multi-column failure mode pypdf is known for was therefore *not* tested.
+  Reported honestly rather than concluding PDF extraction is safe.
