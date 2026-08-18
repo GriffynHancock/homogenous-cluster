@@ -2194,3 +2194,81 @@ the **real measured density is 18**. For a 25-chunk document, **hop 1 alone is
 `except Exception` that reports "the model failed to load" as an ordinary
 length-based refusal. That is a degrade-instead-of-refuse path in the very
 function written to prevent one.
+
+---
+
+## F42. The reduce step launders a fabrication into the final summary. Observed, not theorised — and caught by string comparison, not by a model.
+
+**CONFIRMED by measurement, 2026-08-18.** Full detail in
+`docs/faithfulness-cascade.md`. This is the finding F25 predicted and
+`DESIGN-NOTES.md` E worried about, finally seen in production output.
+
+**What happened.** The reduce step of a completed 5-chunk job asserted a **death
+year that appears nowhere in the source document and in none of the five chunk
+summaries.** The model inserted world knowledge its input did not contain, at
+the exact step where chunk summaries stop being checkable against the source.
+
+**The dangerous part is that the fabricated fact is historically CORRECT.** A
+human reading the summary would find it plausible, and a human spot-checking it
+against the world — rather than against the document — would confirm it. It is
+wrong only in the sense that matters here: **the document does not say it.** For
+summaries of legal and health records, "true but not in the source" is not a
+lesser failure than a falsehood; it is the same failure, because the summary is
+supposed to represent the document.
+
+F25 reasoned that map-reduce would amplify fabrication, because a chunk summary
+becomes *source material* for the reduce step where invention is
+indistinguishable from genuine content. That was labelled INFERRED for months.
+**It is now observed.** Note it did not even require the predicted path — nothing
+was fabricated in a chunk and then laundered upward. The reduce step invented it
+directly, from a context containing only the five chunk summaries.
+
+### What caught it, and what did not
+
+**A deterministic number check caught it.** The year was not in the cited span,
+so it was not in the cited span. No model was consulted.
+
+The two-model MiniCheck ensemble is **off by default and was not used** (F41).
+This is the argument for the cascade stated as compactly as it can be:
+
+| | short docs | production scale |
+|---|---|---|
+| MiniCheck ensemble (F41) | precision 1.00 / recall 1.00 | **0.75 / 0.43**, silent agreeing errors |
+| Deterministic cascade | 0/36 false alarms, ~92% caught-or-escalated | **unchanged at both scales** |
+
+**`in` does not care how long the evidence is.** That scale-invariance, not the
+raw accuracy, is why the deterministic tier is the primary path.
+
+### The numbers
+
+- **Zero false positives on 978 real claims.** Three findings total; all three
+  manually verified as genuine fabrications.
+- **100% catch (27/27)** on mutated figures whose replacement is absent from the
+  source; 92.6% unconstrained — the gap is value collision inside a 4096-token
+  chunk, an inherent ceiling rather than a bug. Fabricated names 258/258.
+- **~3.5 seconds to audit a whole 26-chunk document.** Against F41's measured
+  ~199 minutes for the classifier's hop 1 alone. The saving is not 35%, it is
+  three orders of magnitude, because the expensive question is mostly not asked.
+
+### Two things demoted by measurement rather than argument
+
+- **Entity absence is NOT a hard failure.** A threshold sweep (592 real claims ×
+  238 injected names) showed it flagging **one faithful sentence in seven** even
+  at its optimum, because the source is OCR mojibake and the model correctly
+  reconstructs transliterations. Demoted to routing.
+- **Sub-sentence decomposition splits 29.9% of sentences**, deliberately below
+  F41's measured 55.6% multi-claim rate: an over-eager split misattributes a
+  figure to the wrong clause, which manufactures exactly the false failure the
+  checker exists to avoid.
+
+### The generalisable lesson about checkers
+
+**Five defects were found only by running on real output, and every one produced
+a FALSE HARD FAILURE on correct text.** `may` matched case-insensitively as a
+month. A non-breaking hyphen split `twenty‑four` into 20 and 4.
+
+**A checker's bugs land almost entirely on the sentences that were going to
+pass.** Its failure mode is not missing fabrications, it is crying wolf on
+correct work — and a reviewer who learns to ignore the flag list has been made
+worse off than one with no checker at all. So a checker must be validated on
+material known to be CORRECT, not only on material known to be wrong.
