@@ -155,27 +155,48 @@ organisation's to answer, ideally with someone qualified.
 
 ## Status
 
-**Cluster:** first node fully provisioned, built and measured. Phase 0 complete
-— the measurement gate passed. `llama.cpp` and `ik_llama.cpp` both built and
-verified, models fetched, and the async job runner (Missing Link) built and
-tested. Second node not yet joined.
+**Cluster:** **two nodes** provisioned, built, measured and serving. Phase 0
+complete and the measurement gate passed. `llama.cpp` and `ik_llama.cpp` both
+built and distributed fleet-wide, models fetched, and the async job runner
+(Missing Link) processing real documents end to end — job queue, fan-out across
+independent servers, resumable chunk-level progress, automatic retry on backend
+failure, live per-chunk telemetry, per-workflow guidance, and section-level
+citations back to source spans.
 
 **What measurement changed.** Several things the plan treated as settled did not
 survive contact with hardware:
 
 - **Replication beats sharding by a factor of N.** Sharding one model across
   every node buys capacity, not speed — nodes run sequentially, so utilisation
-  is 1/S. Running an independent copy per node scales linearly, and the document
-  workload is embarrassingly parallel. The architecture is now
+  is 1/S. Running an independent copy per node scales linearly. Measured at
+  **~1.8× on two nodes, about 90% of linear.** The architecture is
   replication-first.
 - **Sparse MoE reaches only ~61% of memory bandwidth**, against ~99% for dense
   models. Every MoE performance estimate was ~1.6× optimistic.
-- **`ik_llama.cpp` is +52% on prefill and −14% on generation** — a net +22% for
-  document work, since prefill dominates. That explains the split evidence
-  online: both camps are right, and which matters depends on your workload.
+- **`ik_llama.cpp` was adopted on a +22% end-to-end win, and then dropped.** It
+  fatal-errors on the *fifth* request of any `--parallel 4` job — a 100% failure
+  rate on any document longer than four chunks. The +22% was measured with
+  `llama-bench`, which issues one sequence. **A benchmark that does not reproduce
+  the deployment's concurrency is not a benchmark of the deployment.**
+- **Chunk size does not matter for quality, and matters a great deal for
+  wall-clock.** 1024-token chunks cost **1.85×** the wall-clock of 4096 on the
+  same document. The curve bottoms out at 4096 and climbs again — the inherited
+  default turned out to be right, for a reason nobody had checked.
+- **A faithfulness classifier's reliability degrades with the length of the
+  evidence you give it.** A two-model ensemble whose disagreement caught *every*
+  error on short documents dropped to precision 0.75 / recall 0.43 when the same
+  claims were embedded in production-sized chunks, and began making silent
+  agreeing errors. It was not deployed.
 - **Faithfulness now leads model selection.** The originally chosen frontier
-  model has the worst measured hallucination rate of any candidate checked,
+  model has the worst reported hallucination rate of any candidate checked,
   against a project whose whole premise is legally sensitive documents.
+
+The pattern behind most of these is the same, and it is the thing worth carrying
+away: **almost every real defect was an instrument confidently reporting on the
+wrong thing** — a benchmark of the wrong configuration, a health check queued
+behind the work it was checking, a validation at the wrong scale. None were
+caught by more tests. All needed the real thing, at the real size, under real
+conditions.
 
 Full detail in `docs/FINDINGS.md`; every number in `docs/measurements.md`.
 
