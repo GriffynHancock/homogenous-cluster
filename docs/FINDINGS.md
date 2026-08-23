@@ -67,6 +67,7 @@ numbers are cited from other documents and must not move.
 | **F46** | A citation can be CORRECT and its sentence still false; and a stricter regex would have destroyed all 7 valid citations | CONFIRMED |
 | **F47** | GLM-5 is 40.8 B active (computed, not published) — and Model B closes in the NEGATIVE | CONFIRMED |
 | **F48** | pysbd is worse than our regex; the legal-domain splitter nobody searched for fixes F45 | CONFIRMED |
+| **F49** | Whole-document single-pass is impossible at `n_ctx_slot=8192`; `WORDS_PER_TOKEN` is wrong by 2x and `/tokenize` is free | CONFIRMED |
 
 ---
 
@@ -2796,3 +2797,110 @@ simultaneously more accurate and cheaper than the general-purpose tool, so
 - **`pip install minicheck` installs an unrelated z3-based model-checking
   package.** `requirements-audit.txt` correctly pins the git URL; anyone
   "simplifying" that line gets the wrong package **silently**.
+
+---
+
+## F49. Whole-document single-pass is arithmetically impossible here — the amplification experiment had to change its unit, and two defects only real text exposed
+
+**CONFIRMED.** The paired experiment STATUS.md §4 specifies — same documents,
+same model, single-pass vs map-reduce — **cannot be run on whole documents at
+all**, and the reason is arithmetic rather than effort.
+
+### The control arm does not fit
+
+`n_ctx_slot = 8192`, **read from node 1's startup log rather than inferred from
+`-c`** (the standing constraint says to do exactly this). Subtract the 2048
+output budget, the ~150-token wrapper and this project's 15% headroom rule:
+the single-pass source budget is **5,094 tokens**.
+
+| | documents |
+|---|---|
+| fit whole at a realistic 1.3 tok/word | **1 of 17** |
+| fit whole even at an implausible 1.0 tok/word | 4 of 17 |
+
+**Exact McNemar cannot reach p<0.05 below 6 discordant pairs** (2/2^6 = 0.031).
+One to four *total* pairs is not an underpowered experiment, it is **no
+experiment** — and it would have produced a null that read as "no
+amplification".
+
+### So the unit is a paragraph-aligned SECTION, and the cost is stated not hidden
+
+Each unit must (a) provably fit one slot and (b) still yield >=2 chunks so the
+treatment arm is genuinely map-reduce. Both arms receive **byte-identical
+text**, so pairing stays exact. **What is lost: fewer chunk summaries than a
+full document, so any amplification measured is a LOWER BOUND.** Yield is ~253
+candidate sections corpus-wide; `--per-doc 4` gives ~53.
+
+**`POST /tokenize` runs on the HTTP thread and constructs no task** — verified
+by reading `/opt/llama.cpp/src/tools/server/server-context.cpp`, not assumed.
+It therefore takes no inference slot and cannot perturb a running benchmark.
+**This makes exact token counting available anywhere the code currently
+estimates**, which matters because of the next item.
+
+### `WORDS_PER_TOKEN = 0.70` is wrong by up to 2x in BOTH directions
+
+The chunk-size sweep's own raw output ranges **0.53-1.08 words/token within a
+single document**. A constant cannot express that. Every place this estimate
+gates a fit decision is a place a document can silently overflow or waste a
+slot — and `/tokenize` is free, so the estimate is not even buying anything.
+
+### Scorer: deterministic tiers only, and one signal survives for a subtle reason
+
+F41 is decisive against the classifier tier: at 4096-token evidence the
+ensemble's disagreement signal degraded to precision 0.75 / recall 0.43 with
+5.6% of errors silent to both models, at 17.74 s and 8.81 s per claim. **Our
+evidence window is a ~5,000-token section — further into the failing regime, at
+a cost exceeding the inference it audits.** `in` is scale-invariant; that, not
+its accuracy, is the argument.
+
+**`cascade.hop_units` could not be reused**: its hop-2 evidence is the
+concatenated chunk summaries, which **the control arm does not have.** Both
+arms are instead scored against the same evidence — the section source — which
+is also precisely the question F42's fabricated death year failed.
+
+**The entity signal remains usable despite its ~1-in-7 false-alarm rate, and
+the reason is worth keeping: a false-positive rate common to BOTH arms cancels
+in the within-pair difference.** That is where the power actually is, because
+the number signal's base rate is only ~0.3% of claims. A signal too noisy to
+report as an absolute rate can still be sound as a paired contrast.
+
+### Two defects that only real text exposed
+
+1. **Paragraph-aligned sectioning returned ZERO usable sections from the
+   Privacy Amendment (NDB) Act 2017.** Its HTML extraction yields 24
+   "paragraphs": 23 under 40 characters and one of **29,053**. On a corpus that
+   is mostly extracted HTML this would have silently gutted the yield. Fixed by
+   refining oversized paragraphs at sentence boundaries, with a regression test.
+2. **The first fan-out implementation silently DROPPED a section and reported
+   success.** A worker losing its endpoint mid-section re-queued after the other
+   worker had drained the queue and exited. Found only by a test that kills an
+   endpoint mid-section. A partly-finished section is now discarded and redone
+   whole.
+
+### A pairing hazard specific to running this on a cluster
+
+**Dispatch is by SECTION, never by (section, arm).** Splitting a pair across
+nodes puts a node difference *inside* the pair, where it is indistinguishable
+from the effect being measured. `run` refuses endpoints serving different
+models, and `analyse` excludes any pair whose arms ran on different nodes —
+which a "node 1 today, node 2 tomorrow" resume would otherwise quietly
+assemble.
+
+### Cost, and why the pilot comes first
+
+From `docs/measurements.md` only: prefill 16.3 tok/s, generation 5.3 tok/s
+(mainline b10369 through `llama-server` at `--parallel 4` — **not**
+llama-bench's 6.05, per F40's lesson), two-node divisor the measured **1.8x**,
+not 2x. **21.7 min per section for both arms.**
+
+| run | 1 node | 2 nodes |
+|---|---|---|
+| pilot, 6 sections | 2.4 h | **1.3 h** |
+| 41 sections | 16.6 h | 9.2 h |
+| **53 sections — recommended full run** | 21.5 h | **11.9 h** |
+
+**Run the 6-section pilot first.** Given the number signal's ~0.3% base rate,
+the pilot's observed event rate is what says whether 53 sections can clear 6
+discordant pairs — and that is much cheaper to learn in 1.3 h than in 11.9.
+`analyse` prints an explicit UNDERPOWERED guard below 6 discordant pairs and
+refuses to let a null read as "no amplification".
