@@ -81,6 +81,7 @@ numbers are cited from other documents and must not move.
 | **F58** | A token-budget formula decides the syllabus; a small model buys only ~2x; `--api-key` takes a LIST | CONFIRMED |
 | **F59** | Node 3 vanished at layer 2 (likely GNOME idle suspend) — and tracked `nodes.env` publishes the IPs the docs hide | CONFIRMED |
 | **F60** | No lab targets on this LAN — the cluster sits on a production cyber-range MANAGEMENT segment | CONFIRMED |
+| **Addendum to F59** | Suspend cause CONFIRMED (1200 s = the GNOME idle timeout); the fix had been hand-applied twice and never propagated | CONFIRMED |
 
 ---
 
@@ -3928,3 +3929,101 @@ and `docs/security-workflows.md` that assumed a reachable vulnerable target is
 up our own targets, which is now the more attractive option, because a Juice
 Shop container on node 3 is under our control, resettable between classes, and
 on a segment we are allowed to attack.
+
+---
+
+## Addendum to F59. The suspend cause is CONFIRMED — and the fix had already been applied by hand twice, per-user, and never propagated
+
+**CONFIRMED.** F59 labelled the mechanism INFERRED. **It is now confirmed, and
+the journal carries the arithmetic.**
+
+Node 3 suspended **today, on its current boot**:
+
+```
+13:22:22  session goes idle
+13:42:22  systemd-logind: The system will suspend now!
+13:42:22  kernel: PM: suspend entry (deep)
+14:24:46  kernel: PM: suspend exit
+```
+
+**Exactly 1200 seconds** — precisely `sleep-inactive-ac-timeout`, and **no other
+timer on the box has that period.** Down 42 minutes, which is F59's symptom
+exactly. `logind`'s own `IdleAction` is `ignore`, so logind idle handling is
+excluded; the requester was `gsd-power` in the running GNOME session.
+**Node 1, the coordinator, did the same on 2026-08-12.**
+
+### Two things F59 could not have known, and both matter for node 4
+
+1. **The GDM greeter has its OWN dconf profile** (`user-db` + `file-db`, no
+   `system-db`). On node 3 the greeter read `'suspend'` while the logged-in
+   admin read `'nothing'`. **Any fix applied only to the admin user misses it —
+   and a greeter is exactly what nodes 4-7 will sit at**, unattended, which is
+   the condition that triggers this.
+2. **Node 3's `debian3` already read `'nothing'`**, from a dconf write
+   timestamped *after* the wake, with one `gnome-control-center` invocation in
+   the journal. **Someone turned it off by hand after the event.** The same
+   fragile per-user fix was applied to node 1 after *its* suspend — **and node 2
+   never got it** (`debian1` there still read `'suspend'`).
+
+**So this has been found and hand-patched twice before, per-user, and never
+reached a script or a note.** That is the third instance today of F56's rule —
+**a step living in someone's shell history rather than in `setup.sh` is
+invisible until a fresh node arrives** — and it is the clearest one, because the
+repair itself kept getting re-done rather than recorded.
+
+### Fixed in four layers, in `setup.sh`, verified by NEGATIVE test
+
+Masked sleep targets; a `logind.conf.d` drop-in (not restarting logind — that
+can drop an active graphical session); a **locked** system dconf database
+covering every present and future user; and the GDM greeter's separate profile.
+
+**Both directions demonstrated on all three nodes**, which is the standard the
+new verification convention requires:
+
+| | node1 | node2 | node3 |
+|---|---|---|---|
+| 5 sleep targets | masked | masked | masked |
+| `systemctl suspend` | **`Access denied`** | same | same |
+| every `/home` user's `ac-type` | `'nothing'` | `'nothing'` (both users) | `'nothing'` |
+| **attempt to RE-ENABLE** | **`The key is not writable`** | same | same |
+| GDM greeter | `'nothing'` | `'nothing'` | `'nothing'` |
+
+The lock was proved by it blocking a write the agent itself attempted —
+`DCONF_PROFILE=gdm` turned out to be **required**, because under the default
+profile the greeter write hits our own lock and fails.
+
+**The honest limit, stated rather than glossed:** the *cause* is CONFIRMED and
+the path is CONFIRMED blocked, but **F59's original disappearance was hours
+earlier and its journal is gone**, so that specific event cannot be proven to be
+this one. **If node 3 vanishes again, suspend is now excluded rather than
+suspected** — which is the useful property.
+
+### `/srv/coldstore` is live, and faster than projected
+
+`/dev/sda` re-confirmed three ways, then **mounted read-only and counted before
+destroying it: 0 files, 0 directories** — the 128 MB was NTFS metadata from a
+bare format. Now a single GPT partition, **ext4**, `LABEL=coldstore`, mounted by
+UUID with `nofail`.
+
+**Measured 210 MB/s write / 213 MB/s read** — well above F56's ~120 MB/s
+projection, so **the local GGUF-mirror payoff is larger than estimated**: a
+re-provision copies 65 GB in ~5 minutes off local disk against ~97 over the
+100 Mb LAN.
+
+Two choices made beyond the brief, both correct: **`-m 0`** (no root reserve on
+a non-root filesystem, recovering ~46 GB) and **`x-systemd.device-timeout=10`**
+— because `nofail` alone still lets systemd wait the full 90 s
+`DefaultTimeoutStartSec` for a dead device. Verified with `findmnt --verify`
+(0 errors) and a full `umount`/`mount -a` cycle, and `RequiredBy=` is empty,
+which is what makes `nofail` real. **exfat was rejected by demonstration, not
+assertion:** a `chmod 750` was shown surviving on ext4 — exfat carries no POSIX
+modes, so a restore from it silently loses every permission.
+
+### Wake-on-LAN closed
+
+All three NICs are Intel `e1000e`, all already `Wake-on: g` — **but the
+NetworkManager profile said `default`** ("keep whatever the driver has"), now
+pinned to `magic`. `wakeonlan` installed on the coordinator: F59 correctly noted
+a recorded MAC is useless without a way to send the packet. MACs are in
+`network.md` (gitignored). **Not proven end to end** — the BIOS PME setting is
+invisible from the OS and testing it means powering a node down.
