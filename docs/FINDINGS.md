@@ -86,6 +86,7 @@ numbers are cited from other documents and must not move.
 | **F62** | The GTX 960 is strictly worse than the P600 already fitted — and it corrects F54 three ways | CONFIRMED / INFERRED |
 | **F63** | No space problem (1.1 TB free); network-backed inference is 1,479× too slow; the 21 MB/s HF figure is impossible | CONFIRMED |
 | **F64** | Node 3's manual work survived only by accident; nearly all of it was the cost of not using the preseed | CONFIRMED |
+| **F65** | Build the narrow repair agent, not a coding harness — one `journalctl` read is 1.7× the whole slot | CONFIRMED |
 
 ---
 
@@ -4433,3 +4434,99 @@ operator convenience, a no-op `apt upgrade` (d-i had already run it), and
 **Claude Code installed natively under `root`** — the operator's own tooling
 rather than cluster infrastructure, though **an agent CLI running as root on a
 box with a root password enabled is a shape worth noting deliberately.**
+
+---
+
+## F65. Build the narrow repair agent, not a coding harness — and one `journalctl` read is 1.7× the whole context slot
+
+**CONFIRMED, measured on node 1's live server.** When internet access is removed
+the cluster must diagnose and repair itself with a local model. The operator
+named opencode and the DeepSeek harness (`dsh`); both were assessed against
+source, not blog posts.
+
+### The offline hard gate
+
+- **opencode — PASS** with `OPENCODE_DISABLE_MODELS_FETCH=1` +
+  `OPENCODE_DISABLE_AUTOUPDATE=1`. It fetches a remote model catalogue at startup
+  **and every 60 minutes**, but one flag guards both. **The widely-repeated "it
+  npm-installs a provider package on first run" claim is out of date** —
+  `BUNDLED_PROVIDERS` is checked before the `Npm.add()` fallback.
+- **dsh — PASS with two patches.** Telemetry defaults to disabled and the model
+  catalogue is **installed, not fetched** (better than opencode's design) — **but
+  `web_search` is mounted in every mode by default** and calls out on each use.
+- **Goose PASS** (docs only). **Aider PASS but wrong tool** — a code editor with
+  no autonomous shell. **Continue CLI FAIL** — its own quickstart offers only an
+  account or a cloud API key.
+
+### The measurements that decide it
+
+- **opencode's system prompt + 12 tool descriptions = 4,692 tokens**, of which
+  **2,379 describe code-editing tools irrelevant to cluster repair.** That is
+  **57% of `n_ctx_slot=8192` before the first fact**, and 283 node-seconds of
+  prefill.
+- **`journalctl -u llama-server@8080 -n 200` = 14,063 tokens.** That is **1.7×
+  the entire slot, and 14.1 minutes, for ONE read.** `--ctx-shift` is off by
+  standing constraint, so **that is a failure, not graceful degradation.**
+- **Machine logs are 2.14 bytes/token — 2.3× denser than prose.** F49's lesson in
+  a new place: a token estimate calibrated on English is wrong on logs, in the
+  expensive direction.
+- **The same 200 lines through a five-line grep/uniq filter cost 0 tokens, and
+  0 is the correct answer.**
+
+### A narrow agent was actually run, and it got F51 right
+
+A 4-tool turn, measured end to end: **404 prompt / 54 generated / 37.1 s** — and
+**it chose `probe_progress` over `restart_unit`**, which is **the answer the real
+watchdog got wrong in F51.** That is a demonstration, not an argument.
+
+**It also corrects F58, recorded earlier the same day: the formula was 19%
+optimistic at n=404** (14.68 tok/s prefill against the 16.6 derived from a
+2048-token batch). **Short prompts prefill worse than a batch figure implies**,
+so agent-shaped workloads — many small turns — should be costed above the
+formula, not at it.
+
+### Recommendation: build the narrow thing
+
+Collect through the **existing** `llama-watchdog-agent` verbs (699 lines, already
+a forced command on a restricted SSH key, allowlist
+`probe|tcpcheck|rpcprogress|synth|mlstate|restart|heartbeat`) → **reduce
+deterministically to ≤1,500 tokens** → ask the model for **one labelled verb per
+turn** → **gate `restart` on a measured no-progress sample, mechanically, not on
+the model's say-so.**
+
+**The decisive reason is the bootstrap problem, not the token cost.** The agent
+may need to repair the very endpoint it reasons through (F36, F40, and the F40
+addendum's note that mainline shares the fork/waitpid path). **Only the narrow
+design still produces a correct report with no model reachable at all. A general
+harness has no non-model mode.**
+
+**Blast radius reinforces it:** `opencode run` **auto-rejects** every permission
+non-interactively, so the realistic unattended configuration is `--yolo` — an
+unrestricted, auto-approved shell on the coordinator — and **F55 established our
+guard layer has never fired.**
+
+**What is given up, stated honestly:** open-ended investigation of failures
+nobody anticipated. **The counter is that open-ended investigation is exactly the
+mode that reads whole journals, which this hardware cannot afford.**
+Recommendation is to **vendor `dsh` or a Goose binary as break-glass while the
+link is still up**, without making it the default path.
+
+### `DESIGN-NOTES.md` §I: verdict stands, but one of its three reasons is refuted
+
+- **Reason 1 (solves a different problem) — stands**, and §I was judging `dsh` as
+  a *Missing Link* replacement. **The repair-agent question is genuinely new and
+  §I never answered it**; it reaches the same verdict for different reasons.
+- **Reason 2 ("brings no local inference; pointing it at llama-server is
+  plausible but undemonstrated") — REFUTED as stated.** `dsh` documents custom
+  providers with `baseURL` + `api: openai-completions` **and a per-route `compat`
+  block for exactly the F35-class dialect mismatches** (`supportsDeveloperRole`,
+  `maxTokensField`, `thinkingFormat`). Still undemonstrated here, but "plausible"
+  has become "documented in detail".
+- **Reason 3 (preview software promising breaking changes) — stands and gets
+  STRONGER under an air gap.** **9,161 files is the worst possible thing to
+  freeze.**
+
+**Cheapest next experiment — one request, no download:** run the same probe
+against **Qwen3-4B** instead of gpt-oss-120b and see whether it also picks
+`probe_progress` over `restart_unit`. **The whole design rests on that and it is
+currently untested.**
