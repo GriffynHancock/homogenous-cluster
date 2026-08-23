@@ -1,5 +1,27 @@
 # Chunk boundary measurement: how often does a cut sever a qualifying clause pair?
 
+> **EVERY NUMBER BELOW WAS PRODUCED BY AN INSTRUMENT THAT HAS SINCE BEEN
+> REPLACED. Do not quote them without saying so.**
+>
+> They came from the regex sentence-splitter fallback. F48 replaced it with
+> `nupunkt`, and on this same corpus the two disagree by roughly 4x on
+> legislative clause-marker rate (Privacy Act compilation 104: 8,455 units /
+> 2.85% under the regex, **1,861 units / 10.53%** under nupunkt). Sentence
+> counts, "mid-sentence" classifications and the bare-line-wrap false-negative
+> checks below are all downstream of that split, so none of them carries over.
+>
+> The re-run is a command, not a judgement call:
+>
+> ```bash
+> cd missing-link
+> .venv/bin/python -m missing_link.chunk_boundary_audit \
+>     --out /var/tmp/chunk-boundary-nupunkt.json
+> ```
+>
+> Its JSON now stamps `sentence_splitter` on the output, and the corpus rows it
+> reads alongside are re-profiled by `missing_link/reprofile_corpus.py`. Until
+> both have run, this page is a record of what the old instrument said.
+
 **Measured 2026-08-18 on node 1**, answering the one question
 `docs/chunking-research.md` named as cheapest and most decisive: *"How often
 does a chunk boundary actually fall inside a qualifying clause pair on the
@@ -13,8 +35,10 @@ Code: `missing-link/missing_link/chunk_boundary_audit.py` (new, standalone,
 same posture as `audit.py` -- not wired into the job flow), tests
 `missing-link/tests/test_chunk_boundary_audit.py`. Neither `worker.py` nor
 `audit.py` was modified; the new module imports `worker.chunk_spans` directly
-and re-uses the same dependency-free sentence-splitter shape `audit.py`'s
-`_SENT_FALLBACK` uses (a test asserts the two are behaviourally identical).
+and shares `audit.py`'s sentence splitter. **As of F48 that is literally one
+object** -- `missing_link/sentences.py` -- rather than two same-shaped copies;
+a test asserts the identity, not merely the behaviour, because the two copies
+that existed when this page was written carried contradicting docstrings.
 
 Labels: **CONFIRMED** (run here, output read), **INFERRED** (computed from
 CONFIRMED numbers).
