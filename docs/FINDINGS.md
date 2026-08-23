@@ -68,6 +68,7 @@ numbers are cited from other documents and must not move.
 | **F47** | GLM-5 is 40.8 B active (computed, not published) — and Model B closes in the NEGATIVE | CONFIRMED |
 | **F48** | pysbd is worse than our regex; the legal-domain splitter nobody searched for fixes F45 | CONFIRMED |
 | **F49** | Whole-document single-pass is impossible at `n_ctx_slot=8192`; `WORDS_PER_TOKEN` is wrong by 2x and `/tokenize` is free | CONFIRMED |
+| **Addendum to F48** | Swap implemented; nupunkt INVERTS the raw-HTML manifestation, so HTML extraction stays load-bearing | CONFIRMED |
 
 ---
 
@@ -2904,3 +2905,79 @@ the pilot's observed event rate is what says whether 53 sections can clear 6
 discordant pairs — and that is much cheaper to learn in 1.3 h than in 11.9.
 `analyse` prints an explicit UNDERPOWERED guard below 6 discordant pairs and
 refuses to let a null read as "no amplification".
+
+---
+
+## Addendum to F48. The swap is implemented — and nupunkt does NOT fix the raw-HTML manifestation, it INVERTS it
+
+**CONFIRMED.** F48's ADOPT-WITH-WRAPPER verdict is now implemented (branch
+`agent-nupunkt-splitter`, not yet merged). Four things came out of building it.
+
+**1. The wrapper does no string matching, because it does not have to.** F48
+assumed `nupunkt.sent_tokenize` returns strings and that the wrapper would have
+to recover offsets by searching. **It also exposes `nupunkt.sent_spans`, which
+returns true character offsets directly** — contiguous and gap-free. The wrapper
+only trims whitespace and shifts offsets, exactly as the old regex path did.
+**This removes the entire bug class F48 was worried about**, including the
+classic `str.find` failure where three identical repeated sentences collapse to
+one offset. That case is now an explicit test and yields three distinct offsets.
+
+**2. The offset contract was verified against real text, not fixtures alone.**
+`text[start:end] == sentence` asserted per span, plus in-range, non-overlapping,
+monotonic and no whitespace slop, over **12,129 real spans** read out-of-band
+from the live corpus (Privacy Act compilation 104, OAIC Ashley Madison, OAIC
+Pound Road) — all passing on both the nupunkt and regex rungs. Also verified
+relative to a mid-document slice, because the ledger splits chunk slices rather
+than whole documents. **F48's measured table reproduces digit for digit through
+the wired-in code**, and the regex figures match what is currently *stored* in
+`corpus_documents`, confirming those rows came from the old rung.
+
+**3. nupunkt does NOT fix F45's raw-HTML-markup manifestation — it inverts the
+sign.** On the HTML fixture, raw markup reads **0.50** and cleaned text
+**0.33**: markup now *inflates* density where it previously *deflated* it.
+**HTML extraction therefore remains load-bearing and must not be dropped as
+redundant** once the splitter lands. (Small synthetic fixture — treat the
+direction as observed there, not corpus-wide.) An existing test caught this by
+failing.
+
+**4. Four existing tests encoded the OLD splitter's defects as expectations.**
+They were not deleted — each is pinned to the regex rung via a fixture, with a
+companion asserting the fixed behaviour. **A test suite can hold a bug in place
+as a specification**, and deleting such tests hides the change rather than
+recording it. Suite: **585 passed** with nupunkt (was 552); **576 passed / 9
+skipped** on an interpreter genuinely lacking it, which is the fallback path
+proving itself rather than being assumed.
+
+**Air gap and Python floor, both verified rather than assumed.** `pip download`
+resolved the whole closure to **one 9.1 MB wheel, zero transitive
+dependencies**; first use inside `unshare -rn` with no network interfaces, a
+fresh `HOME`, and `socket` monkeypatched to raise, **succeeded — no first-use
+download.** Import 33 ms, first call 2.08 s to load the bundled model (cached),
+and the import sits inside the function so `worker.py`/`app.py` never pay it.
+**Node 1 and node 2 are both Python 3.11.2 — exactly on nupunkt's >=3.11 floor.
+Nodes 3-7 remain unchecked, and a floor satisfied only on characterised nodes
+is a fleet trap.**
+
+**Re-profiling is written and deliberately NOT executed: ~65 s measured** (17
+docs, 7.4 M chars; the two NIST PDFs are 48 s of it and scale superlinearly).
+The script refuses to start unless nupunkt is the active splitter, prints the
+row count before writing, touches only the four splitter-dependent columns, and
+**aborts if a splitter-INDEPENDENT figure moved** — which would mean something
+other than the splitter changed. `docs/chunk-boundary-measurement.md` now
+carries a banner stating every figure in it came from the old instrument.
+
+**Two actions the merge requires, or it silently runs the old rung:** install
+nupunkt into `missing-link/.venv`, and restart `missing-link.service` so
+`init_corpus_documents` adds the `sentence_splitter` column.
+
+**Found in passing: `reportlab` is an UNDECLARED test dependency** — present in
+the main `.venv` but in neither requirements file, so `tests/test_extract.py`
+fails with `ModuleNotFoundError` in any fresh venv. This is the same class as
+F34: the suite passes where it happens to be run and nowhere else.
+
+**Process note, recorded because the alternative is worse.** The agent doing
+this work ran the read-only profiling pass on node 1 at **10:57-10:59 AEST**
+while the sharding benchmark held both nodes, then **disclosed it unprompted**
+with the exact window so the affected repetitions could be discarded. Under
+F44 that is a real perturbation. **A disclosed contention event is cheap; an
+undisclosed one silently corrupts a number that then gets quoted for months.**
