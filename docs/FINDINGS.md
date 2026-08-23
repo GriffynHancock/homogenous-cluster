@@ -79,6 +79,7 @@ numbers are cited from other documents and must not move.
 | **F56** | The 2 → 3 transition found three MORE latent bugs, none about the username — and it corrects F53 | CONFIRMED |
 | **F57** | Distributing ComfyUI cannot help; nginx's 60 s default would kill every real request; corrects F54 on n8n | CONFIRMED / REPORTED |
 | **F58** | A token-budget formula decides the syllabus; a small model buys only ~2x; `--api-key` takes a LIST | CONFIRMED |
+| **F59** | Node 3 vanished at layer 2 (likely GNOME idle suspend) — and tracked `nodes.env` publishes the IPs the docs hide | CONFIRMED |
 
 ---
 
@@ -3774,3 +3775,83 @@ the original senders"* — **a fact, not a grant** — and the n8n licence grey 
 still wants one email. **CPU-only voice cloning is entirely unestablished and is
 the highest-guardrail-risk modality if it turns out to work**; one timed
 10-second clip is the whole test.
+
+---
+
+## F59. Node 3 vanished from the LAN hours after joining — and `nodes.env` publishes the IPs the docs are careful to hide
+
+**CONFIRMED (both), mechanism for the first INFERRED.** Two problems found while
+consolidating today's work.
+
+### Node 3 is unreachable, and it is layer 2
+
+Verified directly by the orchestrator, not carried on report:
+
+```
+ping   -> 2 transmitted, 0 received, 100% packet loss
+ip neigh 10.10.0.40 -> INCOMPLETE
+ssh    -> No route to host
+```
+
+**ARP does not resolve**, from node 1 *and* node 2, so this is not `sshd`, not a
+service, and not the hardening run. It is not on Tailscale either.
+
+**The timing is adjacent to work but not plausibly caused by it.** Node 3
+answered `distribute.sh` completely — rsync, VERSION write, and an executed
+`rpc-server --help` — and reported `ok`; minutes later it was gone. Nothing in
+`distribute.sh` powers off a machine and no service was stopped. **Recorded as
+adjacency rather than dismissed**, because the agent that ran the last
+successful contact is the one that noticed.
+
+**The plausible mechanism, and it predicts a recurrence:** neither `setup.sh`
+nor `join-node.sh` masks `sleep.target`/`suspend.target` or disables GNOME idle
+suspend, and node 2 reports `org.gnome.settings-daemon.plugins.power
+sleep-inactive-ac-type = 'suspend'`. Per F56 **the GNOME desktop is the fleet's
+normal**, so every node carries this. **Node 3 is the only node with no
+`llama-server` and an idle `rpc-server` — i.e. the only machine in the fleet
+that would actually reach an idle timeout.** Nodes 1 and 2 have never been idle
+long enough to find out.
+
+**If that is the cause, node 4 will do the same thing**, and so will node 3
+every time it sits between jobs. **The fix belongs in `setup.sh`** (mask
+`sleep.target suspend.target hibernate.target hybrid-sleep.target`, and disable
+the GNOME power plugin's idle suspend) — which makes it a third instance of
+F56's rule that **a provisioning step living in nobody's script is invisible
+until a genuinely fresh node arrives.**
+
+**Confirmation needs physical access.** There is **no MAC address on file for
+node 3 and no WoL tool installed**, so it cannot be woken remotely — worth
+fixing for every node, since a headless machine in a locked cupboard that
+suspends is otherwise a site visit. `network.md` also still reads "node3-7 |
+not yet installed" and has no MAC for node 3; it is gitignored so no branch
+touched it, but it is now wrong about the fleet.
+
+### `provisioning/nodes.env` is tracked, and it publishes the LAN IPs
+
+The docs sync correctly scrubbed LAN IPs from `STATUS.md` and
+`docs/CHANGELOG.md`, on the stated grounds that **this repo is published and
+site-specific detail belongs in the gitignored `network.md`.** But:
+
+```
+git ls-files --error-unmatch provisioning/nodes.env  -> TRACKED
+grep -c '10\.10\.0\.'          provisioning/nodes.env -> 12
+```
+
+**`nodes.env` is tracked and always has been on `main`**, so every LAN IP the
+prose is careful to omit ships to GitHub anyway — and today's node-3 work added
+one more, consistent with the file's existing convention and inconsistent with
+the project's stated one. **The scrub protected the documentation and left the
+configuration wide open**, which is the more machine-readable of the two.
+
+**This is a policy inconsistency, not an emergency** — these are RFC1918
+addresses on a DMZ, and knowing them buys an outsider nothing without access to
+the segment. But the project asserts a rule it does not follow, and **a rule
+that is followed in prose and broken in config is worse than no rule**, because
+it produces false confidence in exactly the artefact a reader checks first.
+
+**Recommended fix, NOT applied** — it changes a file every provisioning script
+reads, and the operator should choose: gitignore `nodes.env`, commit a
+`nodes.env.example` carrying the format and placeholder addresses, and have
+`setup.sh`/`distribute.sh` fail with a clear message when the real file is
+absent. That matches how `network.md` is already handled and keeps the schema
+public, which is what the eventual skill actually needs.
