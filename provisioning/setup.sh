@@ -126,6 +126,128 @@ fi
 THP=$(cat /sys/kernel/mm/transparent_hugepage/enabled)
 echo "    THP: $THP (expected [madvise])"
 
+log "Never sleep"
+# A node that suspends drops off the LAN ENTIRELY -- ARP goes INCOMPLETE and
+# every peer sees "No route to host". It is indistinguishable from a dead
+# machine, and a headless box in a locked cupboard cannot be woken by hand.
+#
+# CONFIRMED on node 3, 2026-08-23 (F59): its GNOME session went idle at
+# 13:22:22 and gsd-power suspended the machine at 13:42:22 -- exactly
+# sleep-inactive-ac-timeout (1200 s) later. It stayed down 42 minutes. Node 1,
+# the COORDINATOR, did the same on 2026-08-12.
+#
+# The fleet runs a full GNOME desktop (F56), so EVERY node ships with GNOME
+# automatic suspend on. Node 3 was simply the first machine idle long enough to
+# reach the timeout -- it has no llama-server and only an idle rpc-server.
+#
+# Four layers, because each one alone has a hole. Every step is reversible.
+
+# 1. Hard backstop. Whatever asks -- gsd-power, the GDM greeter, a stray
+#    `systemctl suspend` -- the transaction fails because the target is
+#    /dev/null. This is the layer that does not depend on knowing the caller.
+#    Undo: systemctl unmask <targets>
+systemctl mask sleep.target suspend.target hibernate.target \
+                hybrid-sleep.target suspend-then-hibernate.target
+
+# 2. logind: never act on idle, the lid, or the sleep/hibernate keys.
+#    IdleAction=ignore is already the upstream default; pinned so a later
+#    package or admin change cannot quietly turn it on.
+mkdir -p /etc/systemd/logind.conf.d
+cat > /etc/systemd/logind.conf.d/10-cluster-no-suspend.conf <<'EOF'
+# Cluster nodes are headless boxes in a cupboard. Nothing may suspend them.
+# See docs/FINDINGS.md F59.
+[Login]
+IdleAction=ignore
+IdleActionSec=0
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+HandleLidSwitchDocked=ignore
+EOF
+# Deliberately NOT restarting systemd-logind: on a machine with an active
+# graphical session that can drop the session. Effective at next boot, and
+# layer 1 covers the gap.
+
+# 3. GNOME, for every user PRESENT AND FUTURE -- a system dconf db plus a LOCK.
+#    Setting one admin account's gsettings is what was done on node 1 after its
+#    2026-08-12 suspend and it is not enough: it misses the GDM greeter, a
+#    second admin account (node 2 has two), and any account created later. A
+#    LOCKED system-db value overrides the per-user db and cannot be written
+#    back -- `gsettings set ... suspend` returns "The key is not writable".
+mkdir -p /etc/dconf/db/local.d/locks /etc/dconf/profile
+if [ ! -f /etc/dconf/profile/user ]; then
+  printf 'user-db:user\nsystem-db:local\n' > /etc/dconf/profile/user
+elif ! grep -qx 'system-db:local' /etc/dconf/profile/user; then
+  printf 'system-db:local\n' >> /etc/dconf/profile/user
+fi
+cat > /etc/dconf/db/local.d/00-cluster-no-suspend <<'EOF'
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-ac-timeout=0
+sleep-inactive-battery-type='nothing'
+sleep-inactive-battery-timeout=0
+EOF
+cat > /etc/dconf/db/local.d/locks/00-cluster-no-suspend <<'EOF'
+/org/gnome/settings-daemon/plugins/power/sleep-inactive-ac-type
+/org/gnome/settings-daemon/plugins/power/sleep-inactive-ac-timeout
+/org/gnome/settings-daemon/plugins/power/sleep-inactive-battery-type
+/org/gnome/settings-daemon/plugins/power/sleep-inactive-battery-timeout
+EOF
+dconf update
+
+# 4. The GDM GREETER has its OWN dconf profile and its own answer.
+#    /usr/share/dconf/profile/gdm is "user-db:user" + "file-db:/var/lib/gdm3/
+#    greeter-dconf-defaults". It does NOT read system-db:local, so step 3
+#    misses it entirely. Measured on node 3: the greeter read 'suspend' while
+#    the logged-in admin read 'nothing'. This is the layer that matters most
+#    for a node with NOBODY logged in graphically -- which is what nodes 4-7
+#    will be.
+if [ -f /etc/gdm3/greeter.dconf-defaults ]; then
+  if ! grep -qx "sleep-inactive-ac-type='nothing'" /etc/gdm3/greeter.dconf-defaults; then
+    cp -a /etc/gdm3/greeter.dconf-defaults \
+          "/etc/gdm3/greeter.dconf-defaults.bak.$(date +%Y%m%d-%H%M%S)"
+    cat >> /etc/gdm3/greeter.dconf-defaults <<'EOF'
+
+# Cluster node: nothing may suspend this machine (FINDINGS F59).
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-ac-timeout=0
+sleep-inactive-battery-type='nothing'
+sleep-inactive-battery-timeout=0
+EOF
+  fi
+  # The conffile above is recompiled into the file-db when gdm3 next starts.
+  # Also write the greeter user's own db, which is higher priority and takes
+  # effect at the next greeter session without restarting gdm3 (which would
+  # kill a logged-in console session). DCONF_PROFILE=gdm is REQUIRED: under
+  # the default 'user' profile this write hits the step-3 lock and fails.
+  if id Debian-gdm >/dev/null 2>&1; then
+    for k in sleep-inactive-ac-type sleep-inactive-battery-type; do
+      runuser -u Debian-gdm -- env DCONF_PROFILE=gdm dbus-run-session -- \
+        gsettings set org.gnome.settings-daemon.plugins.power "$k" 'nothing' || true
+    done
+  fi
+fi
+
+# 5. Wake-on-LAN, so a node that goes down for any OTHER reason is still not a
+#    site visit. Measured on all three nodes: the e1000e NICs report
+#    "Supports Wake-on: pumbg" and already sit at "Wake-on: g", but the
+#    NetworkManager profile said 'default' (= leave whatever the driver has).
+#    Pin it to magic so it cannot drift. Send with: wakeonlan <mac>
+#    NOTE: this cannot verify the BIOS PME setting, which is not visible from
+#    the OS. WoL is enabled at the NIC; it is NOT proven end to end.
+for c in $(nmcli -t -f NAME connection show 2>/dev/null); do
+  if [ "$(nmcli -g connection.type connection show "$c" 2>/dev/null)" = "802-3-ethernet" ]; then
+    nmcli connection modify "$c" 802-3-ethernet.wake-on-lan magic || true
+  fi
+done
+for i in /sys/class/net/*/address; do
+  n=$(basename "$(dirname "$i")")
+  [ "$n" = lo ] && continue
+  echo "    WoL MAC $n = $(cat "$i")   -- record this in network.md"
+done
+
 log "Hardware facts -- record these in docs/measurements.md"
 PHYS_CORES=$(lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l)
 echo "    physical cores : $PHYS_CORES   (nproc reports $(nproc))"
