@@ -684,9 +684,12 @@ overhead figures were a localhost isolation test with the network removed.
 They come from a single short chat request in `bench/two-node-smoke.sh`
 (33 prompt tokens, 54 generated), whereas the comparison columns are
 `llama-bench pp512`/`tg128`. Different workload, far fewer tokens, no repeats.
-**A proper `llama-bench` run over the RPC devices is still owed**, and must be
-done on an idle link — measuring it while a 65 GB transfer saturates the network
-would be meaningless.
+~~**A proper `llama-bench` run over the RPC devices is still owed**~~ —
+**DONE 2026-08-23, see "Two-node sharding A/B" immediately below, which
+SUPERSEDES this table.** The rigorous run reproduces this section's generation
+figure (5.99 vs 5.89 t/s) but the prefill number here is too low (19.07 vs
+17.76), and the rigorous run also identifies the mechanism and a better
+topology.
 
 **The model was 2.4 GB, and that biases the result — probably pessimistically.**
 Qwen3-4B needs no sharding whatsoever (it fits one node ~50 times over). Splitting
@@ -696,6 +699,11 @@ per-layer overhead**, because there is almost no per-layer compute to amortise t
 round trip against. On a large MoE, per-layer compute is far larger against the
 same round trip, so the relative penalty should be **smaller**. Treat −49% as a
 **pessimistic bound for large models, not an estimate.**
+
+**⚠ That last inference is now believed WRONG.** The rigorous run below shows the
+dominant generation cost is the **logit vector returned per token**, which scales
+with `n_vocab` and not with model size, so a larger model does **not** amortise
+it. A large model amortises the *protocol* cost, not the *wire* cost.
 
 **What is nonetheless clear:** generation across two real machines is roughly
 **half** the single-node rate, against the −5.2% localhost floor. The difference
@@ -725,6 +733,186 @@ also clears with two separate machines**, i.e. with real TCP, distinct
 **Still model-dependent.** The public reproductions involve MoE graphs with
 unusual constant/view nodes; this was a **dense 4B**. Re-run with the actual
 Model B GGUF before committing to a 7-node launch.
+
+---
+
+## Two-node sharding A/B — RIGOROUS, and it decomposes the RPC penalty
+
+**Date:** 2026-08-23 | **Nodes:** node1 + node2 | **Model:** Qwen3-4B Q4_K_M
+**Build:** mainline b10369 (`6e62ba538`) — `ggml-rpc-server`, `libggml-cpu.so`
+and `libllama.so` verified **md5-identical on both nodes**, glibc 2.36 both,
+4 physical cores both | `llama-bench -t 4 -p 512 -n 128 -r 5` | both
+`rpc-server -t 4 -c` (physical cores, per F10)
+
+**This supersedes the "⚠ INDICATIVE, NOT RIGOROUS" figures in the section
+above**, which came from a single short chat request (33 prompt / 54 generated
+tokens). This is `llama-bench`, five repetitions per cell, on a verified-idle
+link. Owed by `STATUS.md` §1b.
+
+**The headline: the ≈−47% generation figure was RIGHT, and F14's −5% was also
+right. They measure different things, and the configuration that separates them
+had never been run.**
+
+| # | Topology | pp512 (t/s) | tg128 (t/s) |
+|---|---|---:|---:|
+| **A** | local CPU, no RPC at all | **32.18 ± 0.58** | **11.11 ± 0.12** |
+| **B** | whole model on ONE RPC device, **loopback** | 19.60 ± 0.15 | 10.47 ± 0.09 |
+| **C** | whole model on ONE RPC device, **node 2 over the LAN** | 19.71 ± 0.08 | 6.76 ± 0.01 |
+| **D** | **two** RPC devices (loopback + node 2), `-ts 1/1` | 19.07 ± 0.62 | 5.99 ± 0.06 |
+| **E** | local CPU + node 2 RPC, `-ngl 18` (one hop, no loopback RPC) | 24.53 ± 0.11 | 5.78 ± 0.16 |
+
+Relative to A:
+
+| # | prefill | generation |
+|---|---:|---:|
+| B | −39.1% | **−5.8%** |
+| C | −38.8% | −39.2% |
+| D | −40.7% | **−46.1%** |
+| E | **−23.8%** | −48.0% |
+
+**D is the topology the old smoke test used**, and it lands on tg 5.99 t/s
+against that test's 5.89 t/s — the disputed number reproduces. **B is F14's
+topology**, and it lands on −5.8% / −39.1% against F14's −5.2% / −39.4% — that
+reproduces too, on the same build eleven days later.
+
+### The decomposition, which is the actual result
+
+Generation, walking A → B → C → D:
+
+| step | what is added | tg128 | cost |
+|---|---|---:|---:|
+| A | — | 11.11 | — |
+| → B | RPC protocol, **network removed** | 10.47 | −5.8% |
+| → C | **the 100 Mb wire** | 6.76 | **−35.4%** |
+| → D | a second device + the split | 5.99 | −11.4% |
+
+**F14 measured the first step, and the project has been quoting it as the cost
+of sharding ever since. The wire is the second step, and it is six times
+larger.** F14 was never wrong; it was a localhost isolation test that said so on
+its face, and F28 already suspected this. It is now measured.
+
+Prefill decomposes completely differently:
+
+| step | pp512 | cost |
+|---|---:|---:|
+| A | 32.18 | — |
+| → B | 19.60 | −39.1% |
+| → C | 19.71 | **+0.6% — the network is FREE for prefill** |
+
+### Mechanism: the logit vector crosses the wire once per generated token
+
+Not inferred — it reconciles to the interface byte counters.
+
+Whichever device holds the output layer must return the **full logit vector over
+the vocabulary** for every token generated. Qwen3-4B has `n_vocab = 151936`; at
+f32 that is 151936 × 4 = **593.5 KiB per token**.
+
+| quantity | predicted | measured |
+|---|---:|---:|
+| added latency per token at 11.7 MB/s (F28) | 51.9 ms | **52.4 ms** (B→C: 95.5 → 147.9 ms/token) |
+| bytes received by node 1 across run C | 445 MiB | **443 MiB** |
+
+Two independent quantities, both within 1%. **Generation over RPC on this fleet
+is neither bandwidth-bound nor compute-bound — it is bound by shipping a
+593 KiB softmax input back across a 100 Mb link once per token.**
+
+**And that is exactly why prefill is unaffected.** A 512-token prefill batch
+returns logits for the *final position only* — one transfer per batch, not one
+per token. The same wire that costs generation 35% costs prefill nothing.
+
+**This predicts the effect scales with `n_vocab`, not with model size** — the
+opposite of the guess recorded in the previous section, which expected a large
+model to amortise RPC better. A larger model amortises the *protocol* cost (step
+A→B) but not the *wire* cost, because the logit vector does not shrink.
+
+### Corollary: the obvious sharding topology is the wrong one
+
+**E beats D on prefill by 29%** (24.53 vs 19.07) for the same 50/50 split across
+the same two machines. D routes node 1's own half through a loopback
+`rpc-server`; E gives node 1's half to its own CPU backend directly and uses RPC
+only for the genuinely remote half. **If you shard, never put a loopback
+`rpc-server` in the path for the local shard** — `--rpc <remote> -ngl <half>`
+dominates `--rpc 127.0.0.1,<remote> -ts 1/1`. Generation is unchanged between
+them (−46% vs −48%), because generation's cost is the wire, not the hop count.
+
+### The obvious fix does not work in b10369 — recorded so it is not retried
+
+Pinning the output tensor to the local CPU should replace 593 KiB/token of
+logits with ~10 KiB/token of hidden state. It does not:
+
+| config | pp512 | tg128 | rx |
+|---|---:|---:|---:|
+| E (`-ngl 18`), `-r 5` | 24.53 ± 0.11 | 5.78 ± 0.16 | 401 MiB |
+| E + `-ot 'output\.weight=CPU'`, `-r 3` | **12.37 ± 0.04** | **2.76 ± 0.02** | **937 MiB** |
+
+The override does move the tensor (RPC0 model buffer drops 1285.94 → 1190.32
+MiB) but both metrics collapse and traffic more than **doubles** — it splits the
+graph pathologically rather than trimming the return payload. The mechanism
+above is established by accounting, not by this intervention; what is refuted is
+the one-flag remedy.
+
+### Provenance and contamination disclosure
+
+- Link verified idle before the run (8 KB/s rx) and per-config rx/tx counters
+  recorded for every cell. Runs A and B moved 0 MiB across `eno1`.
+- `llama-bench` was chosen over any chat/`curl` path deliberately (F17: `curl -w
+  %{time_starttransfer}` under-reports TTFT by orders of magnitude). Prompt
+  caching is not a factor — `llama-bench` re-runs its synthetic batch per
+  repetition and has no server-side prompt cache in the path.
+- **Config E was first measured 10:56:23–11:00:52 AEST, which overlapped a
+  concurrent single-threaded CPU-bound job on node 1 (10:57–10:59).** That
+  sample was **discarded, not averaged in**, and E was re-run on idle hardware
+  at 11:09:00–11:13:23. The contamination was visible in the variance: pp512
+  read 22.63 **± 1.23** contaminated versus 24.53 **± 0.11** clean, an error bar
+  11× wider. Generation barely moved (5.97 → 5.78), consistent with generation
+  being wire-bound rather than CPU-bound on this topology.
+- **Runs A, B, C and D all completed before 10:57 and are unaffected**
+  (A 10:38:48–10:41:24, B →10:45:08, C →10:51:27, D →10:56:23).
+- The fleet watchdog did **not** restart either `rpc-server` at any point during
+  this pass; its node-2 suspicion streak peaked at 210 s against a 300 s grace
+  and cleared between configs.
+
+### Large-model control, and why there is no large-model sharded number
+
+A same-day single-node control on the deployment model reproduces the 2026-08-17
+figures almost exactly, confirming node 1 is in its previously measured state:
+
+| gpt-oss-120b F16, node 1, `-t 4`, `-r 5` | 2026-08-17 | 2026-08-23 |
+|---|---:|---:|
+| pp512 (t/s) | 16.03 ± 0.55 | **15.99 ± 0.46** |
+| tg128 (t/s) | 6.05 ± 0.00 | **6.11 ± 0.02** |
+
+**The sharded gpt-oss-120b run could not be completed, for an operational
+reason rather than a measurement one, and the reason is itself the finding.**
+`llama.cpp`'s `rpc-server` serves one client at a time and does not accept new
+connections while busy, so its TCP port **refuses connections for the entire
+duration of a shard upload**. Pushing half of a 60.87 GiB model to node 2 takes
+~54 min at the measured 11.7 MB/s. The fleet watchdog's `rpc` predicate treats
+"port refuses for 350 s" as WEDGED and restarted the worker 9m41s in, aborting
+the load at 5.4 GiB transferred:
+
+```
+11:31:02 [node2 10.10.0.39:50052 rpc] WEDGED: active but the RPC port has refused
+         connections on the node for 350s. ... A worker that is not listening
+         cannot be carrying shard work, and restarting one is cheap
+11:31:03 RESTARTING rpc-server@50052 on node2 -- ... ANY IN-FLIGHT WORK ON
+         10.10.0.39:50052 DIED AT THIS TIMESTAMP.
+```
+
+The client died with `ggml-rpc.cpp:509: Remote RPC server crashed or returned
+malformed response` inside `llama_model_loader::load_all_data`.
+
+**The watchdog's stated premise — "a worker that is not listening cannot be
+carrying shard work" — is exactly inverted here: it was not listening *because*
+it was carrying shard work.** The Qwen3-4B configs above survived only because
+a 1.3 GiB shard uploads in ~110 s, inside the 300 s grace. **Any model whose
+per-node shard exceeds roughly 4 GB on this link cannot currently be loaded onto
+a sharded node at all** — it will be killed mid-load on every attempt. This is
+a blocker for S > 1 on any real model and it is not a `llama.cpp` bug.
+
+Left in place afterwards: ~6.8 GB of content-addressed tensor cache at
+`/var/lib/cluster/.cache/llama.cpp/rpc` on node 2 (369 GB still free). It is a
+legitimate cache and would accelerate a retry, so it was not deleted.
 
 ---
 
