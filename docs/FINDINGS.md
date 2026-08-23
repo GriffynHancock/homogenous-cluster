@@ -83,6 +83,7 @@ numbers are cited from other documents and must not move.
 | **F60** | No lab targets on this LAN — the cluster sits on a production cyber-range MANAGEMENT segment | CONFIRMED |
 | **Addendum to F59** | Suspend cause CONFIRMED (1200 s = the GNOME idle timeout); the fix had been hand-applied twice and never propagated | CONFIRMED |
 | **F61** | n8n's `Execute Command` is disabled by default; the LLM is measurably useless at cryptanalysis | CONFIRMED / REPORTED |
+| **F62** | The GTX 960 is strictly worse than the P600 already fitted — and it corrects F54 three ways | CONFIRMED / INFERRED |
 
 ---
 
@@ -4130,3 +4131,95 @@ workflow to demo first. **Every token count in the document is an estimate of
 input size, and F49 says such guesses are wrong by up to 2×**, so one
 `POST /tokenize` pass over real examples should correct the tables before
 anything is timetabled.
+
+---
+
+## F62. The GTX 960 is worse than the card already in the machine — and it corrects F54 three ways
+
+**CONFIRMED / INFERRED as marked.** The budget is zero, so the RTX 3060
+recommendation in F54 is void. The available card is a **GTX 960** (Maxwell,
+**sm_52**). Verdict:
+
+- **2 GB variant — NOT USABLE as a change of plan.** INFERRED ~85–112 s per
+  512×512 20-step SD1.5 image, which is **slower per image than SD-Turbo already
+  is on the CPU** (25–35 s, F54/F57). It buys nothing the existing turbo plan
+  does not already give the class.
+- **4 GB variant — USABLE ONLY ON A DELIBERATELY PINNED STACK, and only if it
+  measures at the optimistic end.** **Two INFERRED routes disagree by 4×**
+  (~30 s vs ~2.5 min), which is precisely why it must be measured rather than
+  argued. At 30–45 s it changes what is teachable (full-quality 20-step SD1.5 at
+  turbo latency; samplers, CFG and negative prompts become in-class rather than
+  overnight). At 2.5 min it does not, and the driver pin is not worth it.
+- **Video and SDXL stay out for both.** Video by F54's arithmetic, unchanged by
+  5.4× compute. SDXL for a **new** reason — see the FP16 point below: fp32 is
+  forced, so its 2.6 B-param UNet is **10.3 GB**, which neither card can hold.
+
+**The test is specified with its threshold set IN ADVANCE — half a day, zero
+cost, `<60 s` yes / `>120 s` no.** That is the new verification convention
+applied properly: deciding the pass criterion before seeing the number is what
+stops a marginal result being argued into a win.
+
+### Correction 1 — F54's stack argument was overstated
+
+F54 said the old-GPU path means "old PyTorch, old CUDA, old ComfyUI,
+indefinitely, no security updates". **Three of those four are wrong.**
+**CONFIRMED from PyTorch's own build source** (`.ci/manywheel/build_env_setup.py`
+on `main`): `"12.6": {"x86_64": {50, 60, 70, 75, 80, 86, 90}}` — **current
+PyTorch still ships cc 5.0 kernels in the cu126 Linux wheel**, and CUDA's
+binary-compatibility rule (a cubin for X.y runs on X.z where z ≥ y) makes sm_50
+execute on this sm_52 card. ComfyUI ships a **first-party cu126 portable build
+explicitly "Supports Nvidia 10 series and older GPUs"**, and Debian 12's 535
+LTSB driver supports Maxwell **with CVE fixes**.
+
+**What IS genuinely frozen:** the CUDA *toolkit* branch (12.9.2 — verified as
+the last in NVIDIA's own Debian 12 repo index) and the *driver* branch (R580,
+NVIDIA's wording). Two real caveats: release wheels are SASS-only with no PTX
+fallback, and there is already an RFC to drop cu126 at torch 2.10.
+
+### Correction 2 — the PSU warning was about the wrong machine
+
+F54 warned that the **490 W P510** ships a single 6-pin drop. **These are
+P410s.** CONFIRMED on node 1: `dmidecode -t 39` → **450 W, one fixed PSU
+option**; `dmidecode -t 9` → **Slot 3 is a free PCIe 3.0 x16, full length**.
+Lenovo specifies this chassis for **two 120 W Quadro M4000s**, so a 120 W GTX
+960 is inside its design envelope. **This warning was relayed to the operator as
+a reason to check before buying, and it was wrong** — nobody had confirmed the
+chassis model against the caution. Still open and trivially cheap: **nobody has
+counted the actual PSU drops** — 30 seconds with the panel off.
+
+### Correction 3 — the FP16 point, sharpened, kills it on F54's own axis
+
+NVIDIA's Table 4: **cc 6.1 = 2 FP16 results/clock; cc 5.0/5.2 = N/A.**
+**Maxwell has NO native FP16 arithmetic at all.** ComfyUI hard-codes
+`props.major < 6 → return False` **before** the `manual_cast` branch, so it
+cannot even use fp16 as *storage*. SD1.5 therefore loads at **4.26 GB fp32**
+against ComfyUI's own resident-weight budget of ~2.33 GiB on a 4 GB card and
+~0.57 GiB on a 2 GB one.
+
+**So on the exact axis F54 used to reject the Quadro P600, the GTX 960 is
+strictly worse than the card already sitting in the machine** — it is only 2.0×
+the P600's compute and 1.75× its bandwidth, and it is a generation further back
+on FP16 support.
+
+### It is not an embedding or Whisper card either
+
+**None of the non-image uses clear the bar.** 120b offload gives **+5%** — 4 GB
+is 6.6% of a 60.9 GiB model, and Amdahl caps it at +7.1% even at infinite GPU
+speed, i.e. inside existing noise. A small model held wholly on the card is the
+only non-dead LLM idea (Qwen3-4B Q4_K_M at 2.33 GiB fits 4 GB, not 2 GB) — but
+llama.cpp's `GGML_CUDA_CC_DP4A 610` means sm_52 takes a **software fallback of
+four integer MADs per `__dp4a`**, and F58 already showed a smaller model buys
+only ~1.9×. Whisper fits comfortably but transcription is not a named workload
+and there is no audio corpus.
+
+Embeddings are the best paper fit and the one use where 2 GB is no handicap
+(bge-large is ~670 MB) — but embedding is a **one-off indexing cost on a small
+corpus**, and the retrieval task profile does not exist yet. **The card is not
+the missing piece of the retrieval profile; the profile is.**
+
+**Two things flagged as unverifiable to primary source**, correctly rather than
+asserted: NVIDIA's ~Oct 2028 Maxwell security window (press coverage only —
+`nvidia.custhelp.com` returns 403 and the GTX 960 product page is now a 404),
+and **any GTX-960-specific Stable Diffusion benchmark, which does not appear to
+exist anywhere.** That absence is itself the argument for measuring rather than
+estimating.
