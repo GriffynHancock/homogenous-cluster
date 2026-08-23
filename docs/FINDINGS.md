@@ -64,6 +64,7 @@ numbers are cited from other documents and must not move.
 | **F43** | The fleet-wide watchdog was silently non-functional on node 2 from install | CONFIRMED |
 | **F44** | Even niced, a CPU-bound sidecar measurably starves `llama-server` on a 4-core node | CONFIRMED |
 | **F45** | The sentence splitter's line-based fallback distorts clause-marker density — and it now gates corpus decisions | CONFIRMED |
+| **F46** | A citation can be CORRECT and its sentence still false; and a stricter regex would have destroyed all 7 valid citations | CONFIRMED |
 
 ---
 
@@ -2505,3 +2506,89 @@ length; this is a metric that does not survive a change of document genre.**
 - **All four government PDFs extracted cleanly — but they were single-column.**
   The multi-column failure mode pypdf is known for was therefore *not* tested.
   Reported honestly rather than concluding PDF extraction is safe.
+
+---
+
+## F46. A citation can be perfectly CORRECT and the sentence it anchors still false — and a stricter regex would have destroyed all seven valid citations
+
+**CONFIRMED.** The citation-*accuracy* audit STATUS.md had recorded as owed is
+done, deterministically, on real output. No model was consulted at any point —
+labels were resolved to spans in code, per the standing rule that asking a model
+where something came from scores ~38% on the *easier* task of merely validating
+one.
+
+**The headline result is good, and its sample size is 1.** Job `18339bace8f0`:
+**7 markers, 7 CORRECT, 0 WRONG-CHUNK, 0 UNSUPPORTED-ANYWHERE.** Three
+independent deterministic lines agree — 15/15 numbers matched inside their own
+cited span (the F42 check, run in citation scope, finding nothing); the cited
+chunk is argmax for 6/7 by trigram containment; and every distinctive rare term
+localises to its cited chunk. The one non-argmax marker, `[Section 7]`, is a
+**length artifact not a wrong chunk**: chunk 6 is 7,692 chars against ~16,400
+for the others, which depresses containment, and chunk 6 still wins on word
+overlap (0.534 vs 0.479).
+
+**Why n is honestly 1, established rather than assumed.** Of the other three
+completed jobs, two are single-chunk (`fbac801d306a`, `2b4c926a799a`) and **no
+reduce step runs on a single-chunk job**, so markers were never requested. The
+third, `6c0358825609`, ran the reduce step and emitted zero markers — and that
+is not a model failure: `git reflog` puts the repo root reaching `7c1266b` (the
+citations commit) at **08:46:48**, while `missing-link.service` last restarted
+at **08:46:19** — **29 seconds earlier**. The feature arrived by fast-forward
+from a separate worktree, so the running process provably did not have it. One
+document, one genre, a known-mojibake source. **A rate may not be quoted off
+this.**
+
+### The near-miss, and it is the sharpest part of this finding
+
+**The model emitted its markers with U+202F NARROW NO-BREAK SPACE, not ASCII
+space** — `'[Section 1]'`. `_SECTION_MARKER_RE` uses a tolerant `\s`, which
+is the only reason all seven resolved. **A stricter literal-space regex would
+have dropped 7 of 7 valid citations and reported "the model ignored the
+citation instruction"** — a total, confident, and completely wrong conclusion
+about the model, caused entirely by one invisible character in our own parser.
+
+This is the same shape as F45 (a hand-rolled text primitive silently corrupting
+the measurement that depends on it) and the same shape as F40's lesson: the
+instrument fails quietly and the failure is legible as a result. **When output
+parsing reports 0% compliance, suspect the parser before the model.**
+
+### The defect the audit found, which is a NEW shape
+
+The first sentence of the summary asserts *"Swami B.R. Bṛdhar (Śrī
+Bhaktisiddhānta Sarasvat)"* — **conflating the author with his guru.** The
+source at char 109 reads `SwÅmÈ B.R. ßrÈdhar`; separately, at char 3599, `His
+own Guru-Mahåråj çr^la Bhaktisiddhånta Saraswat^ ëhakura`. Both facts sit in
+chunk 0, which is exactly what `[Section 1]` cites.
+
+**So the citation is correct, the span is correct, and the claim is false.**
+This is distinct from F42, where a fabricated number was laundered through the
+reduce step; here nothing is fabricated and nothing is misattributed — two true
+facts from the cited span are *merged into a false one*. `cascade.py`'s own
+header already states the principle (**"an attribution is not a verification"**);
+this is the first observation of it on real output. The deterministic tier did
+route the sentence for escalation, flagging a distinctive term absent from the
+whole document, but it flagged 15 of 43 sentences overall — **a routing signal,
+not a pointer.**
+
+### The invented-marker guard works, verified rather than assumed
+
+Substituting `[Section 47]` into the real job output: `markers 7, valid 6,
+dropped 1`, and `'47'` appears nowhere in the rendered prose. `[Section 0]` and
+`[Section 8]` also drop. `[ section  7 ]` resolves (case/whitespace tolerant).
+`[Sections 1 and 4]` and `[Section four]` land in `unparsed` and stay in the
+prose verbatim rather than becoming links. `templates/job.html` renders only
+`segments`, and a dropped marker is in neither list, so it is *structurally*
+incapable of becoming a link — not merely filtered.
+
+### Two gaps this leaves open
+
+- **The deterministic citation audit has no regression harness.** It was run by
+  hand via the `cascade job --mode citations` CLI. Nothing would catch a
+  regression in it — including a re-tightening of that `\s`.
+- **20 of 43 claims ended at `needs_classifier` and are permanently
+  unchecked.** They are correctly *labelled* as such, but **F41 says the
+  classifier cannot close that gap at production chunk length**, so this residue
+  is not a backlog item awaiting a classifier run — on current evidence it does
+  not have a solution. Every entity flag raised (5) was adjudicated an artifact
+  of the mojibake source, independently vindicating F42's demotion of entity
+  absence from a hard failure to a routing signal.
