@@ -1,9 +1,14 @@
 """Missing Link web API and UI.
 
-Deliberately minimal: no auth, no distributed workers. It runs on an isolated
-network by design (see the security posture in CLAUDE.md -- securing the
-network is the organisation's responsibility, and this app makes no claim to
+Deliberately minimal: one shared credential, no distributed workers. It runs on
+an isolated network by design (see the security posture in CLAUDE.md -- securing
+the network is the organisation's responsibility, and this app makes no claim to
 help).
+
+The credential is `ML_AUTH_TOKEN` in the environment and it is a door lock, not
+a security system -- see `missing_link/auth.py` for what it does, what it
+deliberately does not do, and why `/health` stays open. Unset it and the app
+behaves exactly as it did before F54, which is wide open.
 
 The point of this layer is that slowness stops being a defect. A chat window
 makes a user wait; a job queue lets them submit and leave. Queue control
@@ -22,9 +27,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from missing_link import corpus, db, extract, worker
+from missing_link import auth, corpus, db, extract, worker
 
 DB_PATH = os.environ.get("MISSING_LINK_DB", "/opt/missing-link/jobs.sqlite")
+
+# Read once at import, like DB_PATH and LLAMA_URLS below, so a test can reload
+# this module with a different environment and get a different gate. None means
+# the gate is off; see missing_link/auth.py for why that is the default.
+AUTH_TOKEN = auth.load_token()
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:8080")
 
 # R inference endpoints, not one. `provisioning/nodes.env` already carries this
@@ -80,6 +90,18 @@ async def lifespan(_app: FastAPI):
     if stranded:
         print(f"[startup] requeued {stranded} job(s) stranded by a previous run")
 
+    # Say which of the two states this process is in, every time, in the
+    # journal. The gate fails OPEN when ML_AUTH_TOKEN is unset (auth.py
+    # explains the trade), so "is the lock on?" must never be something an
+    # operator has to infer from behaviour.
+    if AUTH_TOKEN:
+        print("[startup] auth: ON -- shared credential required "
+              f"(open paths: {', '.join(sorted(auth.OPEN_PATHS))})")
+    else:
+        print(f"[startup] auth: OFF -- {auth.ENV_VAR} is unset, so every route "
+              "on this instance is unauthenticated, including "
+              "POST /corpus/{doc_id}/delete")
+
     # requeue_running() runs exactly once, here, BEFORE any worker task exists
     # -- see its docstring in db.py. That ordering is what keeps it safe now
     # that there is more than one worker: every 'running' row it finds was
@@ -100,6 +122,12 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Missing Link", lifespan=lifespan)
+
+# Added as middleware rather than as a per-route dependency on purpose: a
+# dependency has to be remembered on every future route, and the failure mode of
+# forgetting one is a silently unauthenticated endpoint. This way a new route is
+# protected by default and opening one is an explicit edit to auth.OPEN_PATHS.
+app.add_middleware(auth.SharedCredentialMiddleware, token=AUTH_TOKEN)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -756,6 +784,11 @@ def health():
     jobs = db.list_jobs(DB_PATH)
     return {
         "ok": True,
+        # Reported so the gate's state is observable rather than inferred. This
+        # route is deliberately unauthenticated (auth.OPEN_PATHS), so the answer
+        # is available to a monitor that has no credential -- which is the point:
+        # a monitor should be able to notice that the lock fell off.
+        "auth": bool(AUTH_TOKEN),
         "llama_url": LLAMA_URLS[0],  # kept for backward compat with existing callers
         "endpoints": _endpoint_rows(),
         "counts": {s: sum(1 for j in jobs if j["status"] == s)

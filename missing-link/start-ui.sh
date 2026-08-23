@@ -19,6 +19,13 @@ DB="${MISSING_LINK_DB:-/opt/missing-link/jobs.sqlite}"
 # to the single LLAMA_URL above -- one worker, one server, exactly as before.
 LLAMA_URLS="${LLAMA_URLS:-}"
 
+# The shared credential (F54). Inherited from the caller's environment; unset
+# means the instance this script starts is WIDE OPEN, exactly as every instance
+# was before F54. The systemd unit gets it from /etc/default/missing-link, so an
+# operator starting the UI by hand is the one path that can silently miss it --
+# hence the loud line below rather than a silent default.
+ML_AUTH_TOKEN="${ML_AUTH_TOKEN:-}"
+
 mkdir -p "$(dirname "$DB")" 2>/dev/null || sudo mkdir -p "$(dirname "$DB")"
 [ -w "$(dirname "$DB")" ] || sudo chown "$(id -un)" "$(dirname "$DB")"
 
@@ -35,8 +42,15 @@ else
 fi
 echo "  db      : $DB"
 echo "  port    : $PORT"
+if [ -n "$ML_AUTH_TOKEN" ]; then
+  echo "  auth    : ON (shared credential; /health stays open)"
+else
+  echo "  auth    : OFF -- ML_AUTH_TOKEN unset, every route is unauthenticated."
+  echo "            To match the service: . /etc/default/missing-link && export ML_AUTH_TOKEN"
+fi
 
 MISSING_LINK_DB="$DB" LLAMA_URL="$LLAMA_URL" LLAMA_URLS="$LLAMA_URLS" \
+  ML_AUTH_TOKEN="$ML_AUTH_TOKEN" \
   nohup .venv/bin/python -m uvicorn missing_link.app:app \
     --host 0.0.0.0 --port "$PORT" > /tmp/missing-link.log 2>&1 &
 
