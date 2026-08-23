@@ -66,6 +66,7 @@ numbers are cited from other documents and must not move.
 | **F45** | The sentence splitter's line-based fallback distorts clause-marker density — and it now gates corpus decisions | CONFIRMED |
 | **F46** | A citation can be CORRECT and its sentence still false; and a stricter regex would have destroyed all 7 valid citations | CONFIRMED |
 | **F47** | GLM-5 is 40.8 B active (computed, not published) — and Model B closes in the NEGATIVE | CONFIRMED |
+| **F48** | pysbd is worse than our regex; the legal-domain splitter nobody searched for fixes F45 | CONFIRMED |
 
 ---
 
@@ -2695,3 +2696,103 @@ enough to rank candidates that differ by 8x. Real GGUF byte counts were used
 throughout, per DESIGN-NOTES H's UD-quant capacity trap; this corrected three
 sizes carried in the docs (GLM-4.5-Air 60.5 not 58, DeepSeek-V3.2 358.3 not
 363, GLM-4.6 190.7 not 189).
+
+---
+
+## F48. The most-recommended sentence splitter is WORSE than our regex — and the legal-domain one nobody searched for fixes F45 outright
+
+**CONFIRMED.** Prompted by the operator's challenge — *"why aren't we using an
+existing pipeline?"* — every hand-rolled text component was audited against
+what already exists. The answer is **yes for exactly one component, no for
+three, and unmeasured for the fourth** — and the one adoption is not the
+library anybody would have reached for.
+
+### pysbd is worse than the code it would replace
+
+Five candidate splitters were run **against the real corpus in the job store,
+on the exact metric F45 says is broken.** pysbd is the most-recommended library
+for this job and carries a peer-reviewed **97.92% Golden Rules** claim. On the
+Privacy Act compilation it scored **2.76% marker density against our regex
+fallback's 2.85%** — worse than the thing it would replace — **and took 133.94 s
+to be worse.**
+
+**The mechanism is the entire lesson: pysbd was evaluated on well-formed prose,
+and our failure case is a document that is structurally a list.** A benchmark
+score earned on one text genre says nothing about another. This is F40's lesson
+in a different domain — *a benchmark that does not reproduce the deployment is
+not a benchmark of the deployment* — and it is why "adopt the well-cited
+library" would have been the wrong call made for good-sounding reasons.
+
+### nupunkt fixes it, and nobody had looked for it
+
+`nupunkt` is a **legal-domain** sentence splitter: pure Python, **zero runtime
+dependencies**, MIT, model bundled in a 9.1 MB wheel. Measured on the same
+corpus:
+
+| Metric | Before | After |
+|---|---:|---:|
+| Structural fragments | 65.0% | **12.3%** |
+| Fragments with no terminal punctuation | — | **0.0%** |
+| Legislative marker rate | 2.85% | **10.53%** |
+| Legislative : regulatory separation | 2.2x | **4.8x** |
+| ISM short fragments (PDF hard-wrap) | 52.4% | **3.5%** |
+
+**It restores the genre separation F45 lost**, and fixes the PDF hard-wrap
+manifestation as a side effect.
+
+### How the project got here, which is the transferable part
+
+`docs/chunking-research.md` §4 did the research honestly. It assessed nltk and
+spaCy, **correctly** rejected both as too heavy for this fleet, and concluded a
+regex was the only fit. That reasoning was sound and the conclusion was wrong,
+because of the question it asked:
+
+> **It searched for a general-purpose splitter light enough to ship. It never
+> asked whether a legal-domain splitter existed.**
+
+One does, and **it is lighter than either candidate that was rejected for
+weight.** The right query was *"what do people who process legislation use"*,
+not *"what is the best sentence splitter"*. **Domain-specific tooling can be
+simultaneously more accurate and cheaper than the general-purpose tool, so
+"too heavy" is not a conclusion that survives a change of search term.**
+
+### The three KEEP-OURS verdicts, with reasons that are constraints not sunk cost
+
+- **Chunking — KEEP OURS.** Our actual contract is **character offsets into the
+  source** (`text[start:end] == chunk["text"]`), which citations (F46) and the
+  audit ledger both depend on. **Every library returns strings.** `CHUNK_TOKENS
+  = 4096` is a measured optimum and `n_ctx_slot` is a cliff, not a preference.
+  semchunk is the revisit candidate if the splitter swap lands cleanly.
+- **Entity extraction — KEEP OURS, and the reason is subtle enough to record.**
+  spaCy/GLiNER/flair solve *extraction*; our hard problem is *resolution against
+  a scope*. **NER's recall profile is inverted for our use: a fabricated name
+  must still be extracted in order to be failed.** A model that helpfully
+  declines to tag an implausible entity destroys the signal. `REJECTED_RULES`
+  carries both error directions measured per rule; no library exposes that.
+- **Faithfulness scoring — KEEP OURS, classifier tier stays off.** F41 kills
+  MiniCheck directly. SummaC and AlignScore are **not** refuted by F41 (both
+  split evidence by design) but cost strictly more — pairwise NLI against
+  F41's already-fatal 199 min for hop 1. AlignScore is GitHub-only and cannot
+  be installed from a wheelhouse, which matters on an air-gapped fleet.
+  RAGAS and DeepEval are LLM-as-judge — the exact inversion of this project's
+  build rule.
+- **Whole pipeline — NEEDS-A-MEASUREMENT**, unchanged from STATUS §4b. The
+  audit removes one excuse: **LlamaIndex is offline-installable.**
+
+### Two operational consequences, neither optional
+
+1. **Turning nupunkt on INVALIDATES prior numbers.** Every `marker_rate` in
+   `corpus_documents` and every figure in `docs/chunk-boundary-measurement.md`
+   came from the old instrument. **The sweep must be re-run, not the flag
+   flipped.**
+2. **Python floor.** nupunkt needs >= 3.11. Node 1 has **3.11.2 — exactly on
+   the line**, and nodes 2-7 are uncharacterised for this.
+
+### Found in passing, not acted on
+
+- `_SENT_FALLBACK` exists as **two identical copies** (`audit.py:168`,
+  `chunk_boundary_audit.py:79`) carrying **two different docstrings** about
+  when NLTK is preferred.
+- **`pip install minicheck` installs an unrelated z3-based model-checking
+  package.** `requirements-audit.txt` correctly pins the git URL; anyone
+  "simplifying" that line gets the wrong package **silently**.
