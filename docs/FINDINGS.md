@@ -82,6 +82,7 @@ numbers are cited from other documents and must not move.
 | **F59** | Node 3 vanished at layer 2 (likely GNOME idle suspend) — and tracked `nodes.env` publishes the IPs the docs hide | CONFIRMED |
 | **F60** | No lab targets on this LAN — the cluster sits on a production cyber-range MANAGEMENT segment | CONFIRMED |
 | **Addendum to F59** | Suspend cause CONFIRMED (1200 s = the GNOME idle timeout); the fix had been hand-applied twice and never propagated | CONFIRMED |
+| **F61** | n8n's `Execute Command` is disabled by default; the LLM is measurably useless at cryptanalysis | CONFIRMED / REPORTED |
 
 ---
 
@@ -4027,3 +4028,105 @@ pinned to `magic`. `wakeonlan` installed on the coordinator: F59 correctly noted
 a recorded MAC is useless without a way to send the packet. MACs are in
 `network.md` (gitignored). **Not proven end to end** — the BIOS PME setting is
 invisible from the OS and testing it means powering a node down.
+
+---
+
+## F61. n8n's `Execute Command` node is disabled by default — and the LLM is measurably useless at cryptanalysis
+
+**CONFIRMED / REPORTED.** Eight security workflows (`S1`–`S8`) designed for the
+teaching playground, covering the areas `docs/teaching-labs.md` does not:
+cryptanalysis, CTF, OSINT/recon and web pentest. All eight fit the per-student
+ceiling of **150 node-seconds** (50 min ÷ 20 students on one node) derived from
+F58's formula, re-checked line by line.
+
+### The architectural finding
+
+**n8n's `Execute Command` node is blocked by default, and n8n itself names it
+FIRST in the exclude list "if your users might be untrustworthy."** So
+`nmap`/`ffuf`/`hashcat`/`john` cannot be driven the obvious way in a classroom
+instance.
+
+**The replacements are better than the thing they replace:** the tool's own REST
+API (`sqlmapapi`, `cyberchef-server`, Juice Shop's own endpoints) or the **`SSH`
+node** against a **disposable tools host**. That host is the one new machine this
+adds — **and it is where F44's core-saturating tools belong.** `hashcat` and
+`john` must never run on an inference node; F44 measured a merely *niced* sidecar
+starving `llama-server` on four cores.
+
+### The LLM adds nothing at cryptanalysis, and it is measurable rather than arguable
+
+CipherBank (REPORTED): best model **45.14% overall, Vigenère 1.91%**. The
+*reasoning* model did **worse** than the chat model (o1 at 40.59%). Open-weight
+models collapse — **Mixtral-8x22B 0.30%, Qwen2.5-72B 0.55%, QwQ-32B 0.76%** — so
+gpt-oss-120b should be expected to behave like those, not like the leaders.
+Against that, `cyberchef-server`'s `/magic` identifies a cipher
+**deterministically in milliseconds with a confidence score.**
+
+**The contrary result was flagged honestly rather than omitted:**
+CryptanalysisBench reports 65–86%, but that is a **frontier** model reasoning
+about cipher *design and proofs* — which is prose, the thing models are good at —
+and the paper **explicitly excludes "toy ciphers such as Vigenère."** Two
+benchmarks measuring different tasks, not a contradiction.
+
+**Also nothing:** parsing tool output (feeding 8 K tokens of nmap XML costs
+**8 minutes of node time per student** against n8n's zero-code `XML` node);
+brute force; and **deciding whether an exploit worked — the webhook decides,
+which is F36's rule in a new domain.**
+
+### Only 3 of 8 workflows genuinely need n8n, and the honest framing is the lesson
+
+**Strong, always for one of two reasons — a WAIT or an INBOUND EVENT:**
+- **S6, the strongest:** `sqlmapapi` submit → `Wait` → poll → collect. **That is
+  Missing Link's own shape in a second domain**; a script does it with `nohup`
+  and a PID file.
+- **S3:** Juice Shop's `SOLUTIONS_WEBHOOK` (CONFIRMED payload, carries a
+  `cheatScore`) — a script has no listener.
+- **S2 weakly**, for a shared scoreboard across 20 concurrent students.
+
+**The other four are decorative** — straight-line transforms that `exiftool
+-json | jq` or `nmap -oX | xsltproc | diff` do in five lines. **Build them in
+n8n anyway, and say so out loud:** the canvas is the artefact being taught — you
+can point at the `If` node that skips the LLM and ask what it saved — not an
+engine that earns its place.
+
+### Licence findings, one of which is not about licensing at all
+
+**Clean:** Juice Shop MIT, DVWA GPL-3.0, CyberChef Apache-2.0/Crown, hashcat MIT,
+ffuf MIT, sqlmap GPLv2 — verified against actual licence files.
+
+- **`nmap` ships under the NPSL**, which prohibits redistribution inside
+  proprietary products. Irrelevant to teaching; **relevant if a course image is
+  ever sold, or if the eventual Skill emits it.**
+- **SecLists is MIT, but its `Leaked-Databases/` wordlists are real people's
+  breached credentials.** S2 uses a synthetic list instead. **An MIT licence on
+  a collection says nothing about rights in what was collected** — the Hansard
+  precedent applied for an entirely different reason, and the more important of
+  the two.
+
+### Tooling reality on Debian 12
+
+**In `main` (CONFIRMED from the local index):** nmap 7.93, ffuf 1.1.0, hashcat
+6.2.6, john 1.9.0, sqlmap 1.7.2, exiftool, hydra, gobuster, whatweb, wfuzz.
+**Not available:** `zaproxy` (absent from bookworm), `nuclei`/`seclists`/
+`cyberchef`; **`nikto` is `non-free`**, a component this node does not enable.
+
+Two caveats worth acting on: **Debian's `john` is core 1.9.0, not jumbo**
+(crypt(3) family only — which is exactly what the bcrypt-cost lesson needs), and
+**hashcat's pocl CPU backend is REPORTED unsupported upstream**, so `john` is the
+primary path.
+
+### Blocked by F60, and the unverified item to settle first
+
+**S3, S5 and S6 target Juice Shop and DVWA — which F60 established are NOT on
+this LAN.** They are blocked until the operator names the lab network, or until
+we stand up our own containers on node 3. The latter is now clearly better: our
+own targets are resettable, under our control, and on a segment we are permitted
+to point students at.
+
+**Highest-risk unverified item: the `sqlmapapi` endpoint set (S6).** REPORTED
+from community sources; no official documentation appears to exist. Fifteen
+minutes against a local `sqlmapapi.py -s` settles it — and S6 is otherwise the
+workflow to demo first. **Every token count in the document is an estimate of
+input size, and F49 says such guesses are wrong by up to 2×**, so one
+`POST /tokenize` pass over real examples should correct the tables before
+anything is timetabled.
