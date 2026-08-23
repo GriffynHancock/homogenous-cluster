@@ -18,7 +18,19 @@
 set -euo pipefail
 
 NODE="${1:?usage: harden-ssh.sh <node-ip-or-host>}"
+
+# The admin login is PER NODE. It used to default to the coordinator's own name,
+# which was right only while every machine happened to be called the same thing;
+# node 3 is `debian3` (FINDINGS F53). Resolve it from nodes.env by hostname or
+# IP, and keep the old behaviour as the fallback so an ad-hoc host still works.
+# SSH_USER= still wins, for a node not yet in the inventory.
+if [ -z "${SSH_USER:-}" ] && [ -r "$(dirname "$0")/nodes.env" ]; then
+  # shellcheck disable=SC1091
+  source "$(dirname "$0")/nodes.env"
+  SSH_USER=$(node_target_for "$NODE"); SSH_USER=${SSH_USER%@*}
+fi
 SSH_USER="${SSH_USER:-$(id -un)}"
+echo "==> Node $NODE, admin login '$SSH_USER'"
 SSHD=/etc/ssh/sshd_config.d/99-cluster-hardening.conf
 
 echo "==> Verifying KEY auth to $NODE before changing anything"
@@ -36,8 +48,8 @@ FATAL: key-based SSH to $SSH_USER@$NODE does not work yet.
 Refusing to disable password authentication -- doing so now would lock you out.
 
 Fix first:
-  ./provisioning/join-node.sh        # prints the key to install on the node
-  ssh-copy-id $SSH_USER@$NODE        # or install it this way
+  USER_NAME=$SSH_USER ./provisioning/join-node.sh   # prints the key to install
+  ssh-copy-id $SSH_USER@$NODE                      # or install it this way
 Then re-run this script.
 EOF
   exit 1

@@ -49,16 +49,41 @@ echo "  built against libc6 $MASTER_LIBC"
 echo "  master ISA: $MASTER_FLAGS"
 echo
 
-if [ "${#NODES[@]}" -le 1 ]; then
-  echo "Only the master is in nodes.env -- nothing to distribute."
+# The target list, computed ONCE and printed, because the empty case is a
+# silent no-op that looks like success: this used to `exit 0` with a one-line
+# message and a caller who had just added a node read that as "done". Printing
+# the resolved user@ip for every target makes both failure modes visible --
+# an empty list, and a target whose login name is wrong.
+TARGETS=("${NODES[@]:1}")
+if [ "${#TARGETS[@]}" -eq 0 ]; then
+  cat >&2 <<'EOF'
+NOTHING TO DISTRIBUTE -- provisioning/nodes.env lists only the master.
+
+This is a NO-OP, not a success. If you just added a node, its line is not in
+the NODES=() array (check for a stray '#', or that you edited a worktree copy
+rather than the one this script sourced).
+EOF
   exit 0
 fi
 
-for entry in "${NODES[@]:1}"; do
+echo "Targets (${#TARGETS[@]}):"
+for entry in "${TARGETS[@]}"; do
+  # shellcheck disable=SC2086
+  set -- $entry
+  echo "  $1  $(node_target "$entry")"
+done
+echo
+
+for entry in "${TARGETS[@]}"; do
+  # shellcheck disable=SC2086
   set -- $entry
   NAME=$1; IP=$2
+  # The admin login is per-node (5th field, default = coordinator's own login).
+  # A bare `ssh "$IP"` silently uses the CALLER's name, which is correct for
+  # nodes 1-2 only by coincidence -- see nodes.env and FINDINGS F53.
+  TGT=$(node_target "$entry")
 
-  REMOTE_LIBC=$(ssh "$IP" "apt-cache policy libc6 | awk '/Installed:/{print \$2}'")
+  REMOTE_LIBC=$(ssh "$TGT" "apt-cache policy libc6 | awk '/Installed:/{print \$2}'")
   if [ "$REMOTE_LIBC" != "$MASTER_LIBC" ]; then
     echo "FATAL: $NAME libc6 $REMOTE_LIBC != master $MASTER_LIBC" >&2
     echo "Binaries built on the master may not run. Align the point release." >&2
@@ -67,7 +92,7 @@ for entry in "${NODES[@]:1}"; do
 
   # ISA check. distribute.sh is the only place this can be caught cheaply --
   # the RPC handshake compares versions, not instruction sets.
-  REMOTE_FLAGS=$(ssh "$IP" "grep -oE '\bavx512[a-z_]*|\bavx2\b|\bfma\b|\bf16c\b' /proc/cpuinfo | sort -u | tr '\n' ' '")
+  REMOTE_FLAGS=$(ssh "$TGT" "grep -oE '\bavx512[a-z_]*|\bavx2\b|\bfma\b|\bf16c\b' /proc/cpuinfo | sort -u | tr '\n' ' '")
   for flag in $MASTER_FLAGS; do
     case " $REMOTE_FLAGS " in
       *" $flag "*) ;;
@@ -83,14 +108,14 @@ for entry in "${NODES[@]:1}"; do
   # 18 KB stub -- binaries alone are useless. -a preserves the symlink chain
   # (libggml.so -> .so.0 -> .so.0.19.0) and the rpc-server -> ggml-rpc-server
   # compatibility symlink.
-  ssh "$IP" "mkdir -p $SRC/bin"
-  rsync -az --delete "$SRC/bin/" "$IP:$SRC/bin/"
+  ssh "$TGT" "mkdir -p $SRC/bin"
+  rsync -az --delete "$SRC/bin/" "$TGT:$SRC/bin/"
   # Write VERSION from the (possibly derived) value rather than copying a file
   # that may not exist. COMMIT is copied when present.
-  ssh "$IP" "printf '%s\n' '$VERSION' | sudo -n tee $SRC/VERSION >/dev/null 2>&1 || printf '%s\n' '$VERSION' > $SRC/VERSION"
-  [ -f "$SRC/COMMIT" ] && scp -q "$SRC/COMMIT" "$IP:$SRC/"
+  ssh "$TGT" "printf '%s\n' '$VERSION' | sudo -n tee $SRC/VERSION >/dev/null 2>&1 || printf '%s\n' '$VERSION' > $SRC/VERSION"
+  [ -f "$SRC/COMMIT" ] && scp -q "$SRC/COMMIT" "$TGT:$SRC/"
 
-  REMOTE_VERSION=$(ssh "$IP" "cat $SRC/VERSION")
+  REMOTE_VERSION=$(ssh "$TGT" "cat $SRC/VERSION")
   if [ "$REMOTE_VERSION" != "$VERSION" ]; then
     echo "FATAL: $NAME version $REMOTE_VERSION != $VERSION" >&2
     exit 1
@@ -98,9 +123,9 @@ for entry in "${NODES[@]:1}"; do
 
   # Actually execute it. Catches the relocatable-binary problem (F13) that the
   # version and libc checks cannot see.
-  ssh "$IP" "$SRC/bin/rpc-server --help >/dev/null 2>&1" \
+  ssh "$TGT" "$SRC/bin/rpc-server --help >/dev/null 2>&1" \
     || { echo "FATAL: rpc-server will not execute on $NAME." >&2
-         echo "Check for missing .so files: ssh $IP ldd $SRC/bin/ggml-rpc-server" >&2
+         echo "Check for missing .so files: ssh $TGT ldd $SRC/bin/ggml-rpc-server" >&2
          exit 1; }
 
   echo "  $NAME ok"

@@ -34,11 +34,14 @@ cat <<EOF
 # Run these on the NEW node. Coordinator is $(hostname) at ${LAN_IP%%/*}.
 # ============================================================================
 
-# 1. Same username as the coordinator.
-#    Not strictly required, but the systemd unit, every scp/rsync target and
-#    every ssh in these scripts assume it. A different name means editing all
-#    of them.
-sudo adduser ${USER_NAME}          # skip if it already exists
+# 1. The admin account. It NO LONGER has to match the coordinator's name.
+#    Until 2026-08-23 it did: the systemd unit, every scp/rsync target and every
+#    ssh in these scripts resolved to the caller's login. That is now a field in
+#    provisioning/nodes.env (5th column), so an existing account is fine --
+#    just record its name there. Re-run this script as
+#        USER_NAME=<their-name> ./provisioning/join-node.sh
+#    to get the right paths printed below. See docs/FINDINGS.md F53.
+sudo adduser ${USER_NAME}          # SKIP if the machine already has an account
 
 # 2. Passwordless sudo -- APPEND to /etc/sudoers, not a sudoers.d drop-in.
 #    sudo is last-match-wins, and Debian's own "(ALL:ALL) ALL" line can come
@@ -68,7 +71,10 @@ ip -br addr | grep -v LOOPBACK
 #       ^ characterise it FIRST. Do not assume it matches. Core count is a
 #         bandwidth spec, not just a compute spec.
 #
-#   Add it to provisioning/nodes.env with MEASURED values, then:
+#   Add it to provisioning/nodes.env with MEASURED values, INCLUDING the 5th
+#   field if this node's login is not ${USER_NAME}:
+#       "<name> <ip> <ram_mb> <physical_cores> [ssh-user]"
+#   then:
 #     sudo ./provisioning/setup.sh <hostname>
 #     ./provisioning/distribute.sh          # asserts version, libc AND ISA
 #     ./cluster/install-services.sh
