@@ -612,6 +612,56 @@ There is no test suite for the cluster itself — verification is running the
 command and reading the output. Do not report a step as done without having
 seen its output.
 
+### A PASS or FAIL is never an opinion
+
+**Operator instruction, 2026-08-23, and it is binding.** Any verdict — pass,
+fail, works, broken, fixed, safe — must carry **how it is known**. State it
+inline, next to the verdict, not in a footnote:
+
+- **CONFIRMED** — you ran it and read the output. **Say what you ran and what
+  came back.** The strongest form is **local reproduction**: you made the thing
+  happen, or you made the thing that was failing stop failing, on this hardware.
+  Prefer it over every other kind of evidence.
+- **REPORTED** — a source, an upstream issue, another agent, or a previous
+  session says so. Name it. Another agent's report is REPORTED, not CONFIRMED,
+  no matter how detailed it is.
+- **INFERRED** — you reasoned it from something else. Say from what, so the next
+  reader can check the reasoning rather than inherit the conclusion.
+
+**"It should work", "that ought to be fine", "this is now safe" are not
+verdicts.** If you did not check, the verdict is *unknown* — which is a
+perfectly good thing to report and a much better one than a guess that reads
+like a result.
+
+**Why this rule exists — every one of these was a confident verdict that was
+wrong:**
+
+- **F55.** `CLAUDE.md` asserted the safety hooks were *enforced* for six days.
+  One negative test — issue a command the guard claims to block, see whether it
+  is blocked — would have caught it. Nobody ran it, because the claim sounded
+  like a fact.
+- **F31 / F56.** The `#26500` gate prints `journalctl` when it fails, and that
+  command ran unprivileged, so it printed `-- No entries --` on a **healthy node
+  and a broken one alike.** A gate whose diagnostic cannot distinguish the two
+  states is not a gate.
+- **F21.** A reasoning model returning empty content produced a **false negative
+  on that same gate** — a real PASS reported as a failure.
+- **F52 → F55.** A correct, evidence-backed diagnosis of *why* something failed
+  concealed the real cause entirely.
+- **F36 → F40.** A client disconnect explained the hang so well that the actual
+  fork/waitpid abort went unfound for a day.
+
+**The pattern behind all of them, and it is the single most repeated lesson in
+this repo: a satisfying explanation for a failure is the most effective way to
+stop looking for the real one.** So when a result confirms what you expected,
+that is the moment to ask what else would produce the same observation.
+
+**Corollary for anything protective** — a guard, a probe, a gate, a watchdog,
+a lock: **it must be shown to fire.** Demonstrate both directions — it catches
+the bad case *and* it permits the good one. A protective mechanism only ever
+tested on the happy path has been tested for its ability to do nothing, which
+it will also do when it is broken.
+
 **A faster build or config that changes output is not a win.** Any performance
 change must be paired with a coherence check on real output before adoption.
 
