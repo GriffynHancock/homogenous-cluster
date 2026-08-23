@@ -34,3 +34,13 @@ pypdf==6.16.1
 # first use (verified in a network namespace with no interfaces). REQUIRES
 # PYTHON >= 3.11; nodes 1 and 2 are on 3.11.2, exactly on the line.
 nupunkt==0.6.0
+
+# TEST-ONLY, and it was an UNDECLARED dependency until 2026-08-23. `pytest` is
+# already in this file rather than a separate dev file, so this is where a test
+# dependency belongs here. `tests/test_extract.py` builds real PDF bytes with
+# `reportlab.pdfgen.canvas` -- the whole point of that module is that PDFs are
+# tested as PDFs and not as a fixture blob, because decoding PDF bytes as UTF-8
+# is exactly the defect it exists to prevent. It happened to be present in the
+# main checkout's venv, so the omission was invisible until a fresh venv was
+# built in a merge worktree and test_extract.py died with ModuleNotFoundError.
+reportlab==5.0.0
