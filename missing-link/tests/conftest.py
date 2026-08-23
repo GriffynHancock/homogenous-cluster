@@ -44,3 +44,18 @@ def nupunkt_splitter(monkeypatch):
     except sentences.SplitterUnavailable as exc:
         pytest.skip(f"nupunkt not available here: {exc}")
     return sentences.NUPUNKT
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_auth_token(monkeypatch):
+    """No test inherits a shared credential from the shell that ran pytest.
+
+    `missing_link.app` reads ML_AUTH_TOKEN once at import (like DB_PATH and
+    LLAMA_URLS), and every web fixture in this suite reloads that module. So an
+    operator who had exported the production token -- entirely plausible on the
+    coordinator, where it lives in /etc/default/missing-link -- would otherwise
+    turn every existing web test into a 401 for reasons that have nothing to do
+    with what the test is about. Tests that WANT the gate set it themselves,
+    after this has run.
+    """
+    monkeypatch.delenv("ML_AUTH_TOKEN", raising=False)
