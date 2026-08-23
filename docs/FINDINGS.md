@@ -76,6 +76,7 @@ numbers are cited from other documents and must not move.
 | **Addendum to F51** | Fixed with a BYTES progress signal — CPU alone reads 0% during a real shard upload | CONFIRMED |
 | **F54** | ComfyUI is compute-bound the wrong way; n8n fits; and ComfyUI, n8n AND Missing Link all have no auth | CONFIRMED / REPORTED |
 | **F55** | The agent-hardening hooks have NEVER been enforced — and it corrects F52's diagnosis | CONFIRMED |
+| **F56** | The 2 → 3 transition found three MORE latent bugs, none about the username — and it corrects F53 | CONFIRMED |
 
 ---
 
@@ -3478,3 +3479,115 @@ layer must prove it enforces before anything is written that depends on it.**
 The guard needed one negative test — issue a command it claims to block and
 confirm the block — and that test had never been run in ~six days of it being
 cited as a safety property.
+
+---
+
+## F56. The 2 → 3 transition found three more latent bugs — and NONE of them were about the username
+
+**CONFIRMED.** Node 3 is joined, hardened and passing the #26500 gate. The
+per-node username was parameterised rather than worked around, per the
+operator's decision that the eventual skill must run where usernames do not
+match.
+
+**`CLAUDE.md` says everything that can go wrong appears at N=2 and nothing new
+appears at the tenth. That is now measurably too optimistic.** F30 found five
+latent bugs at 1 → 2; **2 → 3 found three more**, and the username — the one
+thing anticipated — was not among them.
+
+1. **`setup.sh` created only `/opt/llama.cpp`.** Shipping ik_llama.cpp to a
+   fresh node died on `mkdir: cannot create directory '/opt/ik_llama.cpp':
+   Permission denied`. **Nodes 1 and 2 worked only because that directory had
+   been made by hand at some point.** This is F32 recurring: a step that lives
+   in an operator's shell history rather than in a script is invisible until a
+   genuinely fresh node arrives.
+2. **`journalctl` in the #26500 gate's failure path ran unprivileged — so the
+   gate's only diagnostic is blind.** No admin account in this fleet is in `adm`
+   or `systemd-journal`, so it prints `-- No entries --` **on a healthy node and
+   a broken one alike**. Confirmed on nodes 2 *and* 3. That is the one command
+   the gate prints when it fails, which is exactly F31's lesson — a passing
+   cluster once looked broken because the diagnostic lied. Fixed with `sudo`.
+3. **F30 item 4 recurred**: machine-id regeneration orphaned the journal on node
+   3 (`No journal files were found`). Fixed by restarting `systemd-journald` —
+   **`setup.sh` still does not do this itself**, so node 4 will hit it again.
+
+### `llama-server@.service` had never reached ANY node
+
+`install-services.sh` now installs the unit for the first time. **It was tracked
+in git and reached no machine** — the F32 defect a second time, in a different
+file. A unit file in version control is not a unit file on a node.
+
+**`EnvironmentFile` cannot solve the per-node user**, and the reason is worth
+recording: **systemd expands `${VAR}` only in the `ExecStart` family.** `User=`
+is resolved *before* any environment exists, so `User=${LLAMA_USER}` is a
+literal username containing `$` and dies 217/USER. Solved with a drop-in written
+by `install-services.sh`. **Two deliberate safety choices:** the tracked `User=`
+is a placeholder resolving to nobody, so a missing drop-in **fails loudly rather
+than silently running the inference server as root**; and the drop-in is written
+*before* the unit, so a half-finished install is never the dangerous half.
+
+Also fixed: `distribute.sh` now **prints its resolved target list**, and the
+empty case says explicitly that it is a no-op. STATUS §1c recorded that silent
+`exit 0` — "nothing to distribute" looking like success — biting before.
+
+### F53 is CORRECTED: the GNOME desktop is the fleet's normal, not a divergence
+
+F53 recorded node 3 arriving as a full GNOME desktop idling at 3,251 MB, framed
+as a deviation from a headless preseed. **That framing was wrong. Nodes 1 and 2
+run the identical stack** — `gdm`, `cups`, `cups-browsed`, `avahi-daemon`,
+`colord`, `geoclue`, `packagekit`, `ModemManager`, `switcheroo-control`,
+`upower`, `udisks2` — and node 2's default target is `graphical.target` too.
+
+**So node 3 matches the fleet and trimming it alone would make it the odd
+machine out**, confounding any A/B against the three-way bandwidth twin F53
+itself established. **The characterisation compared node 3 against a headless
+baseline that does not exist.** Recommended instead: trim fleet-wide as its own
+task with a before/after RAM measurement, fully reversible (`systemctl disable`
+plus `set-default multi-user.target`, no purging). It is ~2.5% of 128.7 GB.
+
+### The 1 TB disk is in far better shape than F53 assumed
+
+Mounted **read-only** to check rather than inferred: **128 MB used of 932 GB —
+a bare NTFS format with no prior Windows data at all.** SMART **PASSED**, **2,789
+power-on hours** (~116 days), 0 reallocated, 0 pending sectors. Effectively a new
+drive.
+
+Recommended layout, **not executed pending the operator's say-so** because it
+destroys the existing filesystem, empty or not: single GPT partition, ext4,
+`LABEL=coldstore`, mounted `/srv/coldstore` from `fstab` **by UUID with
+`nofail`** — a spinning disk that fails to mount must not block a headless boot.
+**Purpose is snapshot and cold storage; models stay on NVMe** (F16, F3).
+
+**The concrete payoff is larger than expected:** a fleet-local mirror of GGUFs
+means a re-provision copies at ~120 MB/s off local rust instead of ~11.7 MB/s
+over the 100 Mb LAN (F28) — **~9 minutes per 65 GB instead of ~97.**
+
+### Verified, not assumed
+
+**SSH is key-only, confirmed independently of the hardening script:** a real
+password login via `sshpass` was **rejected** with `Permission denied
+(publickey)`; sshd offered only `publickey`. `sshd -T` reads
+`passwordauthentication no`, `kbdinteractiveauthentication no`,
+`permitrootlogin no`, `permitemptypasswords no`.
+
+**`two-node-smoke.sh 10.10.0.40` → PASS, and checked against F21's false
+negative**: the response carried real, coherent, on-topic prose, 33-token prompt
+eval at 17.65 t/s, 64 tokens at 5.90 t/s, zero `[create_node] invalid data ptr`.
+Node 3 is at b10369 and ik `8337e4cd`, matching the fleet. `llama-server@8080`
+resolves `User=debian3`. Link confirmed **100 Mb/s full duplex** — F28 holds for
+a third machine.
+
+### Follow-ups this created
+
+- **Nodes 1 and 2 still carry the OLD `llama-server@.service`** (`User=debian1`,
+  no drop-in). They work; converge with `ONLY_NODES=node1,node2
+  ./cluster/install-services.sh` — but that also does `enable --now
+  rpc-server@50052`, so schedule it when no benchmark is running.
+- **`sshpass` is now installed on the coordinator.** `join-node.sh` assumes
+  console access to the new machine; node 3 had no key, and nodes 4-7 will hit
+  the same wall. Either keep it or give `join-node.sh` a documented bootstrap.
+- **Node 3 is deliberately NOT in `INFERENCE_ENDPOINTS`** — adding it before a
+  server answers would park a Missing Link worker in permanent backoff. Its
+  in-band watchdog logs one `DOWN … Restart=always owns this, watchdog stands
+  off` per minute and correctly does not restart anything (`NRestarts=0`).
+- **`setup.sh` asserts `THP: expected [madvise]` but all three nodes report
+  `[always]`** — a stale assertion in the script, not a node-3 problem.
