@@ -65,6 +65,7 @@ numbers are cited from other documents and must not move.
 | **F44** | Even niced, a CPU-bound sidecar measurably starves `llama-server` on a 4-core node | CONFIRMED |
 | **F45** | The sentence splitter's line-based fallback distorts clause-marker density — and it now gates corpus decisions | CONFIRMED |
 | **F46** | A citation can be CORRECT and its sentence still false; and a stricter regex would have destroyed all 7 valid citations | CONFIRMED |
+| **F47** | GLM-5 is 40.8 B active (computed, not published) — and Model B closes in the NEGATIVE | CONFIRMED |
 
 ---
 
@@ -2592,3 +2593,105 @@ incapable of becoming a link — not merely filtered.
   not have a solution. Every entity flag raised (5) was adjudicated an artifact
   of the mojibake source, independently vindicating F42's demotion of entity
   absence from a hard failure to a routing signal.
+
+---
+
+## F47. GLM-5's active-parameter count is 40.8 B, computed not published — and it closes the Model B question in the negative
+
+**CONFIRMED.** Two research gaps blocked the Model B decision. Both are now
+closed, and together they retire the decision itself rather than answering it.
+
+### GLM-5 / 5.1 / 5.2 active params = ~40.8 B
+
+The number is published nowhere — model cards, the arXiv abstract and every
+GGUF quantiser card are silent. It was **computed from `config.json`**, which
+all three releases share in every relevant field:
+
+```
+78 x (165.0 M attn + 9.4 M DSA indexer) = 13.60 B
+ 3 x 226.5 M dense FFN                  =  0.68 B
+75 x 341.3 M (9 of 257 experts + gate)  = 25.60 B
+     154880 x 6144 lm_head              =  0.95 B
+                                          40.83 B
+```
+
+**Labelled CONFIRMED rather than INFERRED because the arithmetic validates
+itself:** the same per-tensor inventory run over all 257 experts plus the MTP
+block reconstructs **753.86 B against the published `safetensors` total of
+753,864,119,552 — 0.00% error.** The single free choice (whether the DSA
+indexer's query projection reads `hidden_size` or `q_lora_rank`) is decided by
+which variant closes the last 1.3 B exactly.
+
+**Three independent facts each reject it:**
+
+- **40.8 B active is MORE than DeepSeek-V3.2's 37 B**, and ~8x gpt-oss-120b's
+  5.1 B. On this fleet active params *are* generation speed.
+- **It is LESS faithful than GLM-4.6** — `zai-org/glm-5` sits at **10.1%** on
+  the Vectara board against GLM-4.6's **9.5%** (REPORTED; 5.1/5.2 have no
+  entry). **The strongest open reasoner is not the most faithful one**, which
+  is the assumption that put GLM on this shortlist in the first place.
+- **IQ4_XS is 402.9 GB real against 368 GB free** — the F16 disk blocker
+  again, worse than Kimi K2. Plus it is a thinking model, and F35 established
+  there is no universal thinking-off switch.
+
+**Software support was NOT the blocker**, contrary to expectation: llama.cpp
+PRs #19460 (GLM MoE DSA arch) and #25407 (DSA indexer) both merged before our
+pin b10369 (`6e62ba5`, 2026-08-11).
+
+### Finix S1 32B does not exist as weights, and its 1.8% is an artifact
+
+`huggingface.co/antgroup/finix_s1_32b` returns **HTTP 401**; the public
+`antgroup` org holds two models, neither Finix. REPORTED as API-only and
+proprietary, and domain-specific to insurance claims.
+
+**The scepticism the 1.8% deserved was warranted, and the mechanism is worth
+keeping.** Its average summary is **172.4 words against a 106.9-word median**
+across 105 listed models — sixth-longest on the board. **The leaderboard's own
+FAQ states that a copy-paste extractive summariser would score 0% hallucination
+and that it is "not evaluating the quality of the summaries."** Long extractive
+output is exactly what scores well there and exactly what is useless as a
+summary. **A hallucination score cannot be read without reading the summary
+length beside it.**
+
+### The consequence: Model B is closed in the NEGATIVE
+
+**"One frontier model too large for any single machine" cannot be justified on
+this fleet.** This is a decision, not a deferral — every candidate is now
+priced and each is dominated. GLM-5 REJECT; Finix S1 REJECT (no weights);
+Kimi K2 REJECT (unchanged, F25); DeepSeek-V3.2 stands on merit alone and does
+not run at N=2. GLM-4.6 becomes viable only at N>=4.
+
+**At N=7 the S=1 tier delivers 12-47x the aggregate tokens of the GLM-5 tier**
+— and GLM-5 offers no faithfulness gain to weigh against that. Fetch cost at
+93.8 Mbit/s (F28) is **9.5 h per node** for GLM-5 IQ4_XS, against 1.5 h for
+gpt-oss.
+
+**The one experiment that reopens it:** GLM-4.6 **UD-IQ1_S at 96.9 GB is
+S=1**, hence replicable at R=7. Whether 1-bit retains enough of the 9.5% to
+beat gpt-oss's 14.2% is genuinely open — DESIGN-NOTES H warns UD's edge
+shrinks at the low-bit end — and it costs 2.3 h to fetch.
+
+### Flagged, not chased: GLM-4.7-Flash may dominate the incumbent
+
+`zai-org/GLM-4.7-Flash` was never on the shortlist and appears to beat
+gpt-oss-120b on every axis this project ranks: **31.2 B total** (CONFIRMED from
+HF safetensors), **~3.6 B active** (computed, reconstruction within 2%),
+**9.3% Vectara** vs gpt-oss's 14.2%, **MIT**, **18.3 GB at Q4_K_M**, S=1,
+predicted ~8.2 tok/s, and **half an hour of link time**. llama.cpp support via
+PR #18936, before our pin.
+
+**Do not adopt it on this paragraph.** It is a hybrid reasoning model
+(F35 again), 31 B total is far less stored knowledge than 120 B, and everything
+but the file sizes and config is REPORTED or INFERRED. It is cheap enough to
+settle by measurement, which is the only way this project is allowed to settle
+it.
+
+### Method note worth reusing
+
+The predicted-throughput column is INFERRED from F24's 17.3 GB/s effective MoE
+bandwidth, and **the method reproduces 6.06 predicted against 6.05 measured for
+gpt-oss-120b.** That is one validation point, not a validated model, but it is
+enough to rank candidates that differ by 8x. Real GGUF byte counts were used
+throughout, per DESIGN-NOTES H's UD-quant capacity trap; this corrected three
+sizes carried in the docs (GLM-4.5-Air 60.5 not 58, DeepSeek-V3.2 358.3 not
+363, GLM-4.6 190.7 not 189).
