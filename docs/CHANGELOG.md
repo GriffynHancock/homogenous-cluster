@@ -13,6 +13,54 @@ an unannotated command is still safe without checking `STATUS.md` and
 
 ---
 
+## MERGED 2026-08-23 (later, consolidation pass) — the fleet and the repo agree again
+
+**The point of this batch was closing a gap between the hardware and the
+repository, not adding capability.** Node 3 had been joined, hardened and passed
+the #26500 gate *on the machines* since earlier the same day, while `main` still
+carried a commented placeholder where node 3's `nodes.env` line belongs — so any
+script run from `main` would have silently skipped it. Four branches merged into
+`main`:
+
+- **`agent/node3-join`** — the one that closed the gap. Per-node SSH login as an
+  optional 5th field in `provisioning/nodes.env`, with `node_user()`,
+  `node_target()` and `node_target_for()` accessors, threaded through
+  `distribute.sh`, `install-services.sh`, `install-watchdog.sh`, `harden-ssh.sh`,
+  `join-node.sh`, `setup.sh` and `bench/*`; plus the `llama-server@.service`
+  per-node drop-in, which exists because systemd resolves `User=` before any
+  environment exists and an `EnvironmentFile` therefore *cannot* carry it (it
+  dies 217/USER). The tracked `User=` is a placeholder resolving to nobody, so a
+  missing drop-in fails loudly instead of silently running inference as root.
+- **`docs/sync-f46-f56`** — `CLAUDE.md`, `STATUS.md` and this file brought into
+  line with F46–F56.
+- **`research/teaching-labs`** — `docs/teaching-labs.md`.
+- **`research/distributed-playground`** — `docs/distributed-playground.md`.
+
+**Verified, rather than merged and assumed** — which is this project's F32 defect
+in its most common form. `./provisioning/distribute.sh` was run from the merged
+tree before `main` moved: it printed `Targets (2): node2 debian1@…` /
+`node3 debian3@…`, reached both, and reported both `ok` at b10369. The suite ran
+**688 passed** (662 + the 26 auth tests), unchanged by the merge, which touched
+no file under `missing-link/`.
+
+**The only real conflict was semantic, not textual.** Git merged all four
+cleanly. But `docs/sync-f46-f56` had rewritten `STATUS.md` to describe
+`agent/node3-join` as unmerged — in two places, "What is in flight" and NEXT
+TASKS §2 — and merging that branch falsified both. They were rewritten to say
+merged **and** exercised, each carrying the command to re-check rather than a
+bare assertion, per that file's own stated principle. A third stale passage
+("two agents are writing `docs/teaching-labs.md` and
+`docs/distributed-playground.md`") was replaced with what those documents
+concluded. **A clean `git merge` is not evidence that the merged prose is still
+true.**
+
+**Still NOT done, and deliberately:** nodes 1 and 2 continue to carry the old
+`llama-server@.service` with no drop-in. Converging them means
+`install-services.sh`, which does `enable --now rpc-server@50052`, so it waits
+for a window with no benchmark running. Merging the unit file did not deploy it.
+
+---
+
 ## MERGED 2026-08-23 — N goes to 3, Model B closes, the splitter changes, and the safety layer turns out to be decorative
 
 **The single largest batch since the project started, and three of its results

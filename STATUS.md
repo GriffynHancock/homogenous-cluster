@@ -121,13 +121,23 @@ worker; `llama-server@.service` was tracked in git and had reached no machine at
 all), F34 caught it once (41 tests passing against a pipeline that had never
 processed a document), and F55 caught it for the hooks. **Check, do not infer.**
 
-- **The node-3 provisioning commit is on a branch, not on `main`, as of this
-  entry.** Node 3 is genuinely joined and serving `rpc-server` — that was done on
-  the hardware — but the parameterised-username `nodes.env`, `distribute.sh`,
-  `install-services.sh` and `llama-server@.service` changes live on
-  `agent/node3-join`. **Check:** `grep -n '^  "node3' provisioning/nodes.env` on
-  whatever branch you are reading. If it returns only the commented placeholder,
-  the merge has not happened and any script you run will not see node 3.
+- **The node-3 provisioning commit is MERGED, and the parameterisation was
+  exercised end to end from the merged tree, not merely merged.**
+  `agent/node3-join` landed on 2026-08-23: the per-node SSH login (`nodes.env`
+  5th field plus `node_user`/`node_target`/`node_target_for`), and its use in
+  `distribute.sh`, `install-services.sh`, `install-watchdog.sh`,
+  `harden-ssh.sh`, `join-node.sh`, `setup.sh` and `bench/*`, together with the
+  `llama-server@.service` drop-in mechanism. **This is the one item in this
+  section that has been checked against the hardware rather than against git.**
+  `./provisioning/distribute.sh` run from the merged tree resolved and reached
+  both workers — `node2 debian1@…`, `node3 debian3@…`, both `ok`, both at
+  b10369. **Check, do not infer** (the section's own rule; the run above is a
+  snapshot from 2026-08-23 and a later session can have changed the tree):
+  `grep -n '^  "node3' provisioning/nodes.env` must return a real four-or-five
+  field line, not a commented placeholder; and `./provisioning/distribute.sh`
+  must print a `Targets (2):` block naming `debian3@` for node 3 — an empty or
+  three-field-only target list means a script run from this tree will not see
+  node 3.
 - **Nodes 1 and 2 still carry the OLD `llama-server@.service`** (`User=debian1`,
   no drop-in). They work. Converge them with
   `ONLY_NODES=node1,node2 ./cluster/install-services.sh` — **but that also does
@@ -314,19 +324,25 @@ changes output is not a win.
 9.5% to beat gpt-oss's 14.2% is genuinely open, `DESIGN-NOTES.md` H warns UD's
 edge shrinks at the low-bit end, and it costs 2.3 h to fetch.
 
-### 2. Converge the fleet's service units, and land the node-3 branch
+### 2. Converge the fleet's service units — the node-3 branch has landed
 
-Two mechanical items, both of which are the F32 defect ("a file in version
-control is not a file on a node") waiting to bite again:
+This was two mechanical items, both instances of the F32 defect ("a file in
+version control is not a file on a node"). **One is done; one is not.**
 
-- **Merge `agent/node3-join`.** Node 3 is joined on the hardware, but the
-  parameterised-username `nodes.env`, `distribute.sh`, `install-services.sh` and
-  `llama-server@.service` changes are on that branch. **Check first:**
-  `grep -n '^  "node3' provisioning/nodes.env`.
-- **Nodes 1 and 2 still carry the OLD `llama-server@.service`** (`User=debian1`,
-  no drop-in). Converge with
+- ~~**Merge `agent/node3-join`**~~ — **DONE 2026-08-23, and verified against the
+  hardware rather than against git.** `./provisioning/distribute.sh` from the
+  merged tree printed `Targets (2): node2 debian1@…` / `node3 debian3@…` and
+  reported both `ok` at b10369, so the per-node login actually resolves. Re-check
+  with that same command rather than trusting this line.
+- **Nodes 1 and 2 STILL carry the OLD `llama-server@.service`** (`User=debian1`,
+  no drop-in) — merging the branch did not deploy it, which is the whole point of
+  F32. They work as they are. Converge with
   `ONLY_NODES=node1,node2 ./cluster/install-services.sh` — **but that also does
   `enable --now rpc-server@50052`, so schedule it when no benchmark is running.**
+  **Check what is actually on a node:**
+  `systemctl cat llama-server@8080 | grep -n '^User='` plus
+  `ls /etc/systemd/system/llama-server@.service.d/` — a node with no drop-in
+  directory has not been converged.
 
 **Two fixes in that branch worth understanding before touching the unit**, because
 they look like over-engineering and are not: `EnvironmentFile` **cannot** supply
@@ -447,9 +463,22 @@ hardening advice, or implying the tooling makes a network safe, is not.
   CUDA 13.0 drops sm_61, and ComfyUI now names CUDA 13.0 — using it means pinning
   an unpatchable stack on a machine students are invited to attack.
 
-**Two agents are writing `docs/teaching-labs.md` and
-`docs/distributed-playground.md` — check for those before starting anything
-here.**
+**Both follow-up surveys have LANDED — read them before starting anything here,
+because between them they already answer most of what would otherwise be
+rediscovered:**
+
+- **`docs/distributed-playground.md`** — can either service use more than one
+  machine? **ComfyUI: third-party only**, and distribution improves its
+  throughput while being unable to improve its latency, since nothing maintained
+  splits a single CPU denoise across machines. **n8n: yes, first-party queue mode,
+  free on Community.** Plus what an LLM load balancer in front of the fleet buys
+  (HAProxy or LiteLLM; **not** Paddler as it currently stands).
+- **`docs/teaching-labs.md`** — the student lab exercises themselves, sized
+  against the measured token budget (F58).
+
+**Both are design/research only: nothing was installed and nothing was run on
+the cluster for either.** Neither has been executed, so treat every number in
+them as unmeasured-here unless it cites `docs/measurements.md`.
 
 ### 7. Operator-named infrastructure with no spec on disk yet
 

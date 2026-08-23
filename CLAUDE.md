@@ -95,6 +95,8 @@ orientation and you are not expected to have read it.**
 | `docs/existing-pipeline-audit.md` | whether an off-the-shelf NLP library should replace any hand-rolled component — one ADOPT, three KEEP-OURS, one unmeasured (F48) |
 | `docs/comfyui-feasibility.md` | the teaching playground's image-generation half — why CPU diffusion is compute-bound the wrong way for this fleet (F54) |
 | `docs/n8n-feasibility.md` | the teaching playground's automation half — licence, isolation, and the local-LLM integration (F54) |
+| `docs/distributed-playground.md` | can either of those use more than one machine — ComfyUI third-party only and it cannot improve latency, n8n yes via first-party queue mode, plus what an LLM load balancer in front of the fleet actually buys |
+| `docs/teaching-labs.md` | the student lab exercises for the cybersecurity course, sized against the measured token budget (F58) — **design only, nothing installed or run** |
 | `docs/upstream-ik-2186-draft.md` | the drafted, **not yet filed**, upstream report of the ik_llama.cpp multi-slot fatal error (F40) |
 
 ## Homogenous Cluster
