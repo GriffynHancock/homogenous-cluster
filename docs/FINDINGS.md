@@ -80,6 +80,7 @@ numbers are cited from other documents and must not move.
 | **F57** | Distributing ComfyUI cannot help; nginx's 60 s default would kill every real request; corrects F54 on n8n | CONFIRMED / REPORTED |
 | **F58** | A token-budget formula decides the syllabus; a small model buys only ~2x; `--api-key` takes a LIST | CONFIRMED |
 | **F59** | Node 3 vanished at layer 2 (likely GNOME idle suspend) — and tracked `nodes.env` publishes the IPs the docs hide | CONFIRMED |
+| **F60** | No lab targets on this LAN — the cluster sits on a production cyber-range MANAGEMENT segment | CONFIRMED |
 
 ---
 
@@ -3855,3 +3856,75 @@ reads, and the operator should choose: gitignore `nodes.env`, commit a
 `setup.sh`/`distribute.sh` fail with a clear message when the real file is
 absent. That matches how `network.md` is already handled and keeps the schema
 public, which is what the eventual skill actually needs.
+
+---
+
+## F60. There are no lab targets on this LAN — the cluster is sitting on a production cyber-range management segment
+
+**CONFIRMED.** The operator believed the teaching labs (Juice Shop, DVWA) were
+reachable on this /24. **They are not.** 76 common service ports were probed
+across all 30 non-ours hosts; **nothing answered on 3000, 3001-3010, 8080,
+8081, 4200, 8180 or 8888.** Discovery was ARP-based (ICMP-independent, since
+the operator flagged ping may be filtered); 33 hosts responded.
+
+**What is on this segment instead — every identification CONFIRMED from a TLS
+certificate CN or a service banner, not from a port number:**
+
+| Host | What it is | Evidence |
+|---|---|---|
+| `.5` | **a SOC platform** | cert a SOC-platform certificate CN |
+| `.11`, `.24`, `.29`, `.30` | **Four ESXi hypervisors**, four hypervisors, sequentially named | cert CNs; `/sdk` → `urn:vim25` 6.7.2 |
+| `.23` | **OpenStack Horizon** on Ubuntu 22.04 | `<title>Login - OpenStack Dashboard</title>` |
+| `.14` | a Windows **imaging server** | RDP cert CN; 139/445/3389/5985 |
+| `.250` | a Windows **jump box** | RDP cert CN; `SSH-2.0-OpenSSH_for_Windows_9.5` |
+
+Two internal domains — one VMware-side and one Windows-side (both recorded in `network.md`).
+The four ESXi hosts are **one managed cluster**: all certificated by the same
+vCenter CA within 83 seconds of each other. A further **20 hosts answer ARP with
+zero open ports** — 16 on one contiguous MAC batch, 4 on Intel; INFERRED as
+firewalled workstations from a single procurement, **physical not virtual** (no
+VMware/VirtualBox/KVM OUI).
+
+**This resolves a question standing since node 2's bring-up.** `STATUS.md`
+recorded an ARP sweep seeing the previously-unidentified DMZ host and warned *"that is something else on
+the DMZ, not node 2"*. It is one of that 16-machine workstation batch, no open
+ports. **The "do not use it" warning stands and now has a reason.**
+
+**INFERRED:** the lab VMs live inside the vSphere/OpenStack estate on internal
+port groups or tenant networks not routed here. **The operator must say which
+network they are on** — no web-pentest workflow can be designed until then.
+
+### The methodological point, and it is the new convention working
+
+**The orchestrator's own lead was wrong and got checked rather than confirmed.**
+that host was handed to the agent as "VMware OUI, a strong candidate for the
+lab hosts". It is an OpenStack dashboard. **An OUI tells you a NIC vendor and
+nothing about what runs on the host** — that was an INFERRED starting point
+presented with more confidence than it had earned, and the right response was to
+read the page title rather than accept the framing. This is exactly the
+CONFIRMED/INFERRED discipline added to `CLAUDE.md` the same day, applied against
+the orchestrator.
+
+### What this means for the playground, and it is not small
+
+**The cluster is on a management segment, not a lab segment.** Everything found
+is production: four hypervisors, their vCenter, a SOC platform, an OpenStack
+control plane, and two Windows servers including an imaging server and a jump
+box. **No n8n or student workflow may be pointed at any of it.**
+
+**And the adjacency runs the other way too, which is worth stating plainly as a
+fact rather than as advice:** this project's own `llama-server` listens
+unauthenticated on `:8080` on this same segment (F54, F58) — the segment
+carrying ESXi and vCenter management interfaces and a SOC platform. F58
+established that **`--api-key` accepts a comma-separated list and
+`--api-key-file` reads one per line**, so closing that costs nothing and needs
+no new software. `CLAUDE.md`'s rule is that this project does not write security
+guidance for other people's networks; **it does not mean leaving our own
+service open on a segment we now know the shape of.**
+
+**Consequence for the teaching plan:** every workflow in `docs/teaching-labs.md`
+and `docs/security-workflows.md` that assumed a reachable vulnerable target is
+**blocked pending the operator naming the lab network** — or pending us standing
+up our own targets, which is now the more attractive option, because a Juice
+Shop container on node 3 is under our control, resettable between classes, and
+on a segment we are allowed to attack.
