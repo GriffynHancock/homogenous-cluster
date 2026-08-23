@@ -90,6 +90,9 @@ below. An agent that cannot inspect the cluster cannot operate it.
 | Mutating SQL (`DELETE`/`UPDATE`/`INSERT`/`DROP`/`ALTER`/…) against `/opt/missing-link/jobs.sqlite`, incl. inside a heredoc | GATE | The `substr(document,1,5)='%PDF'` off-by-one that matched 0 rows, caught only because someone checked `rowcount`. |
 | `sqlite3 <db>` with statements arriving invisibly (bare stdin, `< file.sql`) | GATE | Same. The guard cannot tell a SELECT from a DELETE it cannot see, so it says so instead of guessing. |
 | `sqlite3.connect(<db>)` from Python without `mode=ro` | GATE | The read-only convention. |
+| `python -m <project module>` / `python <project script.py>` whose **source can write the live store** | GATE | **F52**, 2026-08-18: `python -m missing_link.reprofile_corpus --apply` issued **17 UPDATEs** against the live job store and no rule fired, because a module name does not look like SQL. See "The interpreted-mutation gap" below for what "can write" means and what it deliberately does not catch. |
+| `python -c` / python heredoc that reaches the live store **through the db layer** rather than through `sqlite3.connect` | GATE | Same finding. `from missing_link import db; db.delete_corpus_document(<live db>, …)` is the same operation as a `DELETE`, and the `sqlite3.connect` regex above never saw it. |
+| Mutating SQL against the live store named **relatively** — `cd /opt/missing-link && sqlite3 jobs.sqlite "DELETE …"` | GATE | Found while surveying the F52 exposure. The path test was a substring match on the absolute path, so the same file spelled relatively walked straight through. Path tokens are now resolved against the tracked `cd` and compared by `realpath`. |
 | `rm`/`mv`/`dd`/`truncate`/`shred` **of** the jobs DB; `Write` tool targeting it | **DENY** | Destroys queued/running jobs, `chunk_summaries` provenance and every persisted result. |
 | `git push` | GATE | The gitlink commit was pushed before anyone read it. Nothing here should push without the operator saying so. |
 | Writes into `/opt/models` (`cp`/`mv`/`rsync`/`scp`/`curl -o`/`tee`/`>` redirect/`rm`), and `Write`/`Edit` with a path under it | GATE | **F28**: the LAN is 100 Mb/s (measured 93.8 Mbit/s), so a 65 GB model costs **~97 min per node** to re-fetch. |
@@ -122,6 +125,96 @@ it; `echo don't && git add -A` is still caught, `echo it isn't a git add -A
 situation` is not. **This is the documented soft spot**: the fallback is less
 precise than the tokeniser, so a sufficiently strange quoting could evade a
 rule. It is a strong deterrent against honest mistakes, not a proof.
+
+---
+
+## The interpreted-mutation gap (F52)
+
+**What happened.** On 2026-08-18 a corpus re-profile issued **17 UPDATEs against
+`/opt/missing-link/jobs.sqlite`** — the live job store — and the guard said
+nothing. The command was `python -m missing_link.reprofile_corpus --apply`,
+which does not look like SQL to a pattern matcher. What actually protected that
+run was the *script's own* safeguards: an instrument check, a printed row count,
+and an abort-if-a-control-column-moved guard. Those were written by the agent
+that built it, not enforced by the fleet.
+
+### The exposure, surveyed rather than guessed
+
+Every command below was fed to the guard as it stood, using the documented
+`PreToolUse` stdin contract. **`ALLOW` means the guard returned no decision:**
+
+| Command | Old | New |
+|---|---|---|
+| `.venv/bin/python -m missing_link.reprofile_corpus --apply` | ALLOW | **GATE** |
+| `python -c "from missing_link import db; db.delete_corpus_document('/opt/missing-link/jobs.sqlite','x')"` | ALLOW | **GATE** |
+| `python - <<EOF … db.requeue_running('/opt/missing-link/jobs.sqlite') … EOF` | ALLOW | **GATE** |
+| `cd /opt/missing-link && sqlite3 jobs.sqlite "DELETE FROM jobs"` | ALLOW | **GATE** |
+| `sqlite3 /opt/missing-link/../missing-link/jobs.sqlite "DELETE FROM jobs"` | ALLOW | **GATE** |
+| `curl -X POST /jobs/<id>/cancel`, `curl -X DELETE /corpus/<id>` | ALLOW | ALLOW — **still open**, see below |
+| `python -c "import shutil; shutil.rmtree('/opt/models/gguf')"` | ALLOW | ALLOW — **still open** |
+| `find /opt/models -name '*.gguf' -delete`, `huggingface-cli … --local-dir /opt/models` | ALLOW | ALLOW — **still open** |
+| `python -c "import subprocess; subprocess.run(['systemctl','restart','missing-link'])"` | ALLOW | ALLOW — **still open** |
+| `bash bench/amplification-bench.sh`, `./missing-link/start-ui.sh` | ALLOW | ALLOW — by design, a hook cannot see inside a script |
+
+### Why one more regex was the wrong answer
+
+A rule matching `reprofile_corpus` would have closed one spelling and left the
+category open, while making the gated-operation list look complete. **The
+gated-operation list in `CLAUDE.md` reads as though it covers *operations*; a
+command-pattern hook can only cover *some spellings of them*.** A known gap is
+better than a false sense of coverage, so the rule added here asks a *property*
+of the program instead of matching its name:
+
+1. **Resolve** the `-m <module>` or `<script>.py` argument to a file inside the
+   checkout. Anything that does not resolve there — `pytest`, `pip`, `uvicorn`,
+   site-packages — is left alone entirely.
+2. **Scope**: the file (or an explicit `--db` on the command line) must name the
+   live store. A `--db` pointing somewhere else *cancels* the rule, so running
+   the same script against a scratch copy is not gated.
+3. **Decide** from the source: does it contain a mutating SQL statement, or call
+   a function that `missing_link/db.py` itself defines with one? **The writer
+   list is parsed out of `db.py` at hook time, not hard-coded**, so the rule
+   tracks the db layer rather than drifting from it. On the current file that
+   partition is 27 writers / 18 readers, and every getter lands on the read
+   side — which is why `db.list_jobs(<live db>)` stays ALLOW while
+   `db.delete_corpus_document(<live db>)` gates.
+
+Three deliberate limits keep it quiet enough to survive:
+
+- **Entry file only, no transitive import walk.** Intent lives in the program
+  you invoked. A wrapper that hides its writes in a helper module is a residual
+  gap, and is named as one here rather than chased with a slower rule.
+- **`tests/` is excluded.** `conftest` points every test at a tmp database and
+  several quote the live path in a comment about exactly that. Gating `pytest`
+  is how this rule would get switched off in a week.
+- **Silence when undecidable.** Unresolvable, unreadable or unparseable means
+  *no decision*, not a block — the same trade `check_python_syntax` makes when
+  it sees a `$`.
+
+The gate message names the three safeguards that actually held in F52 —
+precondition check, row count printed before the write, control value re-checked
+after — because **the hook can only put the human in the loop; it cannot audit a
+predicate.**
+
+### Considered and rejected
+
+- **A filesystem-level guard on the DB path** (immutable bit, read-only mode).
+  It would have to be punched open for `missing-link.service`, which writes to
+  that file continuously, and the agent has `sudo` anyway. It buys a speed bump
+  at the cost of a way to wedge the live queue.
+- **A `PostToolUse` watcher on the store's mtime/WAL size**, to make any
+  unmatched write *loud* after the fact. Attractive because it observes the
+  effect rather than the spelling, and therefore catches every interpreter,
+  binary and ORM. **Rejected: on a live cluster the service is writing
+  concurrently**, so a long `pytest` or benchmark would raise an alarm about a
+  write it did not perform. An alarm that fires on someone else's activity is
+  noise, and noise is how guards die.
+- **Requiring every mutating script to declare write intent** to `db._connect`
+  (an env var or explicit flag, refused by default). This is the strongest
+  control available and it is the one that would actually close the category —
+  but it is a change to the job store's connection path, and the live service
+  would need the declaration wired into its unit file. **Not attempted here**;
+  it is a job-store change, not a hook change, and it needs the operator.
 
 ---
 
@@ -181,10 +274,33 @@ knowledge failure, not a dangerous command. Missing Link is FastAPI, so
 `GET /openapi.json` is authoritative and free. That is a convention, not a
 control.
 
-**4. The general limit.** A hook sees one tool call at a time. It cannot see
+**4. A mutation reached through an interpreter — PARTLY catchable, and the part
+that is catchable is now caught.** See "The interpreted-mutation gap" above.
+What remains open, and will stay open:
+
+- **Anything the guard cannot resolve to source.** A compiled binary, a shell
+  script, `uv run`, a module outside the checkout, a script whose writes live in
+  a helper it imports.
+- **The HTTP API.** `curl -X DELETE /corpus/<id>` and `POST /jobs/<id>/cancel`
+  mutate the live store over a socket. Not gated: `curl` to the cluster is the
+  job, and no incident has come from this route.
+- **Interpreted writes to `/opt/models` and interpreted service control.**
+  `python -c "import shutil; shutil.rmtree('/opt/models/…')"`,
+  `find /opt/models -delete`, and
+  `subprocess.run(['systemctl','restart','missing-link'])` are all still ALLOW.
+  They are enumerated in the exposure table above and left alone deliberately —
+  no incident traces to them, and the file's own rule is that padding the list
+  with theoretical risks is how a guard becomes noise. Revisit if one of them
+  ever actually happens.
+
+**5. The general limit.** A hook sees one tool call at a time. It cannot see
 *intent*, cannot see inside scripts, and cannot see the sequence of correct
 individual commands that together do the wrong thing. It stops the specific
 motions that went wrong before. It does not make an agent safe.
+
+**So the standing rule is the one F52 ends on: treat the hook as a backstop
+against known-dangerous spellings, never as the reason a write is safe. A script
+that mutates the live store carries its own safeguards, or it does not run.**
 
 ---
 
@@ -236,6 +352,59 @@ a restart:
 
 No cluster service was restarted, stopped or killed at any point in this work.
 
+### Re-verification after the F52 rules (2026-08-23)
+
+Every case below was driven through the documented stdin contract. **The
+regression evidence is a diff, not a count**: the old guard and the new one were
+run over the same four case lists and compared line by line.
+
+- **No existing rule changed.** 48 hand-written cases covering every rule in the
+  table above in both directions, plus **1545 unique command lines lifted from
+  this repo's own `provisioning/`, `cluster/`, `bench/` and `start-ui.sh`**,
+  produced **byte-identical** output from both guards. The only two non-ALLOW
+  results in those 1545 lines are the two already documented (`start-ui.sh`'s
+  `pkill -f`, and a `git checkout` line fed without its preceding `cd`).
+- **Every difference between the guards is an ALLOW that became a GATE.** There
+  is no line where the old guard decided and the new one does not.
+- **The blocking direction, on the real invocation shape.** Under
+  `permission_mode: "default"`:
+
+  ```
+  GATED by .claude/hooks/cluster-guard.py [jobs-db-write]
+  `python -m missing_link.reprofile_corpus` runs missing_link/reprofile_corpus.py,
+  and it contains the statement `UPDATE corpus_documents SET n_sentences=?, …`.
+  That is a write to the live job store /opt/missing-link/jobs.sqlite, reached
+  through the interpreter -- the shape the guard MISSED on 2026-08-18 (F52) …
+  ```
+
+  and under `bypassPermissions` the same call returns `deny` with the
+  gate-downgrade text, so it does not fail open.
+- **The read-only direction.** These stay ALLOW — verified, not assumed:
+  `sqlite3 'file:/opt/missing-link/jobs.sqlite?mode=ro' "SELECT …"`,
+  `sqlite3 -readonly <db> "SELECT …"`,
+  `sqlite3.connect('file:…?mode=ro', uri=True)`,
+  `python -c "from missing_link import db; print(db.list_jobs('<live db>'))"`,
+  `python -m missing_link.audit`, `python -m missing_link.chunk_boundary_audit`,
+  `python -m pytest tests/ -q`, `ls`, `sha256sum`, `git status`.
+- **Entry-point sweep.** All 12 `missing_link` modules, 3 `bench` drivers and 22
+  test files invoked as `python -m …` / `python <file>`: exactly **three** gate
+  — `reprofile_corpus` (the F52 script), `app` (the service entry point, which
+  runs migrations and `requeue_running` on startup) and `db` itself. Everything
+  else is ALLOW. Two false positives were found during this sweep and fixed:
+  test files matched on the env-var *name* `MISSING_LINK_DB` (scope now requires
+  the literal live path, and `tests/` is excluded outright), and the gate message
+  quoted a *comment* and then a *help string* as its evidence instead of the real
+  `UPDATE` (literals are now ranked so the statement quoted is the statement that
+  matters — a guard whose stated reason is wrong is a guard nobody believes).
+- **Cost:** 33 ms per invocation including interpreter startup, on the heaviest
+  case (resolve module → read `db.py` → AST-parse both).
+- **Fail-closed unchanged:** unparseable stdin still returns `deny`.
+
+The framework-level `[DEBUG] Hook denied tool use for Bash` line above cannot be
+reproduced for these rules until the branch is merged, because a session's hook
+is the copy in the live checkout, not the one in the worktree being edited. **Re-run
+the one-liner below after merging** to confirm at the framework level.
+
 ### Re-running the checks
 
 The harness lives in the scratchpad rather than the repo, since there is no test
@@ -270,3 +439,9 @@ git history and no operator watching, which is the whole reason
    got wrong by someone re-implementing this.** A non-technical user's session
    is precisely the one least likely to be able to answer a prompt, and an
    `ask` that nobody can answer is an allow.
+4. **Ship the honest limits with the rules.** F52 is the transferable lesson
+   here, not the rule that came out of it: the guard's own list of "gated
+   operations" was read as covering the operation when it covered a spelling.
+   A Skill that hands a non-technical user a list of protected operations owes
+   them the same exposure table this file now carries — including the rows that
+   still say ALLOW.
