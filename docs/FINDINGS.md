@@ -85,6 +85,7 @@ numbers are cited from other documents and must not move.
 | **F61** | n8n's `Execute Command` is disabled by default; the LLM is measurably useless at cryptanalysis | CONFIRMED / REPORTED |
 | **F62** | The GTX 960 is strictly worse than the P600 already fitted — and it corrects F54 three ways | CONFIRMED / INFERRED |
 | **F63** | No space problem (1.1 TB free); network-backed inference is 1,479× too slow; the 21 MB/s HF figure is impossible | CONFIRMED |
+| **F64** | Node 3's manual work survived only by accident; nearly all of it was the cost of not using the preseed | CONFIRMED |
 
 ---
 
@@ -4326,3 +4327,109 @@ and treat it as buying a diagnostic as well as a fix.** It does **not** rescue
   98.9 GB. **At 85% it moves to 112.0 GB** — the difference between GLM-4.6
   UD-IQ1_S (96.9 GB) fitting with 2 GB to spare and fitting comfortably.
   **That experiment is worth more than any storage change here.**
+
+---
+
+## F64. Node 3's manual work is reconstructable ONLY by accident — and almost all of it was the cost of not using the preseed
+
+**CONFIRMED.** Forensic reconstruction of what was done to node 3 by hand before
+provisioning, so it can go into the scripts rather than be re-derived on node 4.
+
+### The evidence very nearly did not exist
+
+| Source | Status |
+|---|---|
+| `~/.bash_history`, `/root/.bash_history` | **DO NOT EXIST** |
+| `/var/log/auth.log` | **does not exist** — Debian 12 ships no rsyslog; `sudo` goes to the journal only |
+| `journalctl` (current machine-id) | **starts after provisioning** — useless for the manual window |
+| **`/var/log/journal/<OLD-machine-id>/`** | **the find** — orphaned by `setup.sh`'s machine-id regeneration, and it holds the entire manual window with every `sudo` command line |
+
+**The histories were never truncated — they were never written.** Bash writes
+`HISTFILE` on exit, and **six shells from that session are still alive**, so the
+history is in memory and recoverable with `history -a` while they live.
+
+**`setup.sh` regenerates the machine-id while journald is still volatile**, which
+orphaned the only surviving record. **Persistent journald must be enabled BEFORE
+the machine-id block**, or a node's entire early history is unrecoverable — and
+this reconstruction survived by luck rather than design.
+
+### Nearly every manual step traces to one cause: the preseed was not used
+
+**CONFIRMED — the installer's own recorded answers contradict
+`provisioning/preseed.cfg` on every substantive line:**
+
+| `questions.dat` (actual) | `preseed.cfg` (repo) |
+|---|---|
+| `time/zone` = `US/Eastern` | `Australia/Sydney` |
+| tasksel = **GNOME desktop** + SSH + standard | `standard, ssh-server` |
+| **root HAS a password** | `passwd/root-login boolean false` |
+
+**Three of the four divergences each generated manual repair work later**, and
+they are the direct source of F53 (the desktop), F56/F59 (the desktop again, and
+suspend) and the timezone divergence. **Because a root password was set, d-i did
+NOT add the admin user to `sudo`** — costing a `su`, a failed `sudo`, a failed
+`su`, then `usermod -aG sudo`.
+
+**`join-node.sh` has a chicken-and-egg bug this exposes:** its step 2 appends a
+NOPASSWD line to `/etc/sudoers` — **but that step itself requires sudo**, which
+the user does not yet have. It must say: if `sudo -n true` fails, `su -` then
+`usermod -aG sudo <user>`, then log out and back in.
+
+**`find /etc -newermt <first boot> ! -newermt <setup.sh>` returns exactly ONE
+file: `/etc/sudoers`.** So: **no manual network config, no manual sshd config,
+no manual power config, no sudoers.d drop-in.** That negative result is worth as
+much as the positive ones.
+
+### The uncaptured setting on ALL THREE nodes
+
+**`power-profiles-daemon` is set to `Profile=performance` on every node, by hand,
+through the GNOME GUI, and no script touches it.**
+
+| Node | mtime of `state.ini` |
+|---|---|
+| node 1 | Aug 17 17:03 |
+| node 2 | Aug 17 17:50 |
+| node 3 | Aug 23 14:31 |
+
+`power-profiles-daemon` 0.12 defaults to **`balanced`** and only writes
+`state.ini` when the profile is *changed*, so all three files are proof of a
+manual selection. It persists across reboot, so it is not silently reverting —
+**but node 4 will come up `balanced`, with `energy_perf_bias` 6 instead of 0.**
+This is the F32/F56 pattern for a **performance-relevant** setting, and it is
+**unmeasured on this hardware** — it should be benchmarked before being stated
+as a win, not just scripted.
+
+### On the suspend sequence, reported as the record shows it
+
+**Node 3 never suspended before provisioning.** There is no `PM: suspend`,
+`sleep.target` or `Freezing user space` anywhere in the pre-`setup.sh` journal.
+It suspended at **13:42:22 — 36 minutes AFTER `setup.sh` finished** — and stayed
+down 42 minutes until physically woken. The operator then opened GNOME Settings →
+Power (`gnome-control-center`, `last-panel='power'`) and turned it off **for that
+user only**, which is the per-user fix the F59 addendum found and which is
+invisible to the GDM greeter.
+
+So the manual suspend fix came *after* setup on this node, not before it. **The
+underlying complaint is exactly right and cost 42 minutes** — Debian's desktop
+task does default to idle suspend, and it has now bitten all three machines. Only
+the ordering differs from recollection, and it is recorded here because node 4's
+script depends on knowing which step fixes what.
+
+### The gaps, split by whether node 4 needs them
+
+**Structural — must be fixed:** the preseed is not asserted (`setup.sh` should
+**report** the four facts, not silently repair them); the `sudo`-group
+chicken-and-egg; `powerprofilesctl set performance`; **`ethtool` missing from
+`setup.sh`'s package list** although its own WoL block needs it; **`wakeonlan`
+not installed on node 3** and nothing guarantees the coordinator has it; and
+persistent journald before the machine-id regeneration.
+
+**Also worth flagging:** `join-node.sh` steps 3 and 4 were **no-ops** on node 3
+(sshd was already installed and listening from first boot) and cost 12 minutes of
+confusion — they should say "verify, do not assume".
+
+**One-offs, correctly excluded:** three `apt` typos, `gh` and `net-tools` as
+operator convenience, a no-op `apt upgrade` (d-i had already run it), and
+**Claude Code installed natively under `root`** — the operator's own tooling
+rather than cluster infrastructure, though **an agent CLI running as root on a
+box with a root password enabled is a shape worth noting deliberately.**
