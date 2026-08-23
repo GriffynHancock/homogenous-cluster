@@ -71,6 +71,7 @@ numbers are cited from other documents and must not move.
 | **Addendum to F48** | Swap implemented; nupunkt INVERTS the raw-HTML manifestation, so HTML extraction stays load-bearing | CONFIRMED |
 | **F50** | The −47% and F14's −5% are both right; RPC's generation penalty scales with `n_vocab`, not model size | CONFIRMED |
 | **F51** | The watchdog makes large-model sharding impossible — a busy `rpc-server` refuses connections and gets restarted | CONFIRMED |
+| **F52** | Corpus re-profiled on the new splitter — and the SQL safety gate did not fire on the write that did it | CONFIRMED |
 
 ---
 
@@ -3091,3 +3092,71 @@ what F36 said in the first place.
 because its `pgrep -f auto-bench-gptoss` **self-matches its own command line** —
 the same pattern-matching hazard behind this project's standing "never `pkill
 -f`" rule, in its other form. Zero CPU, harmless, and it will never exit.
+
+---
+
+## F52. The corpus is re-profiled on the new instrument — and the SQL safety gate did not fire on the write that did it
+
+**CONFIRMED.** The nupunkt swap (F48 + addendum) is merged and live, and all 17
+corpus documents have been re-profiled. **Every row moved in the expected
+direction**, and the headline figure reproduces F48 to the decimal.
+
+| genre | before | after |
+|---|---:|---:|
+| legislative | 3.03% | **9.68%** |
+| regulatory | 1.06% | **2.06%** |
+| standards (ISM) | 0.57% | **1.71%** |
+| nist standards | 0.30% | **1.21%** |
+
+Privacy Act compilation 104: **2.85% → 10.53%** (sentences 8,455 → 1,861).
+Privacy Credit Reporting Code: 4.47% → 12.72%. Every row is now stamped
+`sentence_splitter = nupunkt`, and the corpus page carries **zero** rows with
+the "splitter unknown / not comparable" badge. The dry run confirmed **no
+splitter-INDEPENDENT control figure moved**, which is what distinguishes "the
+instrument changed" from "something else changed".
+
+**Test suite: 662 passed, 0 failed** — and the number was reconciled rather than
+accepted. The estimate of ~585 was low because the splitter branch extended four
+existing test files as well as adding its own: 552 + 77 (amplification) + 27
+(sentences) + 6 (four existing files) = 662. **A test count that does not
+reconcile is an unexamined claim**, and this project's F34 lesson is exactly
+that a count proves nothing on its own.
+
+### The finding: `cluster-guard.py` did not fire on a live mutating write
+
+`docs/AGENT-HARDENING.md` states that agent hygiene here is **"enforced, not
+merely advised"**, and `CLAUDE.md` lists "mutating SQL against the live job
+store" among the gated operations. The re-profile issued **17 UPDATEs against
+`/opt/missing-link/jobs.sqlite`** — the live job store — and **the hook did not
+match it.** It was invoked as `python -m missing_link.reprofile_corpus --apply`,
+which does not look like SQL to a pattern matcher.
+
+**What actually protected that run was the script's own safeguards** — the
+instrument check that refuses to start unless nupunkt is active, the row count
+printed before writing, and the abort-if-a-control-column-moved guard. Those
+were written by the agent that built it, not enforced by the fleet.
+
+**This generalises past this one command.** A hook that matches command patterns
+cannot see a mutation reached through an interpreter, an ORM, or any script it
+does not have a pattern for — and the gated-operation list reads as though it
+covers the *operation* when it in fact covers *some spellings of it*. This is
+the same shape as the standing warning that **no hook can catch a wrong SQL
+predicate**, because that is a semantics problem rather than a command pattern;
+here the gap is one level up, and the operation was not even seen.
+
+**Treat the hook as a backstop against known-dangerous spellings, never as the
+reason a write is safe.** The safety that held was in the script.
+
+### A definitional wrinkle worth pinning down before anyone quotes it
+
+F48's "genre separation 2.2× → 4.8×" is a **per-document** ratio (Privacy Act
+104 vs OAIC Ashley Madison: 2.85/1.30 = 2.19× → 10.53/2.20 = 4.79×), and it
+reproduces exactly. But the same quantity computed **genre-pooled** is 2.85× →
+4.70×, and by **unweighted genre mean** 3.16× → 4.98×. All three support the
+conclusion; they are not interchangeable numbers. **Quote the definition
+alongside the figure.**
+
+**Also fixed in passing:** `reportlab` is now declared in
+`missing-link/requirements.txt`, verified by building a fresh venv purely from
+that file and running the suite — the F34-shaped hole where the suite passes
+only where it happens to be run is closed for this dependency.
