@@ -5,8 +5,26 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=debian1
-# Config is per-node in /etc/default/llama-server, written by install-inference.sh.
+# PLACEHOLDER, DELIBERATELY UNRESOLVABLE. The real login is per node and is
+# supplied by the drop-in
+#     /etc/systemd/system/llama-server@.service.d/10-node-user.conf
+# written by cluster/install-services.sh from nodes.env's 5th field.
+#
+# Why not an EnvironmentFile like everything else below: systemd expands
+# ${VAR} only in the ExecStart family. `User=` is resolved by the manager
+# before any environment exists, so `User=${LLAMA_USER}` is not a variable --
+# it is a literal username containing '$', and the unit dies 217/USER.
+#
+# Why a placeholder rather than omitting `User=`: omitting it means the unit
+# runs as ROOT. An inference server on a box holding sensitive documents must
+# not silently gain root because a drop-in is missing. This name resolves to
+# nobody, so a missing drop-in fails instantly and legibly instead.
+#
+# This file was `User=debian1` until 2026-08-23. That was correct only while
+# every machine happened to use the coordinator's login name; node 3 is
+# `debian3`. See docs/FINDINGS.md F53.
+User=llama-server-user-set-by-dropin
+# Config is per-node in /etc/default/llama-server, written by install-services.sh.
 # systemd does not expand shell substitutions, hence the EnvironmentFile.
 EnvironmentFile=/etc/default/llama-server
 

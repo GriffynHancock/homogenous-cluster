@@ -82,9 +82,9 @@ WD_PUB="$(cat "${WD_KEY}.pub")"
 # 2. Node side.
 # ---------------------------------------------------------------------------
 install_node() {
-  local NAME="$1" IP="$2"
+  local NAME="$1" IP="$2" TGT="$3"
 
-  echo "== $NAME ($IP)"
+  echo "== $NAME ($IP, admin login ${TGT%@*})"
 
   # Ship the two scripts and the fleet list. `install -m` is atomic-ish and
   # idempotent; re-running simply overwrites with the same bytes.
@@ -92,9 +92,9 @@ install_node() {
          provisioning/nodes.env \
          cluster/llama-watchdog@.service cluster/llama-watchdog@.timer \
          cluster/llama-watchdog-fleet.service cluster/llama-watchdog-fleet.timer \
-         "$IP:/tmp/"
+         "$TGT:/tmp/"
 
-  ssh "$IP" "sudo install -D -m 0755 -o root -g root /tmp/llama-watchdog-agent.sh /usr/local/sbin/llama-watchdog-agent && \
+  ssh "$TGT" "sudo install -D -m 0755 -o root -g root /tmp/llama-watchdog-agent.sh /usr/local/sbin/llama-watchdog-agent && \
              sudo install -D -m 0755 -o root -g root /tmp/llama-watchdog.sh       /usr/local/sbin/llama-watchdog && \
              sudo install -D -m 0644 -o root -g root /tmp/nodes.env               /etc/llama-watchdog/nodes.env && \
              sudo install -D -m 0644 -o root -g root /tmp/llama-watchdog@.service       /etc/systemd/system/llama-watchdog@.service && \
@@ -109,17 +109,17 @@ install_node() {
   # The restricted account. A system account with a real (minimal) shell,
   # because sshd needs to exec the forced command through one. It owns nothing
   # but its own .ssh directory.
-  ssh "$IP" "id -u ${WD_USER} >/dev/null 2>&1 || \
+  ssh "$TGT" "id -u ${WD_USER} >/dev/null 2>&1 || \
              sudo useradd --system --create-home --home-dir '${WD_HOME}' \
                           --shell /bin/sh --comment 'llama-server liveness watchdog' '${WD_USER}'"
   # 0755 on the home, not 0700: it holds the watchdog's heartbeat drop box, and
   # an operator (or Missing Link) has to be able to read it to answer "when did
   # the monitor last look at this node?". Nothing secret lives there.
-  ssh "$IP" "sudo install -d -m 0755 -o ${WD_USER} -g ${WD_USER} '${WD_HOME}' && \
+  ssh "$TGT" "sudo install -d -m 0755 -o ${WD_USER} -g ${WD_USER} '${WD_HOME}' && \
              sudo install -d -m 0700 -o ${WD_USER} -g ${WD_USER} '${WD_HOME}/.ssh'"
 
   # authorized_keys: replace only OUR line, leave anything else alone.
-  ssh "$IP" "sudo sh -c 'f=${WD_HOME}/.ssh/authorized_keys; touch \$f; \
+  ssh "$TGT" "sudo sh -c 'f=${WD_HOME}/.ssh/authorized_keys; touch \$f; \
              grep -v \"llama-watchdog (restricted\" \$f > \$f.new 2>/dev/null || true; \
              printf \"%s\\n\" \"restrict,command=\\\"/usr/local/sbin/llama-watchdog-agent\\\" ${WD_PUB}\" >> \$f.new; \
              mv \$f.new \$f; chown ${WD_USER}:${WD_USER} \$f; chmod 0600 \$f'"
@@ -130,7 +130,7 @@ install_node() {
   # Three units, named individually. Not a blanket `systemctl` grant.
   # `missing-link` is restartable by the credential but gated by POLICY in the
   # controller (never while a job is running -- F36 was caused by exactly that).
-  ssh "$IP" "SC=\$(command -v systemctl); \
+  ssh "$TGT" "SC=\$(command -v systemctl); \
              MLU=\$(systemctl show -p User --value missing-link.service 2>/dev/null); \
              printf '%s ALL=(root) NOPASSWD: %s restart llama-server@*, %s restart rpc-server@*, %s restart missing-link\n' '${WD_USER}' \"\$SC\" \"\$SC\" \"\$SC\" > /tmp/llama-watchdog.sudoers && \
              if [ -n \"\$MLU\" ]; then \
@@ -145,7 +145,7 @@ install_node() {
   # docs/REQUIREMENTS.md 2026-08-17 is explicit that it is NOT sufficient on
   # its own -- it shares the host's failure modes.
   for P in $WD_PORTS; do
-    ssh "$IP" "sudo systemctl daemon-reload && sudo systemctl enable --now llama-watchdog@${P}.timer"
+    ssh "$TGT" "sudo systemctl daemon-reload && sudo systemctl enable --now llama-watchdog@${P}.timer"
     say "in-band timer llama-watchdog@${P}.timer enabled"
   done
 
@@ -194,7 +194,10 @@ if [ "$DO_NODES" = 1 ]; then
     if [ -n "$ONLY" ]; then
       case ",${ONLY}," in *",${NAME},"*|*",${IP},"*) ;; *) continue ;; esac
     fi
-    install_node "$NAME" "$IP"
+    # Admin login is per node (nodes.env 5th field). The WATCHDOG's own login
+    # is not -- it is ${WD_USER}, created identically everywhere, and the
+    # restricted-key checks below deliberately keep using it.
+    install_node "$NAME" "$IP" "$(node_target "$entry")"
   done
 fi
 

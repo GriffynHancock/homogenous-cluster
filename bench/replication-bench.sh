@@ -57,9 +57,9 @@ echo
 FAIL=0
 for entry in "${NODES[@]}"; do
   set -- $entry
-  NAME=$1; IP=$2
-  SZ=$(ssh -o BatchMode=yes "$IP" "stat -c %s '$MODEL' 2>/dev/null" 2>/dev/null || echo 0)
-  BIN=$(ssh -o BatchMode=yes "$IP" "test -x '$ENGINE/bin/llama-server' && echo yes" 2>/dev/null || echo no)
+  NAME=$1; IP=$2; TGT=$(node_target "$entry")
+  SZ=$(ssh -o BatchMode=yes "$TGT" "stat -c %s '$MODEL' 2>/dev/null" 2>/dev/null || echo 0)
+  BIN=$(ssh -o BatchMode=yes "$TGT" "test -x '$ENGINE/bin/llama-server' && echo yes" 2>/dev/null || echo no)
   printf '  %-8s model %14s bytes   engine %s\n' "$NAME" "${SZ:-0}" "$BIN"
   [ "${SZ:-0}" -gt 0 ] || { echo "    FATAL: $NAME has no model at $MODEL" >&2; FAIL=1; }
   [ "$BIN" = yes ]     || { echo "    FATAL: $NAME has no $ENGINE/bin/llama-server" >&2; FAIL=1; }
@@ -73,7 +73,7 @@ echo
 echo "=== Stopping rpc-server on all nodes (replication uses no RPC) ==="
 for entry in "${NODES[@]}"; do
   set -- $entry
-  ssh -o BatchMode=yes "$2" "sudo systemctl stop rpc-server@${RPC_PORT} 2>/dev/null" || true
+  ssh -o BatchMode=yes "$(node_target "$entry")" "sudo systemctl stop rpc-server@${RPC_PORT} 2>/dev/null" || true
   echo "  $1 stopped"
 done
 
@@ -82,7 +82,7 @@ cleanup() {
   echo "=== Cleanup: stopping llama-servers ==="
   for entry in "${NODES[@]}"; do
     set -- $entry
-    ssh -o BatchMode=yes "$2" "pkill -f 'llama-server .*--por[t] $PORT'" 2>/dev/null || true
+    ssh -o BatchMode=yes "$(node_target "$entry")" "pkill -f 'llama-server .*--por[t] $PORT'" 2>/dev/null || true
   done
   echo "  (rpc-server left stopped; restart with ./cluster/install-services.sh"
   echo "   or: sudo systemctl start rpc-server@${RPC_PORT})"
@@ -94,14 +94,14 @@ echo
 echo "=== Launching an INDEPENDENT llama-server per node ==="
 for entry in "${NODES[@]}"; do
   set -- $entry
-  NAME=$1; IP=$2; CORES=${4:-4}
+  NAME=$1; IP=$2; CORES=${4:-4}; TGT=$(node_target "$entry")
   # TWO separate ssh calls, deliberately. Combining them puts both the pkill
   # pattern AND a literal "llama-server ... --port $PORT" into the SAME remote
   # shell's command line, so pkill -f matches its own shell and kills the launch
   # before it happens. (Cost me two dead shells to find. The [t] bracket stops
   # the pattern matching itself, but not a sibling command beside it.)
-  ssh -o BatchMode=yes "$IP" "pkill -f 'llama-server .*--por[t] $PORT'" 2>/dev/null || true
-  ssh -o BatchMode=yes "$IP" \
+  ssh -o BatchMode=yes "$TGT" "pkill -f 'llama-server .*--por[t] $PORT'" 2>/dev/null || true
+  ssh -o BatchMode=yes "$TGT" \
     "nohup $ENGINE/bin/llama-server \
        -m '$MODEL' -t $CORES -c $CTX --parallel $PARALLEL \
        --host 0.0.0.0 --port $PORT --no-warmup --jinja \
@@ -140,7 +140,7 @@ echo "=== Server-reported timings (authoritative, per node) ==="
 for entry in "${NODES[@]}"; do
   set -- $entry
   echo "  --- $1 ---"
-  ssh -o BatchMode=yes "$2" "grep -E 'prompt eval time|eval time' /tmp/llama-server-$PORT.log | tail -4" 2>/dev/null \
+  ssh -o BatchMode=yes "$(node_target "$entry")" "grep -E 'prompt eval time|eval time' /tmp/llama-server-$PORT.log | tail -4" 2>/dev/null \
     || echo "    (no timings found)"
 done
 

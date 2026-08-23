@@ -29,20 +29,60 @@ for entry in "${NODES[@]}"; do
   NAME=$1; IP=$2; CORES=${4:-}
   wanted "$NAME" "$IP" || { echo "  $NAME skipped (ONLY_NODES=$ONLY_NODES)"; continue; }
 
+  # Per-node admin login (nodes.env 5th field; default = coordinator's own).
+  # A bare `ssh "$IP"` uses the CALLER's name -- fine while every node happened
+  # to be `debian1`, wrong the moment one is not. See FINDINGS F53.
+  TGT=$(node_target "$entry")
+  NUSER=$(node_user "$entry")
+
   # Prefer the measured value from nodes.env; fall back to deriving it.
   if [ -z "$CORES" ]; then
-    CORES=$(ssh "$IP" "$CORE_CMD")
+    CORES=$(ssh "$TGT" "$CORE_CMD")
     echo "  $NAME: cores not in nodes.env, derived $CORES -- record it there"
   fi
 
-  scp -q cluster/rpc-server@.service "$IP:/tmp/"
-  ssh "$IP" "sudo mv /tmp/rpc-server@.service /etc/systemd/system/ && \
+  scp -q cluster/rpc-server@.service "$TGT:/tmp/"
+  ssh "$TGT" "sudo mv /tmp/rpc-server@.service /etc/systemd/system/ && \
              echo RPC_THREADS=$CORES | sudo tee /etc/default/rpc-server >/dev/null && \
              sudo systemctl daemon-reload && \
              sudo systemctl enable --now rpc-server@${RPC_PORT}"
 
-  ACTUAL=$(ssh "$IP" "cat /etc/default/rpc-server")
-  echo "  $NAME started ($ACTUAL, nproc=$(ssh "$IP" nproc))"
+  ACTUAL=$(ssh "$TGT" "cat /etc/default/rpc-server")
+  echo "  $NAME started ($ACTUAL, nproc=$(ssh "$TGT" nproc))"
+
+  # -------------------------------------------------------------------------
+  # llama-server@.service: install the unit and the ONE per-node thing in it.
+  #
+  # `User=` is the only setting in that unit that differs per machine, and
+  # systemd does NOT expand environment variables in `User=` -- only ExecStart-
+  # family settings get ${VAR}. So the EnvironmentFile that carries every other
+  # per-node value cannot carry this one. The options were: generate the unit
+  # per node (the shipped file then never matches what is installed, and a
+  # `diff` check stops meaning anything), or a drop-in. Drop-in wins: the
+  # tracked unit stays byte-identical everywhere, the per-node part is one
+  # line in one file, and reverting is deleting that file.
+  #
+  # NOT enabled or started here. Starting it needs /etc/default/llama-server
+  # and a model on disk, both of which are separate steps, and this script is
+  # run against nodes that are already serving -- an `enable --now` here would
+  # bounce a live inference server.
+  # -------------------------------------------------------------------------
+  scp -q cluster/llama-server@.service "$TGT:/tmp/"
+  # Drop-in FIRST, unit SECOND. The tracked unit's `User=` is a placeholder that
+  # does not resolve (see the unit file), so a chain that replaced the unit and
+  # then failed to write the drop-in would leave the node one restart away from
+  # status=217/USER. In this order the incomplete state is always harmless.
+  ssh "$TGT" "printf '# Written by cluster/install-services.sh -- per-node admin login.\n# systemd cannot expand a variable in User=, so it cannot live in\n# /etc/default/llama-server with the rest. Delete this file to revert.\n[Service]\nUser=${NUSER}\n' \
+               | sudo install -D -m 0644 -o root -g root /dev/stdin /etc/systemd/system/llama-server@.service.d/10-node-user.conf && \
+             sudo install -D -m 0644 -o root -g root /tmp/llama-server@.service /etc/systemd/system/llama-server@.service && \
+             rm -f /tmp/llama-server@.service && \
+             sudo systemctl daemon-reload"
+  EFFECTIVE=$(ssh "$TGT" "systemctl show -p User --value llama-server@8080")
+  if [ "$EFFECTIVE" != "$NUSER" ]; then
+    echo "  FATAL: $NAME llama-server@ resolves to User='$EFFECTIVE', expected '$NUSER'" >&2
+    exit 1
+  fi
+  echo "  $NAME llama-server@ unit installed, User=$EFFECTIVE (not started)"
 done
 
 # ---------------------------------------------------------------------------
@@ -67,7 +107,9 @@ for entry in "${NODES[@]}"; do
     echo "  $1 $2:$RPC_PORT open"
   else
     echo "  FATAL: $1 $2:$RPC_PORT unreachable" >&2
-    echo "  check: ssh $2 journalctl -u rpc-server@$RPC_PORT -n 30" >&2
+    # sudo: the admin account is in neither adm nor systemd-journal on any node,
+    # so a plain journalctl here prints "-- No entries --" and nothing else.
+    echo "  check: ssh $(node_target "$entry") sudo journalctl -u rpc-server@$RPC_PORT -n 30" >&2
     exit 1
   fi
 done

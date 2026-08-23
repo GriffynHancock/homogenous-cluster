@@ -27,6 +27,16 @@ PORT="${PORT:-8081}"
 CORES=$(lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l)
 LOG=/tmp/two-node-smoke.log
 
+# The worker's admin login is per node (nodes.env 5th field, default = this
+# machine's own login). Only used for the DIAGNOSTIC journal read on failure --
+# the test itself speaks RPC on a raw IP, which is deliberately login-agnostic.
+WORKER_SSH="$WORKER_IP"
+if [ -r "$(dirname "$0")/../provisioning/nodes.env" ]; then
+  # shellcheck disable=SC1091
+  source "$(dirname "$0")/../provisioning/nodes.env"
+  WORKER_SSH=$(node_target_for "$WORKER_IP")
+fi
+
 [ -f "$MODEL" ] || { echo "FATAL: model not found: $MODEL" >&2; exit 1; }
 
 cleanup() {
@@ -56,7 +66,7 @@ fi
 echo "=== Checking worker $WORKER_IP:$RPC_PORT ==="
 if ! timeout 5 bash -c "cat < /dev/null > /dev/tcp/$WORKER_IP/$RPC_PORT" 2>/dev/null; then
   echo "FATAL: $WORKER_IP:$RPC_PORT not reachable." >&2
-  echo "  ssh $WORKER_IP systemctl status rpc-server@$RPC_PORT" >&2
+  echo "  ssh $WORKER_SSH sudo systemctl status rpc-server@$RPC_PORT" >&2
   exit 1
 fi
 echo "  reachable"
@@ -104,7 +114,12 @@ EOF
   echo "--- llama-server log (tail) ---"; tail -40 "$LOG"
   echo "--- local rpc-server log (tail) ---"; tail -20 /tmp/smoke-local-rpc.log
   echo "--- worker log ---"
-  ssh "$WORKER_IP" "journalctl -u rpc-server@$RPC_PORT -n 40 --no-pager" 2>/dev/null \
+  # sudo, not plain journalctl. The admin account is in neither `adm` nor
+  # `systemd-journal` on ANY node in this fleet, so an unprivileged journalctl
+  # prints "-- No entries --" and a hint, on a healthy node and a broken one
+  # alike. This is the one command that runs when the #26500 gate fails, and it
+  # was silently returning nothing. Verified on nodes 2 and 3, 2026-08-23.
+  ssh "$WORKER_SSH" "sudo journalctl -u rpc-server@$RPC_PORT -n 40 --no-pager" 2>/dev/null \
     || echo "(could not read worker journal)"
   exit 1
 fi

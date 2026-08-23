@@ -183,7 +183,13 @@ else
 fi
 
 log "Directories"
-mkdir -p /opt/llama.cpp/bin /opt/models
-chown -R "${SUDO_USER:-root}" /opt/llama.cpp /opt/models
+# BOTH engine prefixes, not just mainline. distribute.sh takes the prefix as its
+# argument and does `ssh <node> "mkdir -p $SRC/bin"` as the admin user, which
+# cannot create a new directory in /opt -- so shipping the fork to a fresh node
+# died with "mkdir: cannot create directory '/opt/ik_llama.cpp': Permission
+# denied". Found on node 3, 2026-08-23. Nodes 1 and 2 were unaffected only
+# because their fork prefix had been created by hand.
+mkdir -p /opt/llama.cpp/bin /opt/ik_llama.cpp/bin /opt/models
+chown -R "${SUDO_USER:-root}" /opt/llama.cpp /opt/ik_llama.cpp /opt/models
 
 log "Done: $NEW_HOSTNAME"
