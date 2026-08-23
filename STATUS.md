@@ -20,7 +20,7 @@ observed and named plainly as a snapshot, not a fact.
 | | |
 |---|---|
 | **What this is** | An **N-node**, CPU-only llama.cpp cluster doing real work on real sensitive documents, fronted by **Missing Link** — an async job queue where slowness is not a defect. `CLAUDE.md` has the argument and the standing constraints. |
-| **Check before trusting anything below** | **Push state:** `git fetch -q origin && echo "ahead: $(git log --oneline origin/main..HEAD \| wc -l)  behind: $(git log --oneline HEAD..origin/main \| wc -l)"`. **Test count:** `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1`. **Node 1 services:** `systemctl is-active llama-server@8080 missing-link rpc-server@50052`. **Node 2 services + engine:** `ssh debian1@<node2-ip> 'systemctl is-active llama-server@8080 rpc-server@50052; grep LLAMA_BIN /etc/default/llama-server'` — node 2's engine has flipped mid-session at least once (see "Where things stand" below); a stale reading of it is wrong, not just old. **Is fan-out actually in use:** `grep LLAMA_URLS /etc/default/missing-link` — the code fans out across R endpoints, but this variable has been observed unset (silent single-endpoint fallback) more often than set; the code being merged does not mean it is live. **Disk free:** `df -h /` on each node. |
+| **Check before trusting anything below** | **Push state:** `git fetch -q origin && echo "ahead: $(git log --oneline origin/main..HEAD \| wc -l)  behind: $(git log --oneline HEAD..origin/main \| wc -l)"`. **Test count:** `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1`. **Node 1 services:** `systemctl is-active llama-server@8080 missing-link rpc-server@50052`. **Node 2 services + engine:** `ssh debian1@<node2-ip> 'systemctl is-active llama-server@8080 rpc-server@50052; grep LLAMA_BIN /etc/default/llama-server'` — node 2's engine has flipped mid-session at least once (see "Where things stand" below); a stale reading of it is wrong, not just old. **Is fan-out actually in use:** `grep LLAMA_URLS /etc/default/missing-link` — as of 2026-08-23 this is **SET to both endpoints and proven live** (see below), but it had been observed unset (silent single-endpoint fallback) more often than set for weeks before that, so still check rather than assume; the code being merged never meant it was live. **Disk free:** `df -h /` on each node. |
 | **What is running** | `llama-server` on **nodes 1 and 2**, `rpc-server@50052` on both, and **Missing Link** on the coordinator (node 1) — all as systemd units. N = 2. This is the steady-state shape; use the row above to confirm it is actually true right now rather than trusting this sentence. |
 | **Which engine, and why** | **MAINLINE llama.cpp b10369** (`/opt/llama.cpp/bin`), fleet-wide. **Not ik_llama.cpp** — it was adopted on a prefill win (F27) and then dropped, because it fatal-errors on the 5th request of any `--parallel 4` job, i.e. on any document longer than four chunks, leaving a hang `Restart=always` cannot see (**F40**). ik stays installed at `/opt/ik_llama.cpp/bin` for the still-untested `--parallel 1` configurations only. **Do not point a serving node at it.** |
 | **Next task** | **§0, the corpus-driven benchmark** — the operator's stated priority. Re-run the three measurements that were blocked or weakened by the corpus (chunk-boundary severance, the entity signal's false-positive rate, the faithfulness cascade) against the real public documents now on the `/corpus` page — legislation, standards, regulator determinations — instead of the two narrative texts every earlier measurement had to use. Full brief under **NEXT TASKS, in order** below. |
@@ -404,8 +404,37 @@ against `db.claim_next_pending` (already atomic under concurrency —
   `start_char`/`end_char` per chunk; confirmed present in the live
   `/opt/missing-link/jobs.sqlite` schema.
 
-**The code is built, merged and tested, but fan-out is NOT actually enabled
-on node 1 right now.** Confirmed directly from `/etc/default/missing-link`
+**RESOLVED 2026-08-23 — fan-out is now ENABLED AND PROVEN ON HARDWARE.**
+`/etc/default/missing-link` sets
+`LLAMA_URLS=http://127.0.0.1:8080,http://10.10.0.39:8080` (backup at
+`/etc/default/missing-link.bak-20260823-102936`; the legacy singular
+`LLAMA_URL` line was deliberately KEPT — `app.py:39-42` reads it only when
+`LLAMA_URLS` is unset or empty, so it is a pure fallback and cannot produce a
+duplicate endpoint). **Proof, and note that "the service started" was not
+accepted as proof:** two jobs submitted back to back were claimed by
+DIFFERENT endpoints and ran concurrently — `c74d70b24d1f` on
+`http://127.0.0.1:8080` and `1a634b040762` on `http://10.10.0.39:8080`,
+started 5 ms apart (00:30:19.707 / 00:30:19.712), both `done`. Corroborated
+from OUTSIDE Missing Link's own opinion of itself: node 2's load average went
+from 0.00 to 1.14 with `llama-server` on CPU during the run. **This is the
+first time node 2 has ever run inference through Missing Link** — the
+`endpoint` column was NULL on every historical job and the only two non-NULL
+rows in the store were both `127.0.0.1`. The column had been working; there
+was simply never a second endpoint to record.
+
+**A trap found while doing it, recorded because it makes an obvious-looking
+knob dangerous:** a DUPLICATE entry in `LLAMA_URLS` would half-break the
+status display. `ENDPOINT_STATE` is a dict comprehension (`app.py:49`) so it
+dedupes, but the worker task list (`app.py:94`) does not — listing the same
+URL twice yields two worker loops sharing one state entry, and `current_job`
+is clobbered by whichever wrote last. Jobs would still run correctly; only the
+display would lie. So "run two workers per node" is **not** available by
+repeating a URL. Also verified by direct execution, not inference: a malformed
+entry (no scheme, dead host, or not a URL) never crashes the app — all three
+return `False` via `BackendUnavailable` and the entry sits in backoff forever,
+visible only as `"reachable": false` on `/health`.
+
+**Historical note — what this paragraph said before 2026-08-23:** Confirmed directly from `/etc/default/missing-link`
 this session: it sets `LLAMA_URL=http://127.0.0.1:8080` (the legacy singular
 variable) and does **not** set `LLAMA_URLS` (the plural, comma-separated
 variable `app.py` actually reads for fan-out — see `app.py` around line 38).
@@ -610,7 +639,7 @@ second replica, `10.10.0.39`)** — both provisioned, both serving.
 | Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB), **Qwen3-Next-80B-A3B-Instruct UD-Q8_K_XL — download COMPLETE as of 2026-08-18 afternoon**, both shard files present, ~93 GB total (`ls /opt/models`; the previous entry's "26%" is stale) | **gpt-oss-120b, md5-verified as of 2026-08-17** (not re-checked since) |
 | SSH | password auth still ON as of 2026-08-18 (no key installed until that session) | **key-only, hardened** |
 | Disk free | snapshot 2026-08-18 afternoon: **248 GB**. Re-check: `df -h /` | snapshot 2026-08-18 afternoon: **375 GB**, down from the previous entry's 437 GB, consistent with the corpus/model activity recorded above. Re-check: `ssh debian1@<node2-ip> 'df -h /'` |
-| Missing Link | job store + worker + web API, fan-out across R endpoints (code merged, but as of 2026-08-18 afternoon **`LLAMA_URLS` was unset — only node 1 actually used**; see task 2 above and re-check with `grep LLAMA_URLS /etc/default/missing-link`), queue control, resumable per-chunk persistence, automatic retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table, a corpus benchmark page. Test count and service-restart timestamp are snapshots, not facts — re-run `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1` and `systemctl show missing-link --property=ActiveEnterTimestamp` yourself; as last observed (2026-08-18 afternoon) these were **552 tests** and `ActiveEnterTimestamp` **17:44:47**, later than the previous entry's 11:53:31, i.e. the service had been restarted again since then, consistent with the corpus feature going live | n/a (coordinator only) |
+| Missing Link | job store + worker + web API, fan-out across R endpoints (**LIVE as of 2026-08-23: `LLAMA_URLS` set to both endpoints and proven by two jobs running concurrently on different nodes** — see task 2 above; re-check with `grep LLAMA_URLS /etc/default/missing-link`), queue control, resumable per-chunk persistence, automatic retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table, a corpus benchmark page. Test count and service-restart timestamp are snapshots, not facts — re-run `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1` and `systemctl show missing-link --property=ActiveEnterTimestamp` yourself; as last observed (2026-08-18 afternoon) these were **552 tests** and `ActiveEnterTimestamp` **17:44:47**, later than the previous entry's 11:53:31, i.e. the service had been restarted again since then, consistent with the corpus feature going live | n/a (coordinator only) |
 | Phase 0 gate | **PASSED**, 2026-08-12 — a one-time validation, not a live status | — |
 | #26500 gate | **PASSED across both machines** (F31), 2026-08-17 — a one-time validation, not a live status | — |
 
@@ -651,8 +680,7 @@ session — see F30.
 
 **Not done:** nodes 3+, Model B decision, Open WebUI, evaluation harness,
 chunk-level fan-out within one document, a retrieval task profile, watchdog
-moved fully off-cluster, `LLAMA_URLS` actually set so fan-out is used in
-production, ik at `--parallel 1` / flash-attention-off, a long
+moved fully off-cluster, ik at `--parallel 1` / flash-attention-off, a long
 legal/records-style document for the boundary measurement, filing the
 ik_llama.cpp defect upstream. **Done since the previous entry:** the
 aggregate replication measurement, the chunk-size sweep at `-c 32768`
@@ -1113,4 +1141,6 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
   had not been reflected in `STATUS.md`'s tables); `missing-link.service`'s
   running process postdates all the relevant merges; `LLAMA_URLS` is unset
   in production despite fan-out being fully built, so only node 1 is
-  actually used; and 50, not "41+", commits are unpushed to `origin/main`.
+  actually used **[superseded 2026-08-23 — `LLAMA_URLS` is now set and fan-out
+  is proven live; see task 2]**; and 50, not "41+", commits are unpushed to
+  `origin/main`.
