@@ -72,6 +72,9 @@ numbers are cited from other documents and must not move.
 | **F50** | The −47% and F14's −5% are both right; RPC's generation penalty scales with `n_vocab`, not model size | CONFIRMED |
 | **F51** | The watchdog makes large-model sharding impossible — a busy `rpc-server` refuses connections and gets restarted | CONFIRMED |
 | **F52** | Corpus re-profiled on the new splitter — and the SQL safety gate did not fire on the write that did it | CONFIRMED |
+| **F53** | Node 3 is a three-way bandwidth twin — but its "1 TB" is a spinning HDD and it shipped as a GNOME desktop | CONFIRMED |
+| **Addendum to F51** | Fixed with a BYTES progress signal — CPU alone reads 0% during a real shard upload | CONFIRMED |
+| **F54** | ComfyUI is compute-bound the wrong way; n8n fits; and ComfyUI, n8n AND Missing Link all have no auth | CONFIRMED / REPORTED |
 
 ---
 
@@ -3160,3 +3163,225 @@ alongside the figure.**
 `missing-link/requirements.txt`, verified by building a fresh venv purely from
 that file and running the suite — the F34-shaped hole where the suite passes
 only where it happens to be run is closed for this dependency.
+
+---
+
+## F53. Node 3 is a three-way bandwidth twin — but its "1 TB" is spinning rust and it arrived as a GNOME desktop
+
+**CONFIRMED.** Node 3 (10.10.0.40) measured before provisioning, per F29's rule
+that homogeneity is a result and not an assumption.
+
+**The CPU claim holds exactly.** Xeon E5-1620 v4, family/model/**stepping**
+6/79/**1**, microcode `0xb000040`, 4 physical cores / 8 threads, **no AVX-512**,
+and the sorted flag sets diff to **zero differences** against node 1. Same
+chassis (Lenovo ThinkStation P410) and same BIOS (S00KT52A). **No ISA/SIGILL
+risk** (F8).
+
+**STREAM triad: 27.6–27.7 GB/s peak at 4 threads**, against node 1's 28.4 and
+node 2's 27.9. **F29 extends to a third machine — the fleet is a three-way
+bandwidth twin.** The 4-thread peak and the SMT penalty (F10) reproduce
+independently for the third time, and the 6-thread dip lands on node 2's figure
+exactly. Generation on node 3 will match. RAM is **128707 MB** — genuinely 2 MB
+under nodes 1/2, so use the measured value (F29's lesson).
+
+### The "1 TB of storage" is not what the plan assumed
+
+```
+sda     931.5G  ROTA=1  ST1000DM003-1SB102  sata   <- 7200rpm SPINNING HDD, NTFS, unmounted
+nvme0n1 476.9G  ROTA=0  INTEL SSDPEKKF512G7L nvme  <- the actual root disk
+```
+
+**The 1 TB is a spinning SATA disk carrying an NTFS partition from a prior
+Windows life. It is not mounted, not in `fstab`, and contributes zero usable
+space today.** The OS lives on a 476.9 GB NVMe — the same model as node 1's.
+
+**Consequence for the operator's stated plan** (1 TB disks as snapshot target
+*and* model storage): **models must stay on NVMe.** F16 already established disk
+as the binding constraint, and F3 that model load is single-core serialised and
+slow; loading 65 GB off 7200 rpm rust would make that materially worse. **The
+HDDs are snapshot and cold-storage capacity, not model storage** — and the same
+applies to the 1 TB drives going into nodes 1 and 2.
+
+### It is not the headless preseed, and that costs RAM
+
+**Node 3 is a full GNOME desktop install** — `task-gnome-desktop`, `gdm3`,
+`cups`, `avahi-daemon`, `ModemManager`, `packagekit`, `geoclue` and more all
+running. **It idles at 3,251 MB** against node 1's headless baseline, which
+comes straight off the working-memory budget. Also: **swap is ENABLED** (975 MB;
+node 1 has none — `setup.sh` disables it, so this self-resolves at provisioning,
+but until then node 3 degrades silently instead of OOMing loudly), and the
+**timezone is US/Eastern** against the fleet's Australia/Melbourne. That last is
+display-only, but this project does cross-node journal forensics constantly
+(F36, F40) and node 2 was aligned for exactly that reason.
+
+**No duplicate identity** — `machine-id` and all six SSH host key fingerprints
+distinct (F30 clear). glibc and kernel identical, Python 3.11.2 (on the nupunkt
+floor). No compiler on node 3, so the STREAM binary was built on node 1 (same
+CPU, same glibc, no `-march=native`) and copied.
+
+**The username is a hard blocker, and it is broader than a naming preference.**
+`getent passwd debian1` returns nothing on node 3. `distribute.sh` uses bare
+`ssh "$IP"` / `rsync`/`scp` at eight sites, `install-services.sh` at five, and
+`cluster/llama-server@.service:8` hardcodes `User=debian1` — all resolve to the
+coordinator's login name and all will fail. (`rpc-server@.service` uses
+`User=cluster`, created by `setup.sh`, so the RPC path is unaffected.)
+**Operator decision: parameterise per-node rather than rename**, because the
+skill must eventually run where usernames do not match.
+
+Proposed line, measured values only: `node3 10.10.0.40 128707 4`.
+
+---
+
+## Addendum to F51. Fixed with a BYTES signal — and CPU alone would not have saved the upload
+
+**CONFIRMED.** The probe now asks whether the RPC transfer is *progressing*,
+not whether the port answers. New agent verb `rpcprogress` samples **TCP
+data-byte counters on the RPC port's established connections** (`ss -ti`,
+`bytes_sent`+`bytes_received`) with the unit's cgroup CPU as a co-signal; either
+advancing counts as progress. It runs **only after the port has already
+refused**, so the healthy path costs nothing.
+
+**The decisive measurement, and it retires an obvious-looking alternative: at
+this link's rate the receiving `rpc-server` burns ~0% CPU.** In the busy tests
+CPU read **0% throughout while 1 MB/s of real payload was arriving.** So the
+CPU-progress signal that works for `llama-server` (F36's wedge showed
+`cpu=0ms/10002ms`) **would not have saved the shard upload on its own.** Bytes
+had to be primary. The connection count that comes free with them is
+structurally decisive: a single-client server refusing *because* it is busy
+necessarily has a client established; a dead one has none.
+
+**Rejected with reasons:** tensor-cache growth — the cache is content-addressed
+and `-c` exists precisely so a re-load re-pushes nothing, so **the second
+attempt at the same model, the run we most need not to kill, writes zero while
+making full progress**; interface byte counters — machine-wide, which F39
+already rejected; raising the grace — F51's own conclusion, a guess about a
+number nobody has.
+
+**Both directions tested, on both nodes, against a real `rpc-server` speaking
+the real RPC wire protocol.** Old and new controllers were run alternately
+against identical live state: old logged `WEDGED` and restarted; new logged
+`BUSY … 3080192 bytes moved (conns=1)` and cleared the streak. A genuinely
+`SIGSTOP`ped server with `conns=0` still triggered a **real** restart
+(MainPID 3246928 → 3256771 on node 1; 2648000 → 2655228 on node 2) with a
+correctly-formatted ledger line. **The fleet was never unguarded — zero
+seconds**, installed by atomic rename with no timer stopped, and confirmed
+*evaluating* rather than merely scheduled (F43's lesson).
+
+**Still open, unchanged and not widened:** a frozen-but-listening `rpc-server`
+with an empty backlog answers `tcp=accept` and is not caught. `RPC_STALL_GRACE
+= 900 s` is a **labelled safety margin, not a measurement** — never tested
+against a real mid-transfer stall. **Node 2 has no `iptables` and no `nft`.**
+
+---
+
+## F54. The teaching-playground surveys: ComfyUI is compute-bound the wrong way, n8n fits — and BOTH have no usable auth story
+
+**CONFIRMED / REPORTED.** Feasibility surveys for the instructor's ComfyUI and
+n8n request. **The two verdicts point in opposite directions, and the security
+finding applies to both plus something we already run.**
+
+### ComfyUI: (b) overnight batch, with an (a) carve-out, and a hard (c) for video
+
+INFERRED per-node times from two independent REPORTED anchors on 4-core-class
+AVX2 CPUs without AVX-512 (optimum-benchmark on 4-core EPYC; HF/Intel on Sapphire
+Rapids). They converge on **7–13 minutes for one 512×512 20-step SD1.5 image per
+node** — about 6 images/hour/node, so **a class of 20 queues 3+ hours.**
+
+**The rescue is step count, not tuning:** SD-Turbo at 1 step ≈ **25–35 s/image**,
+4-step LCM ≈ 90–120 s. That is a workable classroom exercise. **SDXL at 1024² is
+1–2 h/image. Video is 20–80× a single image per denoising step — tens of hours
+to days per 5-second clip.**
+
+**So the deepfake-video demo as imagined is not reachable on this hardware.**
+
+**And the operator's "high RAM, low compute" instinct points away from diffusion
+entirely:** the one CPU diffusion benchmark with a published memory figure peaks
+at **6.94 GB — 5% of a node's 131.8 GB.** Diffusion leaves idle exactly the
+resource this fleet has and saturates the one F12 says it most lacks. **This
+project's argument is that old hardware is useful for MEMORY-BOUND work. It has
+never claimed old hardware is useful for compute-bound work, and pretending
+otherwise would be the unmeasured advice `CLAUDE.md` forbids.**
+
+**If a GPU is wanted:** a used **RTX 3060 12 GB** (~sub-$300) in one node. Two
+P510-specific gotchas: the **490 W PSU ships a single 6-pin drop** where the
+650/850 W shipped 6+8 — check before ordering; and **do not substitute an Intel
+Arc B580**, which needs Resizable BAR that C612/X99 firmware generally does not
+expose.
+
+**The P600 is rejected a second time on NEW grounds.** `CLAUDE.md`'s existing
+rejection was a capacity argument about LLM layers, and SD1.5 *does* fit in 2 GB
+— so it got a fresh look and still loses: **PyTorch dropped Pascal from its CUDA
+12.8 binaries at 2.8, CUDA 13.0 drops sm_61 entirely, and ComfyUI's own system
+requirements now name CUDA 13.0.** Using it means pinning an unpatchable stack
+**on a machine students are invited to attack.**
+
+### n8n: licensed, viable, and the local-LLM integration works with no code
+
+**Licence — permitted, from the actual `LICENSE.md` text, with one grey edge.**
+Use is granted for "internal business purposes **or for non-commercial or
+personal use**" — two independent routes to yes. n8n's FAQ narrows the
+prohibition to *selling a product whose value derives substantially from n8n
+functionality*, and explicitly permits "consulting services related to n8n, for
+example building workflows". **The grey edge, stated honestly:** another FAQ
+answer phrases it as not making n8n available to "your customers for them to
+connect their accounts and build workflows", which is literally what a classroom
+does if a fee-paying student is a customer. **Recommendation: one email to
+`license@n8n.io`** (they invite it three times) and keep the reply with the
+project docs. Precedent for taking this seriously: Hansard's CC BY-NC-ND killed
+a corpus source in `docs/corpus-selection.md`.
+
+**Unlimited users on Community — CONFIRMED FROM SOURCE**, not docs:
+`license.ts`'s `getUsersLimit()` returns `UNLIMITED_LICENSE_QUOTA` when no key
+is present. **A widely-repeated forum claim that Community forbids collaborators
+is wrong.** But Community gives **Owner + Member only** — Projects, sharing and
+all RBAC are Enterprise.
+
+**Local-LLM integration is first-class and needs no custom code** — confirmed
+from n8n's source because the published docs never mention it:
+`OpenAiApi.credentials.ts` has a **Base URL** field, and `LmChatOpenAi.node.ts`
+loads its model dropdown from `{baseURL}/models` with a filter written so
+non-OpenAI endpoints are not excluded. Point it at
+`http://<node>:8080/v1`. **Three gotchas:** the Responses API defaults ON
+(llama.cpp's is a conversion shim — switch to Chat Completions); the model id
+renders as the full GGUF path because our unit passes no `--alias`; and
+node-level Base URL is hidden above typeVersion 1.1, so set it on the
+credential.
+
+### The security finding, which is the part that actually matters
+
+**ComfyUI has NO AUTHENTICATION AT ALL.** Unauthenticated `POST /queue` (clear),
+`/interrupt`, `/free`, `/history` mean **any student can cancel or wipe
+everyone's work from a browser address bar — no exploit required.** Custom nodes
+are arbitrary Python `exec_module`'d at startup across a ~1,300-extension
+ecosystem; CVE-2025-67303 (unauth RCE in ComfyUI-Manager) and CVE-2026-68771
+(unauth RCE via pickle) are real, as is a ~1,000-host XMRig botnet whose
+escalation step was **installing ComfyUI-Manager where none was present**.
+
+**n8n's task runners default to `N8N_RUNNERS_MODE=internal`, which n8n's own
+docs call "insecure by design"**: *"anyone who can edit a workflow could
+potentially read your database, encryption key, stored credentials, and
+environment variables."* External mode ships as a Docker sidecar. Plus
+**webhook paths are unique instance-wide** (twenty students all pick
+`/webhook/test`) and `N8N_CONCURRENCY_PRODUCTION_LIMIT` **explicitly does not
+cover manual executions — the only kind a classroom generates.**
+
+**AND, found in passing, the one that is already live: MISSING LINK HAS NO
+AUTH.** No security scheme in its OpenAPI, bound to **`0.0.0.0:8000`**, exposing
+`POST /corpus/{doc_id}/delete`, `/jobs/reorder` and `/jobs/{id}/cancel`.
+**Students on the LAN would reach the production research instance and be able
+to delete its corpus.** That is not a playground concern — it is the existing
+system, and it predates this request.
+
+**Placement, and F44 decides it.** ComfyUI is a strictly *worse* case than F44's
+sidecar: it holds all cores for its entire runtime with no gaps, contending for
+the same 28.2 GB/s. **`nice` is not a mitigation — F44 tested exactly that.**
+n8n's "it's I/O-bound so co-location is fine" argument **also fails**, because
+the Code node makes it CPU-bound on demand. **Both belong on node 3, not on an
+inference node** — or in daylight-only windows, which is nearly free given
+Missing Link is deliberately an overnight workload and a class is not.
+
+**Class latency is the other constraint:** from `docs/measurements.md`, a
+~1,300-token request at `--parallel 4` took **77–99 s end-to-end**. Twenty
+students across four slots is a queue tens of minutes deep. **A small model that
+fails visibly may be pedagogically better for a "how AI harms" syllabus than a
+large one that is merely slow.**
