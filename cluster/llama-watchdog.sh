@@ -406,8 +406,25 @@ GRACE="${WATCHDOG_GRACE:-300}"
 # a labelled safety margin, not a measurement. See the note in predicate_llama.
 RPC_GRACE="${WATCHDOG_RPC_GRACE:-900}"
 
-# rpc-server: unbroken seconds of "active but the port refuses" before acting.
+# rpc-server: unbroken seconds of "active, port refuses, AND NOT MAKING
+# PROGRESS" before acting. The second half of that sentence is F51's fix: the
+# old predicate acted on the refusal alone and so restarted a worker 9m41s into
+# a 5.4 GiB shard upload. See predicate_rpc.
 RPC_TCP_GRACE="${WATCHDOG_RPC_TCP_GRACE:-300}"
+
+# The SAME streak, but for the case where a client IS still attached and simply
+# nothing is moving. Longer, because a connected client is evidence that
+# somebody believes this worker is theirs, and because a model load legitimately
+# interleaves long local phases (F3: minutes, single-core-serialised) between
+# pushes. UNTESTED against a real mid-transfer stall -- a labelled safety
+# margin, exactly like RPC_GRACE above, not a measurement.
+RPC_STALL_GRACE="${WATCHDOG_RPC_STALL_GRACE:-900}"
+
+# Bytes on the RPC port's established connections, over one WINDOW, that count
+# as "data is moving". Not zero, so a keepalive or a retransmit cannot pass for
+# progress; trivially small next to the real thing, which at the measured
+# 11.7 MB/s link speed (F28) delivers ~117 MB in a 10 s window.
+RPC_BYTES_MIN="${WATCHDOG_RPC_BYTES_MIN:-4096}"
 
 # missing-link: unbroken seconds of "active, no job running, HTTP silent".
 ML_GRACE="${WATCHDOG_ML_GRACE:-300}"
@@ -885,14 +902,78 @@ predicate_llama() {
 }
 
 # ===========================================================================
-# PREDICATE: rpc-server.  DELIBERATELY WEAK. Never judged on CPU.
+# PREDICATE: rpc-server.  A REFUSED PORT IS A QUESTION, NOT A VERDICT. (F51)
 #
 # An rpc-server with no shard work is SUPPOSED to be idle -- measured 0 ns over
-# a 3 s window on a perfectly healthy node 1 worker. The only fault signal taken
-# is "systemd says active, but the RPC port refuses a connection ON THE NODE".
-# That is safe to act on because a worker that is not listening cannot be
-# carrying in-flight shard work, and because restarting one is cheap: F23,
-# workers never read model files, so there is no 65 GB reload.
+# a 3 s window on a perfectly healthy node 1 worker -- so CPU alone cannot
+# convict it, and this predicate used to take exactly one fault signal:
+# "systemd says active, but the RPC port refuses a connection ON THE NODE",
+# justified as "a worker that is not listening cannot be carrying in-flight
+# shard work".
+#
+# **THAT PREMISE WAS EXACTLY INVERTED AND IT COST A SHARD LOAD.** `rpc-server`
+# serves ONE CLIENT AT A TIME and listens with a backlog of 1, so for the whole
+# duration of a shard upload -- ~54 min for half of gpt-oss-120b at the measured
+# 11.7 MB/s (F28) -- its port refuses. On 2026-08-23 this predicate restarted
+# node 2's worker 9m41s in, at 5.4 GiB transferred, logging the inverted premise
+# verbatim. It was not listening BECAUSE it was carrying shard work. The
+# consequence was a hard capability limit: no shard larger than ~4 GB could ever
+# be loaded on this link, i.e. the safety system forbade the capability the
+# cluster exists to provide. F50's two-node A/B passed only because Qwen3-4B
+# uploads in ~110 s and squeaked under the 300 s grace.
+#
+# **The correct grace is a function of shard size and link speed, and the probe
+# knows neither.** So the grace is not the fix. The fix is the one F36 stated,
+# F39 re-derived, and F51 re-derived a third time from the opposite direction:
+# A LIVENESS PROBE MUST TEST PROGRESS -- not the process, not the port.
+#
+#   refusing connections WHILE MAKING PROGRESS  -> HEALTHY, never restart
+#   refusing connections WHILE MAKING NO PROGRESS -> wedged, after a grace
+#
+# Both halves are evaluated before any restart. Progress is read from two
+# independent kernel-maintained counters, taken on the node (`rpcprogress` in
+# the agent), and EITHER one advancing is enough:
+#
+#   1. TCP DATA BYTES on the established connections of THIS listening port.
+#      Chosen as primary because it is the most direct possible measurement of
+#      the thing being protected -- shard bytes arriving -- and because the
+#      CONNECTION COUNT that comes with it is structurally decisive on its own:
+#      a single-client server refusing BECAUSE it is busy necessarily has a
+#      client established; a dead one has none.
+#   2. THE UNIT'S OWN CGROUP CPU. Kept as a co-signal, not because it is
+#      redundant, but because the incident itself proves it separates the two
+#      states: the F51 restart record logged `cpu_delta=563ms` over a 1 s window
+#      -- 56% of a core -- at the very moment it declared the worker wedged,
+#      while F36's genuine wedge logged `cpu=0ms/10002ms(0%)` and an idle worker
+#      measures exactly 0 ns. The old code PRINTED that number and then decided
+#      without it. It also covers the case bytes miss: a worker computing a
+#      graph for an already-attached client moves little traffic.
+#
+# REJECTED as a progress signal, on evidence, not taste:
+#
+#   * **Tensor-cache growth** (`~cluster/.cache/llama.cpp/rpc`, 6.8 GB of real
+#     content-addressed material on node 2). It is CONTENT-ADDRESSED and
+#     `rpc-server@.service` runs with `-c`, whose whole documented purpose is
+#     that "without it every restart re-pushes the full model over the wire".
+#     So the second attempt at the same model -- precisely the run we most need
+#     not to kill -- is a cache HIT and writes NOTHING while making full
+#     progress. A signal that reads zero on a healthy retry is worse than no
+#     signal.
+#   * **Interface byte counters** (`/sys/class/net/*/statistics`). Machine-wide,
+#     and F39 already rejected machine-wide load for this exact reason: a
+#     coordinator is never a quiet machine. `ss` per-socket counters are scoped
+#     to the port; interface counters would credit this worker for an rsync.
+#   * **Raising the grace period.** F51's own conclusion, and it is not a
+#     signal, it is a guess about a number nobody has.
+#
+# The `sport = :PORT` filter matters on the coordinator, which both LISTENS on
+# 50052 and CONNECTS OUT to a peer's 50052; the outgoing socket has dport=50052
+# and is correctly excluded. See the agent's `sock_bytes_on_port`.
+#
+# Restarting a worker remains cheap -- F23, workers never read model files, so
+# there is no 65 GB reload -- but "cheap to restart" was never the point. What
+# a restart destroys is the CLIENT's in-flight upload, and that is what this
+# now refuses to do while the upload is visibly progressing.
 #
 # KNOWN LIMITATION, stated rather than hidden: a hung-but-listening rpc-server
 # is NOT fully covered. The kernel completes the handshake from the listen
@@ -988,14 +1069,89 @@ predicate_rpc() {
     return
   fi
 
+  # ---------------------------------------------------------------------
+  # The port is NOT accepting. THIS IS WHERE F51 WENT WRONG. Before that can
+  # mean anything, ask the only question that separates a dead worker from one
+  # busy carrying exactly the work this cluster exists to do: is it PROGRESSING?
+  # ---------------------------------------------------------------------
+  local prec; prec="$(agent_call "$host" "$tr" "$(budget)" rpcprogress "$port" "$WINDOW")"
+  if ! ok_rec "$prec"; then
+    rm -f "$sf"
+    emit BLIND rpc "$host" "$port" "$name" \
+      "RPC port refuses, but the progress probe did not return -- refusal ALONE is not evidence of death (F51). No verdict, streak cleared"
+    return
+  fi
+
+  local c0 c1 b0 b1 pc0 pc1 pt0 pt1
+  c0="$(field "$prec" conns0)"; c1="$(field "$prec" conns1)"
+  b0="$(field "$prec" bytes0)"; b1="$(field "$prec" bytes1)"
+  pc0="$(field "$prec" cpu0)"; pc1="$(field "$prec" cpu1)"
+  pt0="$(field "$prec" t0)";   pt1="$(field "$prec" t1)"
+
+  # Signal 1: bytes on this port's established connections. -1 from the agent
+  # means "could not measure" (no `ss`), which is NOT zero and never convicts.
+  local conns=-1 bdelta=-1
+  case "$c0" in ''|*[!0-9-]*) c0=-1 ;; esac
+  case "$c1" in ''|*[!0-9-]*) c1=-1 ;; esac
+  case "$b0" in ''|*[!0-9-]*) b0=-1 ;; esac
+  case "$b1" in ''|*[!0-9-]*) b1=-1 ;; esac
+  conns="$c1"; [ "$c0" -gt "$conns" ] && conns="$c0"
+  if [ "$b0" -ge 0 ] && [ "$b1" -ge 0 ]; then
+    bdelta=$(( b1 - b0 )); [ "$bdelta" -lt 0 ] && bdelta=0
+  fi
+
+  # Signal 2: the unit's own cgroup CPU over the same window. Same counter and
+  # same scope predicate_llama uses; -1 means unmeasurable, never idle.
+  local pct=-1 pwall=0
+  case "${pc0}${pc1}${pt0}${pt1}" in
+    ''|*[!0-9]*) ;;
+    *) pwall=$(( pt1 - pt0 ))
+       [ "$pwall" -gt 0 ] && pct=$(( (pc1 - pc0) * 100 / pwall )) ;;
+  esac
+
+  local pnote="conns=${conns} bytes_delta=${bdelta} cpu=${pct}%/${BUSY_PCT}% over $(( pwall / 1000000 ))ms"
+
+  # Neither signal available: we know nothing. Say so loudly and do NOT act --
+  # the same rule this script already applies when CPU accounting is missing.
+  if [ "$bdelta" -lt 0 ] && [ "$pct" -lt 0 ]; then
+    rm -f "$sf"
+    emit ALERT rpc "$host" "$port" "$name" \
+      "RPC port refuses and NEITHER progress signal is measurable (${pnote}). Install iproute2 (\`ss\`) and check CPUAccounting -- until then this worker cannot be judged, and refusal alone is not evidence of death (F51). Streak cleared, nothing restarted"
+    return
+  fi
+
+  local progress=0 why=""
+  if [ "$bdelta" -ge 0 ] && [ "$bdelta" -gt "$RPC_BYTES_MIN" ]; then
+    progress=1; why="${bdelta} bytes moved on the RPC port"
+  fi
+  if [ "$pct" -ge "$BUSY_PCT" ]; then
+    progress=1; why="${why:+${why}, }cgroup CPU at ${pct}% of a core"
+  fi
+
+  if [ "$progress" = "1" ]; then
+    rm -f "$sf"
+    emit BUSY rpc "$host" "$port" "$name" \
+      "RPC port refuses new connections BECAUSE IT IS BUSY -- ${why} (${pnote}). Single-client by design: refusal while progressing is HEALTHY (F51). Not restarting, streak cleared"
+    return
+  fi
+
+  # No progress. Which grace applies depends on whether anyone is still
+  # attached -- see RPC_STALL_GRACE. conns<0 (unmeasurable) falls to the short
+  # grace only because the CPU signal must then have been the one that decided.
+  local eff_grace="$RPC_TCP_GRACE" gnote="no client attached"
+  if [ "$conns" -gt 0 ]; then
+    eff_grace="$RPC_STALL_GRACE"
+    gnote="${conns} client(s) STILL ATTACHED but nothing moving -- long grace (UNTESTED safety margin)"
+  fi
+
   local streak; streak="$(streak_start "$sf")"
-  if [ "$streak" -lt "$RPC_TCP_GRACE" ]; then
+  if [ "$streak" -lt "$eff_grace" ]; then
     emit SUSPECT rpc "$host" "$port" "$name" \
-      "systemd says active but the RPC port REFUSES connections on the node itself. ${cpunote}streak=${streak}s/${RPC_TCP_GRACE}s. Holding"
+      "RPC port refuses AND no progress: ${pnote}, ${gnote}. ${cpunote}streak=${streak}s/${eff_grace}s. Holding"
     return
   fi
   emit WEDGED rpc "$host" "$port" "$name" \
-    "active but the RPC port has refused connections on the node for ${streak}s. ${cpunote}A worker that is not listening cannot be carrying shard work, and restarting one is cheap (F23: workers never read model files)"
+    "active, RPC port has refused connections on the node for ${streak}s AND made no progress throughout: ${pnote}, ${gnote}. ${cpunote}Refusal alone would NOT be enough (F51) -- it is the absence of progress that convicts. Restarting a worker is cheap (F23: workers never read model files)"
 }
 
 # ===========================================================================

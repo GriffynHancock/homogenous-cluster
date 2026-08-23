@@ -139,7 +139,7 @@
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
-AGENT_PROTO=4
+AGENT_PROTO=5
 
 # The agent runs as the UNPRIVILEGED watchdog user over SSH, so its drop box
 # cannot be root's /var/lib/llama-watchdog -- it writes into its own home. This
@@ -222,6 +222,39 @@ nprocs_of() {
   n=$(grep -c . "/sys/fs/cgroup${cg}/cgroup.procs" 2>/dev/null)
   case "$n" in ''|*[!0-9]*) n=0 ;; esac
   echo "$n"
+}
+
+# ---------------------------------------------------------------------------
+# RPC PROGRESS: established connections on a LOCAL listening port, and the
+# cumulative TCP data-byte counters of those connections. (F51)
+#
+# Echoes "<conns> <bytes>", or "-1 -1" when it cannot measure -- which the
+# controller must treat as no evidence, never as "idle".
+#
+# `sport = :PORT` and nothing else. That filter is load-bearing on the
+# COORDINATOR, which both LISTENS on 50052 (its own worker) and CONNECTS OUT to
+# 10.10.0.39:50052 (as a shard client). The outgoing client socket has
+# dport=50052 and an ephemeral sport, so it is excluded: node 1's rpc-server
+# never gets credit for node 2's traffic.
+#
+# bytes_sent/bytes_received come from the kernel's tcp_info (`ss -ti`), are
+# cumulative for the life of the connection, and are readable by an
+# UNPRIVILEGED user -- verified as `llamawd` on node 2. They cannot be faked by
+# a process that has stopped running: they are maintained by the TCP stack, not
+# by the application, which is the whole property F36/F39/F51 keep asking for.
+# ---------------------------------------------------------------------------
+sock_bytes_on_port() {
+  local p="$1"
+  command -v ss >/dev/null 2>&1 || { echo "-1 -1"; return; }
+  ss -tinH state established "( sport = :${p} )" 2>/dev/null | awk '
+    /^[^ \t]/ { c++; next }
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^bytes_sent:/)     { split($i, a, ":"); s += a[2] }
+        if ($i ~ /^bytes_received:/) { split($i, a, ":"); s += a[2] }
+      }
+    }
+    END { printf "%d %.0f\n", c + 0, s + 0 }'
 }
 
 case "$VERB" in
@@ -324,6 +357,51 @@ case "$VERB" in
     else
       echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) port=${P} tcp=refused ok=1"
     fi
+    ;;
+
+  # rpcprogress <port> <window_seconds> -- IS THIS WORKER REFUSING BECAUSE IT
+  # IS BUSY?  (F51)
+  #
+  # `rpc-server` serves ONE CLIENT AT A TIME and its listen backlog is 1, so
+  # while it is carrying shard work a new connection is refused or dropped.
+  # F51: the watchdog read that refusal as death and restarted the worker
+  # 9m41s into a 5.4 GiB shard upload, on the reasoning that "a worker that is
+  # not listening cannot be carrying shard work". It was not listening BECAUSE
+  # it was carrying shard work. The premise was exactly inverted, and it makes
+  # any shard larger than ~4 GB unloadable on this 100 Mb link.
+  #
+  # So the port answers "is it accepting?", and this verb answers the only
+  # question that actually matters afterwards: IS IT MAKING PROGRESS?
+  #
+  #   conns  -- established connections ON this listening port. A single-client
+  #             server that refuses because it is busy NECESSARILY has one. A
+  #             dead one has none. This is structural, not statistical.
+  #   bytes  -- kernel TCP data-byte counters summed over those connections.
+  #             Advancing = shard data is moving.
+  #   cpu    -- the unit's own cgroup CPU, same counter and same scope as
+  #             predicate_llama. Covers the case bytes miss: a worker computing
+  #             a graph for an already-connected client moves little traffic.
+  #
+  # Both windows are timed on THIS node (see the header note on why the agent
+  # sleeps), so a congested link can delay the answer but never distort it.
+  rpcprogress)
+    P="${2:-}"; W="${3:-10}"
+    case "$P" in ''|*[!0-9]*) die "refused_port:$P" ;; esac
+    [ "$P" -ge 1 ] && [ "$P" -le 65535 ] || die "refused_port_range:$P"
+    case "$W" in *[!0-9]*|'') die "refused_window:$W" ;; esac
+    [ "$W" -ge 1 ] && [ "$W" -le 120 ] || die "refused_window_range:$W"
+    UNIT="rpc-server@${P}"
+    validate_unit "$UNIT"
+
+    read -r C0 B0 <<< "$(sock_bytes_on_port "$P")"
+    PC0=$(cpu_ns "$UNIT"); T0=$(now_ns)
+    sleep "$W"
+    T1=$(now_ns); PC1=$(cpu_ns "$UNIT")
+    read -r C1 B1 <<< "$(sock_bytes_on_port "$P")"
+
+    echo "wd_agent_proto=${AGENT_PROTO} host=$(hostname) port=${P} unit=${UNIT}" \
+         "conns0=${C0} conns1=${C1} bytes0=${B0} bytes1=${B1}" \
+         "cpu0=${PC0:-} cpu1=${PC1:-} t0=${T0} t1=${T1} window=${W} ok=1"
     ;;
 
   # synth <port> <max_tokens> <timeout_s> -- THE SYNTHETIC TRANSACTION.
@@ -613,7 +691,7 @@ print("ml_running=%s ml_pending=%s ml_chunks=%s ml_jobs=%s" % (
     ;;
 
   '')
-    die "no_verb (allowed: version probe tcpcheck synth mlstate restart heartbeat)"
+    die "no_verb (allowed: version probe tcpcheck rpcprogress synth mlstate restart heartbeat)"
     ;;
   *)
     die "refused_verb:${VERB}"

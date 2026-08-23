@@ -158,6 +158,23 @@ install_node() {
     *) echo "  FATAL: the restricted key does not work on $NAME: $v" >&2; return 1 ;;
   esac
 
+  # F51: the rpc predicate now decides on PROGRESS, and its byte counters come
+  # from `ss` (iproute2). Prove that dependency ON THE NODE, through the same
+  # restricted credential the watchdog will actually use. Without `ss` the
+  # predicate degrades to CPU-only, which is safe but weaker -- so this is a
+  # loud warning, not a fatal, and it must never be silent. F43 is exactly the
+  # failure of assuming an install worked fleet-wide.
+  local g
+  g=$(ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$WD_KEY" -o IdentitiesOnly=yes \
+        "${WD_USER}@${IP}" "rpcprogress ${RPC_PORT:-50052} 1" 2>&1 || true)
+  case "$g" in
+    *conns0=-1*) echo "  WARNING: no usable \`ss\` on $NAME -- the rpc progress probe (F51)" >&2
+                 echo "           will fall back to CPU only. Install iproute2. ($g)" >&2 ;;
+    *conns0=*)   say "rpc progress probe verified: $g" ;;
+    *)           echo "  FATAL: rpcprogress failed on $NAME -- the agent is older than" >&2
+                 echo "         proto 5, or the verb was refused: $g" >&2; return 1 ;;
+  esac
+
   # And prove it CANNOT do anything else. A credential is only as good as what
   # it refuses.
   local r
