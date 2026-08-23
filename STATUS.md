@@ -1,7 +1,7 @@
 # Status
 
-**Updated:** 2026-08-18 (afternoon)
-**Phase:** **N=2. Node 2 joined, provisioned, characterised and serving.**
+**Updated:** 2026-08-23
+**Phase:** **N=3. Node 3 joined, hardened and gated; nodes 1 and 2 serving.**
 
 ## At a glance — read this before touching anything
 
@@ -20,11 +20,15 @@ observed and named plainly as a snapshot, not a fact.
 | | |
 |---|---|
 | **What this is** | An **N-node**, CPU-only llama.cpp cluster doing real work on real sensitive documents, fronted by **Missing Link** — an async job queue where slowness is not a defect. `CLAUDE.md` has the argument and the standing constraints. |
-| **Check before trusting anything below** | **Push state:** `git fetch -q origin && echo "ahead: $(git log --oneline origin/main..HEAD \| wc -l)  behind: $(git log --oneline HEAD..origin/main \| wc -l)"`. **Test count:** `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1`. **Node 1 services:** `systemctl is-active llama-server@8080 missing-link rpc-server@50052`. **Node 2 services + engine:** `ssh debian1@<node2-ip> 'systemctl is-active llama-server@8080 rpc-server@50052; grep LLAMA_BIN /etc/default/llama-server'` — node 2's engine has flipped mid-session at least once (see "Where things stand" below); a stale reading of it is wrong, not just old. **Is fan-out actually in use:** `grep LLAMA_URLS /etc/default/missing-link` — as of 2026-08-23 this is **SET to both endpoints and proven live** (see below), but it had been observed unset (silent single-endpoint fallback) more often than set for weeks before that, so still check rather than assume; the code being merged never meant it was live. **Disk free:** `df -h /` on each node. |
-| **What is running** | `llama-server` on **nodes 1 and 2**, `rpc-server@50052` on both, and **Missing Link** on the coordinator (node 1) — all as systemd units. N = 2. This is the steady-state shape; use the row above to confirm it is actually true right now rather than trusting this sentence. |
-| **Which engine, and why** | **MAINLINE llama.cpp b10369** (`/opt/llama.cpp/bin`), fleet-wide. **Not ik_llama.cpp** — it was adopted on a prefill win (F27) and then dropped, because it fatal-errors on the 5th request of any `--parallel 4` job, i.e. on any document longer than four chunks, leaving a hang `Restart=always` cannot see (**F40**). ik stays installed at `/opt/ik_llama.cpp/bin` for the still-untested `--parallel 1` configurations only. **Do not point a serving node at it.** |
-| **Next task** | **§0, the corpus-driven benchmark** — the operator's stated priority. Re-run the three measurements that were blocked or weakened by the corpus (chunk-boundary severance, the entity signal's false-positive rate, the faithfulness cascade) against the real public documents now on the `/corpus` page — legislation, standards, regulator determinations — instead of the two narrative texts every earlier measurement had to use. Full brief under **NEXT TASKS, in order** below. |
-| **Never do this to the live services** | Do not stop, restart or reconfigure `llama-server`, `rpc-server@50052` or `missing-link` without first checking whether a job is running — a restart destroys that job's in-flight work, which is exactly how F39 lost 10m55s of completed work. Do not benchmark a node while it or its peer is doing real work. Never `pkill -f`; never `git add -A` — `.claude/hooks/cluster-guard.py` blocks both, and gates service control, `git push`, writes to `/opt/models`, and mutating SQL against the live job store. |
+| **Check before trusting anything below** | **Push state:** `git fetch -q origin && echo "ahead: $(git log --oneline origin/main..HEAD \| wc -l)  behind: $(git log --oneline HEAD..origin/main \| wc -l)"`. **Test count:** `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1`. **Node 1 services:** `systemctl is-active llama-server@8080 missing-link rpc-server@50052`. **Nodes 2 and 3 services + engine:** `ssh <user>@<node-ip> 'systemctl is-active llama-server@8080 rpc-server@50052; grep LLAMA_BIN /etc/default/llama-server'` — node 2's engine has flipped mid-session at least once (see "Where things stand" below); a stale reading of it is wrong, not just old. **Logins differ per node** — read `provisioning/nodes.env`, 5th field. **Is fan-out actually in use:** `grep LLAMA_URLS /etc/default/missing-link` — as of 2026-08-23 this is **SET to both endpoints and proven live** (see below), but it had been observed unset (silent single-endpoint fallback) more often than set for weeks before that, so still check rather than assume; the code being merged never meant it was live. **Disk free:** `df -h /` on each node. |
+| **What is running** | `llama-server` on **nodes 1 and 2**, `rpc-server@50052` on **all three**, and **Missing Link** on the coordinator (node 1) — all as systemd units. **N = 3, but only 2 serve inference:** node 3 is deliberately NOT in `INFERENCE_ENDPOINTS` until a model and a server actually land on it, because adding it early parks a Missing Link worker in permanent backoff. Use the row above to confirm this is true right now rather than trusting this sentence. |
+| **Missing Link needs a credential now** | `ML_AUTH_TOKEN` in `/etc/default/missing-link`, accepted as HTTP Basic (`curl -u ml:$ML_AUTH_TOKEN …`) or `Authorization: Bearer`. **`/health` is the only open route**, deliberately (F39: a probe whose token drifts reports an outage that is not happening). **Check without printing the secret:** `grep -q '^ML_AUTH_TOKEN=' /etc/default/missing-link && echo set \|\| echo UNSET`, then `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/jobs` — expect **401**. **Never write the token into this file, `docs/`, a commit message or a comment.** It is a door lock, not a security system (F54). |
+| **Which engine, and why** | **MAINLINE llama.cpp b10369** (`/opt/llama.cpp/bin`), fleet-wide, node 3 included. **Not ik_llama.cpp** — it was adopted on a prefill win (F27) and then dropped, because it fatal-errors on the 5th request of any `--parallel 4` job, i.e. on any document longer than four chunks, leaving a hang `Restart=always` cannot see (**F40**). ik stays installed at `/opt/ik_llama.cpp/bin` for the still-untested `--parallel 1` configurations only. **Do not point a serving node at it.** |
+| **The sentence splitter changed, and it invalidates old numbers** | **`nupunkt`, not the regex** (F48 + addendum, merged and live; F52 re-profiled all 17 corpus documents on it). Legislative marker rate went 2.85% → 10.53% on the Privacy Act compilation. **Any marker-density or boundary figure produced before 2026-08-23 came from a different instrument and is not comparable** — `docs/chunk-boundary-measurement.md` carries a banner saying so. **Check the active rung:** `missing-link/.venv/bin/python -c 'import nupunkt; print("nupunkt live")'` — the code falls back to the regex loudly rather than failing, so an uninstalled nupunkt silently means old behaviour. Needs Python **>= 3.11**; nodes 1-3 are on 3.11.2, exactly on the line, and nodes 4-7 are unchecked. |
+| **Model B is CLOSED, in the negative** | **F47.** Every frontier candidate is priced and dominated — GLM-5 is 40.8 B active (computed from `config.json`, validated to 0.00% against the published total) and *less* faithful than GLM-4.6; Finix S1 has no public weights and its 1.8% is a summary-length artifact; Kimi K2 unchanged from F25. **Do not reopen it with reasoning.** The one live model question is **`GLM-4.7-Flash`**, which may dominate the gpt-oss-120b incumbent (3.6 B active, 9.3% Vectara, MIT, 18.3 GB, S=1) and is **cheap to settle by measurement** — half an hour of link time. See NEXT TASKS §1. |
+| **The agent-hardening hooks have NEVER fired** | **F55.** `settings.json` invoked the guard via `"$CLAUDE_PROJECT_DIR"/…`, the variable is empty, the path never resolved, and a hard BLOCK rule (`git add -A`) executed unimpeded when someone finally tested it. `CLUSTER_OPS_CONFIRMED=1` has never meant anything. **A fallback path is now patched in and it is UNVERIFIED** — the framework reads `settings.json` at session start, so only a fresh session can confirm. **Verify it, and record the result:** in a throwaway repo (`d=$(mktemp -d) && git -C "$d" init -q`), run `git -C "$d" add -A` through the Bash tool and see whether you are blocked; then check `wc -l .claude/hook-audit.log` for a new line with a non-test invocation. **Until someone has seen a real block, you are the only enforcement.** |
+| **Next task** | **§0, the corpus-driven benchmark** — the operator's stated priority, and the corpus is now re-profiled on the correct instrument so the blocked measurements can finally be re-run. Full brief under **NEXT TASKS, in order** below. |
+| **Never do this to the live services** | Do not stop, restart or reconfigure `llama-server`, `rpc-server@50052` or `missing-link` without first checking whether a job is running — a restart destroys that job's in-flight work, which is exactly how F39 lost 10m55s of completed work. **`rpc-server` refusing connections is not evidence of death** — it serves one client at a time and is silent for the whole of a shard upload (F51). Do not benchmark a node while it or its peer is doing real work; a contended benchmark shows up as an **11× wider error bar**, not a wrong mean (F50). Never `pkill -f`; never `git add -A` — **and note the hook does not currently stop you**, per the row above. |
 | **Where the history went** | The session-by-session "MERGED" / "completed this session" narrative that used to sit here is now in **`docs/CHANGELOG.md`**, intact. |
 
 Everything below expands on that table. If you only have time for one more
@@ -34,123 +38,131 @@ thing, read the **Index** at the top of `docs/FINDINGS.md`.
 
 ## Current state, in detail
 
-**The engine choice has flipped and flipped back: both nodes now run MAINLINE
-llama.cpp fleet-wide** (`/opt/llama.cpp/bin`), not ik_llama.cpp — see F40 below
-and the "Engine" row in "Where things stand". ik_llama.cpp stays installed
-side by side and its former `/etc/default/llama-server` is backed up at
-`/etc/default/llama-server.ik.bak` on both nodes (confirmed on node 1 this
-session; brief-reported, not independently re-checked, for node 2). **Upstream
-bug #26500 gate PASSED across real machines.** Missing Link has grown a lot
-since the last full rewrite of this file: fan-out across R endpoints, queue
-control, resumable chunk-level persistence, automatic retry-and-resume on
+**The fleet is N=3.** Nodes 1 and 2 serve inference and run `rpc-server`; node 3
+is joined, hardened key-only, running `rpc-server@50052`, and **passing the
+#26500 gate** — but deliberately holds no inference endpoint yet. Everything
+runs **MAINLINE llama.cpp b10369** (`/opt/llama.cpp/bin`); ik_llama.cpp stays
+installed side by side at `/opt/ik_llama.cpp/bin` for the still-untested
+`--parallel 1` / flash-attention-off configurations only (F40), and node 1's
+former ik config is backed up at `/etc/default/llama-server.ik.bak`.
+
+**Node 3 is a three-way bandwidth twin, and that is a measured result rather
+than an assumption** (F53, corrected by F56). STREAM triad 27.6–27.7 GB/s
+against node 1's 28.4 and node 2's 27.9; identical Xeon E5-1620 v4 down to the
+stepping, identical BIOS and chassis, **zero differences** in the sorted CPU
+flag set, so no ISA/SIGILL risk. Its RAM is genuinely 2 MB under nodes 1/2
+(128707 MB, measured, not copied). Its admin login is **not** the coordinator's,
+which is why `nodes.env` grew an optional 5th field rather than the machine
+being renamed — the eventual skill must run where usernames do not match.
+
+**Two things about node 3 that will recur on node 4.** Its "1 TB" is a 7200 rpm
+spinning SATA disk carrying an empty NTFS format, not more NVMe — **models stay
+on NVMe; the HDDs are snapshot and cold storage** (F16, F3). And it shipped as a
+full GNOME desktop — which **F56 corrected from "a divergence" to "the fleet's
+normal"**: nodes 1 and 2 run the identical stack, and trimming node 3 alone
+would make it the odd machine out and confound any A/B against the bandwidth
+twins it just joined.
+
+**Missing Link is behind a shared credential.** `ML_AUTH_TOKEN`, HTTP Basic or
+Bearer, `/health` the only open route. It closes one specific hole found by F54
+— the live instance was bound to `0.0.0.0:8000` with no security scheme at all,
+exposing `POST /corpus/{doc_id}/delete` to any host on a LAN that is about to
+carry a class of students — and it claims nothing beyond that. The token is a
+value in `/etc/default/missing-link` and belongs in no published file.
+
+**Fan-out is live and proven on hardware, not merely merged.** `LLAMA_URLS`
+names both serving endpoints; two jobs submitted back to back were claimed by
+*different* endpoints 5 ms apart and ran concurrently, corroborated from outside
+Missing Link's own opinion of itself by node 2's load average going 0.00 → 1.14.
+That was the first time node 2 had ever run inference through Missing Link.
+
+**Missing Link's own feature surface**, all merged: fan-out across R endpoints,
+queue control, resumable chunk-level persistence, automatic retry-and-resume on
 backend failure, live per-chunk telemetry with separate prefill/generation
-rates, per-workflow guidance (text or file), section-level citations on the
-reduce output, a revive route, a per-job failure-history table, and a
-deterministic faithfulness cascade, a corpus benchmark page and the
-provenance/licence gap it surfaced. **Test count and push state are
-deliberately not asserted here as current fact — see "Check before trusting
-anything below" in the at-a-glance table for the commands.** As last
-observed, 2026-08-18 afternoon: **552 tests** (`cd missing-link &&
-.venv/bin/python -m pytest tests/ -q`, 0 failures, 25s; up from 469 at the
-previous entry — the corpus feature added its own test files), **45
-findings** in `docs/FINDINGS.md` (F45 landed this session), and **60 commits
-ahead of `origin/main`**, none behind. That last figure is exactly the kind
-of claim that goes stale between sessions — it did, within the same day, and
-the correction is why push state is no longer stated as fact anywhere in
-this file. **Repo:** https://github.com/GriffynHancock/homogenous-cluster
+rates, per-workflow guidance, section-level citations on the reduce output, a
+revive route, a per-job failure-history table, a deterministic faithfulness
+cascade, a corpus benchmark page, the nupunkt splitter, and the auth gate.
+**Test count and push state are deliberately not asserted here as current fact**
+— see "Check before trusting anything below" for the commands. **Repo:**
+https://github.com/GriffynHancock/homogenous-cluster
 
-**THE REPLICATION MEASUREMENT IS DONE, AND IT PASSES.** Aggregate throughput
-across two independent `llama-server`s running gpt-oss-120b: **~1.8× on two nodes,
-~90% of linear** (1.86× prefill / 1.77× completion, adjusted for one failed
-request; 1.62×/1.55× raw). **The replication-first architecture is validated on
-real hardware.** Full detail and caveats in `docs/measurements.md`.
+### Corrections to long-standing assumptions, from measurement
 
-**A measured chunk-size sweep displaces a throughput assumption that had stood
-since the plan.** "Chunk size barely matters for map-reduce" was true for
-*quality* (its actual source, BooookScore) and is now known to be **wrong for
-*wall-clock* by 1.85×** between the worst and best size tested, on the real
-pipeline against the real 97,299-char document. **4096 tokens — the value
-`worker.py` already used — is the measured optimum.** Full table and mechanism
-in `docs/measurements.md`, "Chunk-size sweep" section; the stale throughput
-claim in `worker.py`'s comments has been corrected this session (the quality
-claim, which still stands, was kept).
-
-**Corrections to long-standing assumptions, from measurement:**
-
-- **The network is 100 Mb/s, not gigabit** (93.8 Mbit/s measured). Both NICs are
-  gigabit and the switch is the cap. This **inverts** F23's peer-pull preference
-  and qualifies the expert-parallelism comms analysis. See **F28**.
-- **`nodes.env` had node 1's RAM as 125629 MB, which `free -m` does not report**
-  (128709 on both nodes). Corrected — it sets `--tensor-split` ratios. See F29.
+- **The network is 100 Mb/s, not gigabit** (93.8 Mbit/s measured, confirmed on a
+  third machine). Both NICs are gigabit and the switch is the cap. This
+  **inverts** F23's peer-pull preference. See **F28**.
 - **ik_llama.cpp fatal-errors on the 5th request of any `--parallel 4` job** —
   a 100% failure rate on any document longer than four chunks, and the hang it
   produces is invisible to `Restart=always` and a port check. **Mainline is the
-  fleet-wide default now; this is F40, and it is the most consequential
-  correction since the last full rewrite of this file.**
+  fleet-wide default. F40.**
+- **RPC's generation penalty scales with `n_vocab`, not with model size, so it
+  never amortises** — F50 decomposes the long-standing −5% vs −47% dispute into
+  protocol −5.8%, the 100 Mb wire a further −35.4%, the second device −11.4%.
+  The standing guess in `docs/measurements.md` that a larger model would amortise
+  it away was wrong and is corrected there.
+- **`WORDS_PER_TOKEN = 0.70` is wrong by up to 2× in both directions**, and
+  `POST /tokenize` is free — it runs on the HTTP thread and takes no inference
+  slot. Exact counting is available wherever the code estimates. **F49.**
+- **The `PreToolUse` hooks have never enforced anything** — F55, and it corrects
+  F52's diagnosis. See the at-a-glance row.
+- **`nodes.env` had node 1's RAM as 125629 MB, which `free -m` does not report.**
+  Corrected — it sets `--tensor-split` ratios. F29.
 
 **Session history — what merged when, and the reasoning behind each batch — is
-now in `docs/CHANGELOG.md`.** It used to sit between here and "NEXT TASKS" and
-was the main thing a cold reader had to wade through to reach the actionable
-part. Nothing was deleted, only moved.
+in `docs/CHANGELOG.md`.** Nothing was deleted, only moved.
 
 ---
 
-## What is actually in flight right now — read before assuming anything from an older copy of this file
+## What is in flight, and what is merged but not deployed
 
-**Two things this file's previous version described as "in flight" have
-finished. Verified from the live system this session, not carried over from
-the previous entry:**
+**This section exists because "the code is on `main`" has repeatedly not meant
+"the thing is running."** F32 caught it twice (ik_llama.cpp had never reached a
+worker; `llama-server@.service` was tracked in git and had reached no machine at
+all), F34 caught it once (41 tests passing against a pipeline that had never
+processed a document), and F55 caught it for the hooks. **Check, do not infer.**
 
-1. **The `-c 65536` extended chunk-size sweep on node 2 has FINISHED, AND has
-   since been written up.** This entry corrects the previous version of this
-   file, which said the write-up was still owed — it was not, by the time that
-   claim was written. `docs/measurements.md`'s "Chunk-size sweep, extended"
-   section (added by commit `35ee0a0`, 16:17, which is *before* the previous
-   STATUS entry at 17:49) has the full table and the finding: raising `-c`
-   past what `CHUNK_TOKENS=4096` needs costs **33% more wall-clock on
-   identical chunking**, not a wash. `CLAUDE.md`'s `-c` standing constraint has
-   been corrected to say so. Node 2's `rpc-server@50052` **is active**,
-   confirmed by direct SSH this session (`systemctl is-active` → `active`,
-   twice, four minutes apart) — the sweep is over and the service is back.
-2. **The citation-test job (`18339bace8f0`) has FINISHED, not "in flight."**
-   Read directly from `/opt/missing-link/jobs.sqlite` (read-only) this
-   session: `status = done`, 7 chunks, finished
-   `2026-08-18T03:09:43+00:00`. **Its result DOES contain `[Section 1]`
-   through `[Section 7]` markers, one per chunk, in order** — so on this real
-   document the model complied with the citation instruction. This is **not**
-   a citation-accuracy audit (whether each marker points at the right
-   underlying content was not checked here) — it only establishes that the
-   model follows the instructed format on real output, which was previously
-   unverified. A citation-accuracy pass is still owed.
-
-**The service-restart gap the previous version of this file warned about is
-now closed, and this WAS checked this session.** `systemctl show
-missing-link --property=ActiveEnterTimestamp` reads **`Tue 2026-08-18
-11:53:31 AEST`**, which is after fan-out (`151ed32`, 06:36), resumability and
-retry (`a41666e`/`b7114cf`, 06:24/07:48), live telemetry (`2c1be61`, 07:09)
-and citations (`7c1266b`, 08:46) — all of it is live in the running process,
-not just on disk. (Consistent with this: job `18339bace8f0` was claimed 10
-seconds after that restart.) Three later commits — opt-in boundary snapping
-(default OFF, so this does not change default behaviour), the faithfulness
-cascade (an offline script, not wired into any route) and a chunk-boundary
-measurement doc — landed after the restart but do not require one. **Next
-restart should still be treated as the thing that would pick up whatever
-lands after this entry**, this is just recording that the gap flagged
-previously has actually been closed, not assuming it away.
+- **The node-3 provisioning commit is on a branch, not on `main`, as of this
+  entry.** Node 3 is genuinely joined and serving `rpc-server` — that was done on
+  the hardware — but the parameterised-username `nodes.env`, `distribute.sh`,
+  `install-services.sh` and `llama-server@.service` changes live on
+  `agent/node3-join`. **Check:** `grep -n '^  "node3' provisioning/nodes.env` on
+  whatever branch you are reading. If it returns only the commented placeholder,
+  the merge has not happened and any script you run will not see node 3.
+- **Nodes 1 and 2 still carry the OLD `llama-server@.service`** (`User=debian1`,
+  no drop-in). They work. Converge them with
+  `ONLY_NODES=node1,node2 ./cluster/install-services.sh` — **but that also does
+  `enable --now rpc-server@50052`, so schedule it when no benchmark is running.**
+- **The amplification harness is built and has never been run** (F49). The
+  operator's instruction is to leave it for now. See NEXT TASKS §3.
+- **The 1 TB coldstore disk layout is designed and NOT executed**, pending the
+  operator's go-ahead, because it destroys an existing filesystem — empty or not.
+  See NEXT TASKS §4.
+- **`setup.sh` asserts `THP: expected [madvise]` but all three nodes report
+  `[always]`** — a stale assertion in the script, not a node-3 problem.
+- **A stale process from 2026-08-17 (PID 20659) loops forever**, because its
+  `pgrep -f auto-bench-gptoss` self-matches its own command line — this project's
+  standing "never `pkill -f`" hazard in its other form. Zero CPU, harmless, and
+  it will never exit.
 
 ---
 
 ## If you are a fresh session
 
-1. **Read `docs/FINDINGS.md`.** **45 findings** from running this on real
-   hardware. Several correct the plan or the spec — **and F28 corrects this file
-   and F23; F40 reverses the ik_llama.cpp recommendation fleet-wide; F39/F43
-   correct the watchdog's own design twice, once for what it was probing and
-   once for a bug in the probe itself; F45 corrects the metric the corpus page
-   uses to judge a document's usability.** Do not trust the original plan's
-   numbers over these, and do not trust an older copy of this file's engine
-   choice — it changed, more than once, including during this session (see
-   "Where things stand" below).
+1. **Read `docs/FINDINGS.md`.** **56 findings** from running this on real
+   hardware, and it **outranks this file and `CLAUDE.md` both.** Several correct
+   the plan or the spec — **F28 corrects this file and F23; F40 reverses the
+   ik_llama.cpp recommendation fleet-wide; F39/F43/F51 correct the watchdog's own
+   design three times; F45 then F48 correct the metric the corpus page uses to
+   judge a document, and then the instrument producing it; F50 reconciles two
+   contradictory RPC numbers that both turned out to be right; F52 is itself
+   corrected by F55, and F53 by F56.** Do not trust the original plan's numbers
+   over these, and do not trust an older copy of this file's engine choice — it
+   changed, more than once.
+   **Three findings correct THIS FILE and `CLAUDE.md` directly, so read them
+   before acting on anything either says: F47** (Model B is closed in the
+   negative), **F55** (the agent-hardening hooks have never fired) and **F56**
+   (the "nothing new appears at the tenth node" claim is measurably too
+   optimistic).
 2. `docs/measurements.md` is the only place performance numbers may be quoted
    from.
 3. `docs/UPSTREAM-PATCHES.md` lists the concrete corrections still to fold back
@@ -161,17 +173,15 @@ previously has actually been closed, not assuming it away.
 5. **You are the operator.** Run the commands, read the output, record the
    numbers. Never report a step done without having seen its output.
 
-**Everything is built and working on nodes 1 AND 2.** llama.cpp b10369 at
-`/opt/llama.cpp/bin` **is now the engine actually serving on both nodes**
-(confirmed on node 1 this session via `/etc/default/llama-server`'s
-`LLAMA_BIN=/opt/llama.cpp/bin`); ik_llama.cpp stays installed side by side at
-`/opt/ik_llama.cpp/bin` for the still-untested `--parallel 1` /
+**Everything is built on nodes 1, 2 AND 3.** llama.cpp b10369 at
+`/opt/llama.cpp/bin` is the engine fleet-wide; ik_llama.cpp stays installed side
+by side at `/opt/ik_llama.cpp/bin` for the still-untested `--parallel 1` /
 no-flash-attention configurations (F40), not as the default. Models in
-`/opt/models`, Missing Link in `missing-link/` (coordinator only).
-`rpc-server@50052` is **active on both nodes** at `-t 4` as user `cluster`
-— **not independently re-checked on node 2 this session**, since this agent
-did not SSH to either node; the previous entry's "active on both" is carried
-forward, not re-verified.
+`/opt/models` on nodes 1 and 2; **node 3 has no model yet and no inference
+endpoint.** Missing Link in `missing-link/` (coordinator only).
+`rpc-server@50052` runs at `-t 4` as user `cluster`. **All of that is a
+described shape, not a live reading** — take the commands from the at-a-glance
+table and check it yourself.
 
 **Access:** node 1 is reachable over Tailscale with Tailscale SSH enabled, and a
 detached tmux session named `cluster` is waiting on it. **The address is in
@@ -185,512 +195,440 @@ ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'   # then: cla
 
 ## NEXT TASKS, in order
 
-### 0. THE CORPUS-DRIVEN BENCHMARK — the operator's stated priority for the next session
+**Done on 2026-08-23, so nobody re-does it:** fan-out enabled and proven live on
+hardware; the deterministic citation-accuracy audit (F46); Model B closed in the
+negative (F47); the sentence splitter swapped to nupunkt and all 17 corpus
+documents re-profiled on it (F48, addendum, F52); the rigorous two-node sharding
+A/B (F50); the watchdog's RPC probe rewritten to test bytes-moved instead of port
+acceptance (F51 + addendum); the agent-hardening hook gap found (F55); node 3
+joined, hardened and gated (F53, F56); and a shared credential put in front of
+Missing Link (F54). The narrative is in `docs/CHANGELOG.md`.
 
-**"this is a strong direction. this needs to be a large part of next session."** — the
-operator, 2026-08-18.
+### 0. THE CORPUS-DRIVEN BENCHMARK — the operator's stated priority, and it is now UNBLOCKED
+
+**"this is a strong direction. this needs to be a large part of next session."**
+— the operator, 2026-08-18.
 
 **Why this is first, and it is not a preference.** Every measurement this project
-has made ran against whatever documents happened to have been submitted as jobs:
-two long narrative/devotional texts and a 2,202-character memo. **Three separate
-measurements were blocked or weakened by that, and only that:**
+made before the corpus existed ran against whatever documents happened to have
+been submitted as jobs: two long narrative/devotional texts and a 2,202-character
+memo. **Three separate measurements were blocked or weakened by that, and only
+that:**
 
 - **Chunk-boundary severance returned 0 of 84 events and could not answer its own
-  question.** The only legal-styled document in the store is 2,202 characters —
-  too short to produce a single chunk boundary at any size — so it contributed
-  zero data points. The two documents long enough to produce boundaries are
-  narrative prose at 0.03–1.4% clause-marker density, 50–500× sparser. The zero
-  reflects the corpus, not the splitter. See `docs/chunk-boundary-measurement.md`.
+  question.** The only legal-styled document in the store was 2,202 characters —
+  too short to produce a single chunk boundary at any size.
 - **The entity signal's 15% → 8.5% false-positive rate is dominated by OCR damage
   specific to that corpus.** The model correctly reconstructs transliterations
-  the source has mangled, and a faithful claim therefore looks unsupported.
+  the source has mangled, so a faithful claim looks unsupported.
   `--entity-rules strict` measures **100% near-miss catch at 17.3% FP** and is
-  probably correct for this project's actual target material — clean digital
-  legal and standards text — but is **untested on clean source**. See
-  `docs/two-scope-and-entity-index.md`.
+  probably correct for this project's real target material — clean digital legal
+  and standards text — but is **untested on clean source.**
 - **The faithfulness cascade was validated on constructed fixtures** plus one
   narrative corpus. Its hard tier keys on numbers and named entities, which is
   exactly what legislative and standards material is dense in and devotional
   prose is not.
 
-**So the corpus is the instrument, and it has been the limiting one.**
+**The corpus is the instrument, and until 2026-08-23 the instrument itself was
+broken.** F45 found the sentence splitter's line-based fallback distorting
+clause-marker density; F48 found the fix (nupunkt, a legal-domain splitter); F52
+re-profiled every document on it. **That is what unblocks this task** — and it
+also means **every marker-density or severance number produced before that date
+must be re-derived, not compared against.**
 
-**What now exists to support this** (all merged 2026-08-18): a corpus page
-(`/corpus`) that is deliberately NOT a job queue — uploading creates no job and
-consumes no cluster time — with per-document profiling that says whether a
-document can answer a given question at all: chunk count at the current
-`CHUNK_TOKENS`, clause-marker density, numeric density, and a plain-language
-usability verdict on the row. Plus HTML extraction (`legislation.gov.au` serves
-HTML, and raw markup made a real Act look like it had a 0.0455 marker rate
-against a true 0.1176 — the corpus page would have called it useless), RTF
-refusal, two-scope hard checking, and a canonical entity index.
+**What exists to support it.** `/corpus` — deliberately NOT a job queue;
+uploading creates no job and consumes no cluster time — with per-document
+profiling that says whether a document can answer a given question at all: chunk
+count at the current `CHUNK_TOKENS`, clause-marker density, numeric density, a
+plain-language usability verdict, and now a `sentence_splitter` stamp per row.
+Plus HTML extraction, RTF refusal, two-scope hard checking, and a canonical
+entity index. **17 documents, 403 chunks, 7.4 M characters** across four genres:
+legislative 6 (including four dated Privacy Act 1988 point-in-time compilations),
+nist standards 4, regulatory 5 (OAIC determinations), standards 2 (ISM).
 
-**The work:**
+**The work, in order:**
 
-1. **Load real material — DONE, verified from the live store this session.**
-   `/opt/missing-link/jobs.sqlite`'s `corpus_documents` table (read-only query,
-   this session) holds **17 documents, 403 chunks at `CHUNK_TOKENS=4096`,
-   7,416,682 characters**, across four genres: **legislative 6** (four Privacy
-   Act 1988 point-in-time compilations — 2005-05-16, 2014-03-12, 2018-02-22,
-   2026-06-04 "current" — plus the Notifiable Data Breaches amending Act and
-   the Credit Reporting Code), **nist standards 4** (SP 800-53 Rev4 and Rev5,
-   SP 800-171 Rev3, SP 800-63B Rev4), **regulatory 5** (five OAIC investigation
-   determinations, including the Ashley Madison joint investigation), and
-   **standards 2** (ISM April 2019 and June 2026 editions). **The four Privacy
-   Act compilations are what make the revision-diff experiment (item 4 below)
-   possible** — real, dated, small textual deltas between compilations of one
-   instrument, exactly the shape Q5 of `docs/corpus-selection.md` asked for.
-   `docs/corpus-selection.md` **exists on disk and carries the ranked
-   shortlist this task used** — **read it before assuming the operator's
-   picks are the right ones.** Its headline finding: **it demotes the ISM**
-   from "primary sourcing pick" to "extraction stress test + revision-diff
-   pair" and **promotes OAIC Commissioner-initiated investigation
-   determinations to #1** on the shortlist, because they are the closest
-   public proxy to a real internal incident investigation — a narrative
-   fact-finding account against a named respondent, ending in numbered
-   findings against statutory tests — which is what a sensitive-sector office
-   actually *writes*, whereas the Act and the ISM are what it *reads*. It also
-   found **Hansard's licence (CC BY-NC-ND, NoDerivs) genuinely conflicts with
-   this pipeline** (see the new `docs/REQUIREMENTS.md` entry this session,
-   2026-08-18) and recommends against using it at all, and it explains why
-   **Commonwealth Ombudsman reports were skipped**: `ombudsman.gov.au` sits
-   behind a Cloudflare JS challenge and returns 403 to plain HTTP fetch — a
-   real constraint on corpus assembly from government sources, not an
-   oversight (also recorded as F45's "also worth recording" note).
-   **Correction to how this file previously described `docs/corpus-
-   selection.md`: it was NOT committed to git** as of the previous entry
-   (`git log --all -- docs/corpus-selection.md` returns nothing) — it existed
-   only as a file on the coordinator's disk in the main checkout. It has been
-   copied into this session's worktree so it ships with these doc fixes; it
-   still needs an actual commit to exist once this repo goes public.
-2. **Re-run the blocked measurements against it — attempted, and it found the
-   instrument itself was broken before it could answer the question.** The
-   boundary-severance re-run against the new legislative corpus is **F45**:
-   marker density on real legislation came back only 2–4× the narrative
-   texts' (1.8–4.9% vs 0.00–1.4%), not the dramatic gap expected, because
-   legislation's paragraph-per-clause HTML feeds thousands of short
-   structural lines into the sentence splitter's denominator. **The severance
-   question itself is therefore still open** — what's now known is that
-   marker density is within-genre comparable only, until the splitter
-   excludes non-sentence fragments. Read F45 directly, not this summary.
-3. **Settle `--entity-rules strict` on clean source.** It is the setting most
+1. **Re-run chunk-boundary severance on the nupunkt instrument.** This is the
+   measurement F45 invalidated and F48/F52 made possible. `docs/chunk-boundary-
+   measurement.md` carries a banner saying every figure in it came from the old
+   splitter — the banner comes off when the re-run lands, not before.
+2. **Settle `--entity-rules strict` on clean source.** It is the setting most
    likely correct for production and the only reason it is not the default is
-   that nothing clean has been measured.
-4. **The revisions experiment, which is novel.** Several compilations of one Act
-   are near-identical documents differing in small, real ways. That is the only
-   clean way to test whether the checker distinguishes **a genuine difference
-   between two sources** from **a fabrication** — and `docs/market-research.md`
-   found **no mainstream tool handles disagreeing sources at all.** Nothing is
-   built for this yet; the corpus makes it possible.
+   that nothing clean had been measured. The corpus is now clean source.
+3. **Re-validate the faithfulness cascade's hard tier on legislative and
+   standards text**, which is dense in exactly the numbers and named entities it
+   keys on.
+4. **The revisions experiment, which is novel and which nothing else does.**
+   Several compilations of one Act are near-identical documents differing in
+   small, real, dated ways. That is the only clean way to test whether the
+   checker distinguishes **a genuine difference between two sources** from **a
+   fabrication** — and `docs/market-research.md` found **no mainstream tool
+   handles disagreeing sources at all.** Nothing is built for this yet.
 
-**Do not treat the corpus as test fixtures.** It is the measuring instrument,
-and this project's repeated lesson (F17, F31, F39, F40, F41) is that a confident
+**Read `docs/corpus-selection.md` before assuming the picks are right.** It
+demotes the ISM from "primary sourcing pick" to "extraction stress test", and
+**promotes OAIC Commissioner-initiated investigation determinations to #1**,
+because they are the closest public proxy to a real internal incident
+investigation — which is what a sensitive-sector office *writes*, whereas the Act
+and the ISM are what it *reads*. It also found **Hansard's CC BY-NC-ND genuinely
+conflicts with this pipeline**, and records that `ombudsman.gov.au` sits behind a
+Cloudflare JS challenge and 403s a plain fetch.
+
+**Do not treat the corpus as test fixtures.** It is the measuring instrument, and
+this project's repeated lesson (F17, F31, F39, F40, F41, F45) is that a confident
 result from a mis-specified instrument is worse than no result.
 
+**One gap F46 leaves that belongs here:** the deterministic citation audit has
+**no regression harness.** It was run by hand via `cascade job --mode citations`,
+and nothing would catch a regression in it — including a re-tightening of the
+tolerant `\s` in `_SECTION_MARKER_RE` that was the only reason 7 of 7 valid
+citations resolved at all.
 
-### 1. ~~Join node 2~~ — DONE 2026-08-17, except the replication measurement
+### 1. Measure `GLM-4.7-Flash` — the only live model question
 
-**Completed and verified by output:**
+**Model B is closed (F47) and this is not a reopening of it.** It is a candidate
+to *replace the incumbent*, gpt-oss-120b, at S=1. On paper it beats gpt-oss on
+every axis this project ranks: **31.2 B total** (CONFIRMED from HF safetensors),
+**~3.6 B active** (computed, reconstruction within 2%), **9.3% Vectara** against
+gpt-oss's 14.2%, **MIT**, **18.3 GB at Q4_K_M**, predicted ~8.2 tok/s, llama.cpp
+support merged before our pin — and **~30 minutes of link time to fetch** at the
+measured 11.7 MB/s.
 
-| Step | Result |
-|---|---|
-| Key auth + NOPASSWD sudo on node 2 | working (was already in place) |
-| `harden-ssh.sh 10.10.0.39` | **key-only, passwords refused** |
-| Characterisation before assuming anything | **node 2 is a twin of node 1** (F29) |
-| STREAM triad on node 2 | **27.9 GB/s** vs node 1's 28.4 same-day control |
-| `nodes.env` populated with MEASURED values | node1 + node2, both 128709 MB / 4 cores |
-| `setup.sh node2` | hostname, identity, swap off, THP, service account |
-| `distribute.sh` (version + libc + ISA) | **node2 ok**, 24 MB / 35 files, exec-tested |
-| `distribute.sh /opt/ik_llama.cpp` | **node2 ok** — was impossible before (F32) |
-| `install-services.sh` | `rpc-server@50052` on both, **RPC_THREADS=4**, 0 restarts |
-| `two-node-smoke.sh 10.10.0.39` | **PASS — #26500 does not fire** (F31) |
-| Aggregate replication measurement | **STILL OWED** — see "In flight" above |
+**It may not be adopted on that paragraph, and the reasons are specific:**
 
-**Five latent bugs were found and fixed on the way, every one of them specific to
-the 1 → 2 transition** (F30): the `User=cluster` account nothing created, the
-coordinator being unable to SSH to itself, host-key regeneration invalidating
-`known_hosts`, `machine-id` regeneration orphaning the journal, and a 14-hour
-timezone divergence. Plus the DIMM reporter printing an empty slot label, and
-F21 recurring in the smoke test as a **false negative on the go/no-go gate**.
+- It is a **hybrid reasoning model**, and F35 established there is no universal
+  thinking-off switch — `enable_thinking` is inert on gpt-oss and unknown kwargs
+  are dropped silently. Verify per model; never assume.
+- **31 B total is far less stored knowledge than 120 B.** Faithfulness is not the
+  only axis.
+- Everything but the file sizes and the config is **REPORTED or INFERRED.**
 
-**Node 3 will be much cheaper than node 2 was.** The fixes above are in
-`setup.sh`/`distribute.sh`, so the path is: run `join-node.sh`, install the key,
-`harden-ssh.sh`, characterise + STREAM, add to `nodes.env`, `setup.sh node3`,
-both `distribute.sh` invocations, `install-services.sh`. **Run `ssh-keygen -R`
-after `setup.sh`** — see F30 item 3.
+**So: fetch it, run it through `llama-server` at `--parallel 4` against the real
+pipeline** — F40's lesson is that a benchmark not reproducing the deployment's
+concurrency is not a benchmark of the deployment — and compare wall-clock *and*
+output coherence against gpt-oss on the same documents. A faster config that
+changes output is not a win.
 
-### 1b. Owed follow-ups from this session
+**The one experiment that would reopen Model B proper:** GLM-4.6 **UD-IQ1_S at
+96.9 GB is S=1**, hence replicable at R=N. Whether 1-bit retains enough of the
+9.5% to beat gpt-oss's 14.2% is genuinely open, `DESIGN-NOTES.md` H warns UD's
+edge shrinks at the low-bit end, and it costs 2.3 h to fetch.
 
-- **A rigorous two-node sharding A/B.** The −47% generation figure is from a
-  single short chat request, not `llama-bench`. Run
-  `llama-bench` over the RPC devices **on an idle link** and record it properly.
+### 2. Converge the fleet's service units, and land the node-3 branch
+
+Two mechanical items, both of which are the F32 defect ("a file in version
+control is not a file on a node") waiting to bite again:
+
+- **Merge `agent/node3-join`.** Node 3 is joined on the hardware, but the
+  parameterised-username `nodes.env`, `distribute.sh`, `install-services.sh` and
+  `llama-server@.service` changes are on that branch. **Check first:**
+  `grep -n '^  "node3' provisioning/nodes.env`.
+- **Nodes 1 and 2 still carry the OLD `llama-server@.service`** (`User=debian1`,
+  no drop-in). Converge with
+  `ONLY_NODES=node1,node2 ./cluster/install-services.sh` — **but that also does
+  `enable --now rpc-server@50052`, so schedule it when no benchmark is running.**
+
+**Two fixes in that branch worth understanding before touching the unit**, because
+they look like over-engineering and are not: `EnvironmentFile` **cannot** supply
+the per-node user, since systemd expands `${VAR}` only in the `ExecStart` family
+and `User=` resolves before any environment exists — it dies 217/USER. It is done
+with a drop-in. And the tracked `User=` is a **placeholder resolving to nobody**,
+so a missing drop-in fails loudly rather than silently running the inference
+server as root; the drop-in is written *before* the unit, so a half-finished
+install is never the dangerous half.
+
+**Also still owed from F56:** `setup.sh` does not restart `systemd-journald`
+after regenerating `machine-id`, so **node 4 will orphan its journal exactly as
+nodes 2 and 3 did**; and `setup.sh` asserts `THP: expected [madvise]` while all
+three nodes report `[always]` — a stale assertion in the script.
+
+### 3. The fabrication-amplification pilot — BUILT, NEVER RUN, and parked
+
+**The harness exists and has never been executed. The operator's instruction is
+to drop it for now.** Recorded here so nobody either re-builds it or quietly runs
+it: it is a decision, not an oversight.
+
+**What F49 established while building it, which stands regardless:**
+
+- **Whole-document single-pass is arithmetically impossible here.** At
+  `n_ctx_slot = 8192` — read from the startup log, not inferred from `-c` — minus
+  the 2048 output budget, the ~150-token wrapper and the 15% headroom rule, the
+  single-pass source budget is **5,094 tokens**. **1 of 17 documents fits** at a
+  realistic 1.3 tok/word. Exact McNemar cannot reach p<0.05 below 6 discordant
+  pairs, so one to four total pairs is **not an underpowered experiment, it is no
+  experiment** — and it would have produced a null reading as "no amplification".
+- **So the unit is a paragraph-aligned SECTION**, both arms receiving
+  byte-identical text. **What is lost is stated, not hidden: fewer chunk
+  summaries than a full document, so any amplification measured is a LOWER
+  BOUND.** Yield ~253 sections corpus-wide; `--per-doc 4` gives ~53.
+- **Cost, from `docs/measurements.md` only:** 21.7 min per section for both arms.
+  6-section pilot **1.3 h on two nodes**; the recommended 53-section run
+  **11.9 h**. `analyse` prints an explicit UNDERPOWERED guard below 6 discordant
+  pairs and refuses to let a null read as "no amplification".
+- **A pairing hazard specific to running this on a cluster:** dispatch is by
+  SECTION, never by (section, arm) — splitting a pair across nodes puts a node
+  difference *inside* the pair, indistinguishable from the effect. `run` refuses
+  endpoints serving different models and `analyse` excludes cross-node pairs.
+
+**If it is ever unparked, run the 6-section pilot first**, because the pilot's
+observed event rate is what says whether 53 sections can clear 6 discordant
+pairs, and that is much cheaper to learn in 1.3 h than in 11.9.
+
+### 4. The coldstore disk layout — DESIGNED, NOT EXECUTED, awaiting the operator
+
+**Blocked on the operator's say-so and must stay blocked, because it destroys an
+existing filesystem** — empty or not. Do not run it on your own initiative.
+
+Node 3's "1 TB" is a 7200 rpm SATA disk carrying a **bare NTFS format with 128 MB
+used of 932 GB and no prior Windows data at all**; SMART PASSED, 2,789 power-on
+hours, 0 reallocated and 0 pending sectors — effectively a new drive. The same
+drives are going into nodes 1 and 2.
+
+**Recommended layout:** single GPT partition, ext4, `LABEL=coldstore`, mounted
+`/srv/coldstore` from `fstab` **by UUID with `nofail`** — a spinning disk that
+fails to mount must not block a headless boot.
+
+**Purpose is snapshot and cold storage. Models stay on NVMe** (F16 makes disk the
+binding constraint; F3 makes model load single-core serialised, and loading 65 GB
+off rust would make that materially worse). **The payoff is larger than expected:**
+a fleet-local GGUF mirror re-provisions at ~120 MB/s off local rust instead of
+~11.7 MB/s over the 100 Mb LAN — **~9 minutes per 65 GB instead of ~97.**
+
+### 5. The fleet-wide GNOME trim
+
+**Do this fleet-wide or not at all.** F53 recorded node 3 idling at 3,251 MB as a
+full GNOME desktop and framed it as a divergence; **F56 corrected that — nodes 1
+and 2 run the identical stack** (`gdm`, `cups`, `cups-browsed`, `avahi-daemon`,
+`colord`, `geoclue`, `packagekit`, `ModemManager`, `switcheroo-control`,
+`upower`, `udisks2`), and node 2's default target is `graphical.target` too.
+**Trimming node 3 alone would make it the odd machine out and confound any A/B
+against the three-way bandwidth twin it just joined.**
+
+Its own task, **with a before/after RAM measurement**, fully reversible
+(`systemctl disable` plus `set-default multi-user.target`, no purging). It is
+~2.5% of 128.7 GB.
+
+### 6. The cybersecurity teaching playground
+
+**New scope, 2026-08-23.** The cluster is also becoming a teaching environment —
+ComfyUI and n8n for roughly 20 students on the DMZ LAN. Surveys are done:
+`docs/comfyui-feasibility.md`, `docs/n8n-feasibility.md`, and **F54**.
+
+**`CLAUDE.md`'s "do not write security guidance into this project" applies to the
+CLUSTER'S OWN posture and does not forbid the lab work.** Building the playground
+and writing teaching material about how these systems fail is in scope; writing
+hardening advice, or implying the tooling makes a network safe, is not.
+
+**What the surveys settled:**
+
+- **ComfyUI is compute-bound the wrong way for this fleet.** 7–13 min per
+  512×512 20-step SD1.5 image per node — a class of 20 queues 3+ hours. **The
+  rescue is step count, not tuning:** SD-Turbo at 1 step ≈ 25–35 s. **SDXL at
+  1024² is 1–2 h/image and video is tens of hours to days per 5-second clip, so
+  the deepfake-video demo as imagined is not reachable on this hardware.** And
+  the one CPU diffusion benchmark with a published memory figure peaks at
+  **6.94 GB — 5% of a node's RAM**: diffusion leaves idle exactly the resource
+  this fleet has. **This project's argument is that old hardware is useful for
+  MEMORY-BOUND work; it has never claimed it is useful for compute-bound work.**
+- **n8n fits**, is licence-permitted for this use with one grey edge worth **one
+  email to `license@n8n.io`**, gives unlimited users on Community (CONFIRMED from
+  `license.ts`, contradicting a widely-repeated forum claim), and its local-LLM
+  integration needs **no custom code** — point the OpenAI credential's Base URL
+  at `http://<node>:8080/v1`, switch off the Responses API default, and set the
+  URL on the credential rather than the node.
+- **Placement is decided by F44, not preference: both belong on node 3, not on an
+  inference node.** ComfyUI holds all cores for its whole runtime and `nice` is
+  not a mitigation — F44 tested exactly that.
+- **If a GPU is wanted**, a used **RTX 3060 12 GB**. Two P510-specific gotchas:
+  the 490 W PSU ships a single 6-pin drop where the 650/850 W shipped 6+8, and
+  **do not substitute an Intel Arc B580** (needs Resizable BAR, which C612/X99
+  firmware generally does not expose). **The Quadro P600 is rejected a second
+  time on new grounds:** PyTorch dropped Pascal from its CUDA 12.8 binaries,
+  CUDA 13.0 drops sm_61, and ComfyUI now names CUDA 13.0 — using it means pinning
+  an unpatchable stack on a machine students are invited to attack.
+
+**Two agents are writing `docs/teaching-labs.md` and
+`docs/distributed-playground.md` — check for those before starting anything
+here.**
+
+### 7. Operator-named infrastructure with no spec on disk yet
+
+**Listed so they are not lost, and flagged so nobody builds the wrong thing.
+Scope each with the operator before implementing.**
+
+- **The `:80` directory page.** The only place authentication and per-student
+  rate limiting can live, and the only thing that makes the fleet navigable.
+  Sketched in both feasibility docs (`docs/comfyui-feasibility.md` §4,
+  `docs/n8n-feasibility.md` §6.2) as a small nginx or Caddy serving a static
+  index over 8000 / 8188 / n8n. **`llama-server` on 8080 must not be exposed to
+  students** — it is unauthenticated and `--parallel 4` means four of them can
+  starve the queue.
+- **Snapshotting.** Distinct requirements for each service: what ComfyUI and n8n
+  actually keep is enumerated in their surveys (`docs/comfyui-feasibility.md` §6,
+  `docs/n8n-feasibility.md` §5), and the cluster-side target is the coldstore
+  disk in §4 above. **Nothing is built.**
+- **Grafana / monitoring.** Named by the operator; **no design exists on disk.**
+  Note the standing constraint it must not violate: **liveness may not live
+  on-node** (F36, and F40 showed forked abort children inherit the listening
+  socket, defeating a process check, a port check and `/health` at once). A
+  dashboard that shares the cluster's failure modes is not a monitor.
+  `docs/watchdog-research.md` has the dead-man's-switch pattern this should
+  probably follow.
+
+### 8. Verify the hooks actually block, once, and record it
+
+**One negative test, never run in ~six days of the guard being cited as a safety
+property (F55).** In a throwaway repo, issue a command the guard claims to
+BLOCK — `git add -A` — through the Bash tool and see whether you are stopped.
+Then check `.claude/hook-audit.log` for a line that is a real framework
+interception rather than a direct test invocation.
+
+**Write the result into `docs/FINDINGS.md` either way.** A confirmed block
+retires F55's "treat the guard as inert"; a second failure means the fallback
+path did not work and the prose in `CLAUDE.md` is still the only enforcement.
+
+### 9. Smaller, still open
+
+- **Faithfulness evaluation stays REFRAMED (F25, and unchanged).** Do **not** try
+  to reproduce the leaderboard: distinguishing GLM-4.6's 9.5% from Kimi K2's
+  17.9% needs **~260 documents per model**, and separating GLM-4.6 from
+  GLM-4.5-Air needs tens of thousands. **Use the leaderboard for ranking — it is
+  a better instrument than anything we can build.** Measure instead the thing it
+  structurally cannot tell us, which is §3's paired amplification question.
+- **LlamaIndex `tree_summarize` as a BASELINE.** The project implicitly claims
+  Missing Link beats reaching for the obvious library, and that claim is
+  untested. The pipeline audit removed one excuse: **LlamaIndex is
+  offline-installable.** **Set timeouts explicitly before running it** — the
+  underlying SDKs default `max_retries` to **2** (corrected from an earlier
+  claim of 3–6) and each retry re-waits the full 60 s-class timeout, which
+  against this backend is a retry storm, not a summary.
+- **Chunk-level fan-out within one document**, and **a retrieval-based task
+  profile.** Both deliberately out of scope so far; `DESIGN-NOTES.md` G and E
+  have the reasoning. They optimise different metrics (one-document latency vs
+  aggregate throughput) and should be selected by queue depth.
+- **ik at `--parallel 1`, and ik with flash attention explicitly off.** Both
+  untested and both might restore F27's win. Neither may be adopted on reasoning
+  alone — F40's own lesson is that a plausible configuration was standardised
+  from a benchmark that could not exercise the failure.
+- **File the ik_llama.cpp defect upstream.** `docs/upstream-ik-2186-draft.md` is
+  written and **NOT filed.**
+- **`-fa` flash attention and `-ctk q8_0` KV quantisation on mainline** —
+  untested, cheap.
+- **Measure the real per-node RAM ceiling** now that the 75% rule's citation is
+  disproven (F1). At 85% the pooled budget rises ~13%.
 - **Re-check `cluster/models.sh pull`.** F28 inverts its peer-over-internet
-  preference at 11.7 MB/s vs 21 MB/s from HuggingFace.
-- **Get a gigabit switch (~$20–30).** Uplink it to the existing 100 Mb port;
-  node↔node then runs at gigabit. Preferred over daisy-chaining, which needs
-  N−1 ports per node and does not scale past 2. Slots 2 and 3 are free on the
-  P510 if a NIC is wanted instead, but the switch is the better buy.
-- **`node1`'s hostname is `debian1`.** Cosmetic, but inconsistent with
-  `nodes.env`. Left alone deliberately — renaming mid-session risked disturbing
-  Tailscale's registration for no benefit.
-- **Remote access is now set up:** Tailscale SSH enabled on node 1
-  (`tailscale set --ssh`, revert with `--ssh=false`), and a detached tmux session
-  named `cluster` exists. Reattach with
-  `ssh -t <coordinator-tailscale-ip> 'tmux new-session -A -s cluster'`, then
-  `claude --continue`. **Address is in `network.md`, not here** — this file is
-  published. (Note: `docs/measurements.md:13` already carries that IP from commit
-  `e908e33`, predating this session. Worth scrubbing if the repo goes public.)
+  preference at 11.7 MB/s LAN vs 21 MB/s from HuggingFace.
+- **Get a gigabit switch (~$20–30)** and uplink it to the existing 100 Mb port.
+  Preferred over daisy-chaining, which needs N−1 ports per node and does not
+  scale past 2.
+- **`_SENT_FALLBACK` exists as two identical copies** (`audit.py:168`,
+  `chunk_boundary_audit.py:79`) carrying two *different* docstrings.
+- **`pip install minicheck` installs an unrelated z3-based package.**
+  `requirements-audit.txt` correctly pins the git URL; anyone "simplifying" that
+  line gets the wrong package **silently.**
+- **`sshpass` is now installed on the coordinator**, because `join-node.sh`
+  assumes console access to the new machine and node 3 had no key. Either keep it
+  or give `join-node.sh` a documented bootstrap — nodes 4-7 hit the same wall.
+- **A frozen-but-listening `rpc-server` with an empty backlog** still answers
+  `tcp=accept` and is not caught by the new bytes probe. `RPC_STALL_GRACE = 900 s`
+  is a **labelled safety margin, not a measurement.** **Node 2 has no `iptables`
+  and no `nft`.**
+- **20 of 43 claims in the F46 audit ended at `needs_classifier` and are
+  permanently unchecked.** They are correctly *labelled*, but **F41 says the
+  classifier cannot close that gap at production chunk length** — this is not a
+  backlog item awaiting a classifier run; on current evidence it has no solution.
 
-### 1c. Original node-2 procedure, retained for node 3+
+### Joining node 4
 
-**The 1 → 2 transition is where all the risk lives.** Everything that can go
-wrong across a fleet appears at N=2 and nothing new appears at N=10.
+**The 1 → 2 transition holds most of the risk, but F56 measured that it does not
+hold all of it** — 2 → 3 found three more latent bugs and the one that was
+anticipated (the username) was not among them. **Expect node 4 to find
+something.**
 
-**Node 2 is at `10.10.0.39`** (see `network.md` — gitignored, site-specific).
-Debian and `sshd` are up. It has the same admin password as node 1; install the
-coordinator's key, then harden to key-only.
-
-Note an earlier ARP sweep saw `10.10.0.35` answering — **that is something else
-on the DMZ, not node 2.**
+`nodes.env` fields are `<hostname> <lan-ip> <ram_mb> <physical-cores>
+[ssh-user]`; the 5th is optional and defaults to the coordinator's login.
+**Values must be MEASURED, not assumed** — do not copy node 1's, and do not leave
+placeholders. `distribute.sh` now **prints its resolved target list** and says
+explicitly when it is a no-op, because a silent `exit 0` meaning "nothing to
+distribute" once looked exactly like success.
 
 ```bash
-# 1. Characterise it -- do NOT assume it matches node 1
-ssh <node2-ip> 'lscpu -p=Core,Socket | grep -v "^#" | sort -u | wc -l; free -m; lsblk -d'
-#    and run the STREAM triad -- core count is a BANDWIDTH spec (F12)
+# 1. Characterise it FIRST -- homogeneity is a result, not an assumption (F29)
+ssh <user>@<ip> 'lscpu -p=Core,Socket | grep -v "^#" | sort -u | wc -l; free -m; lsblk -d'
+#    and run the STREAM triad -- core count is a BANDWIDTH spec (F12).
+#    No compiler on a fresh node: build STREAM on node 1 (same CPU, same glibc,
+#    no -march=native) and copy it.
 
-# 2. Add node 2 to provisioning/nodes.env with MEASURED values FIRST.
-#    Both distribute.sh and install-services.sh read their target list from it;
-#    with only node1 present, distribute.sh exits 0 with "nothing to distribute"
-#    -- a silent no-op that looks like success, and step 3 then fails.
-$EDITOR provisioning/nodes.env      # "node2 <ip> <ram_mb> <physical_cores>"
+# 2. Add the node to provisioning/nodes.env with MEASURED values, BEFORE step 3.
+$EDITOR provisioning/nodes.env
 
 # 3. Provision, distribute, verify
-sudo ./provisioning/setup.sh node2
-./provisioning/distribute.sh        # asserts version, libc AND ISA
+sudo ./provisioning/setup.sh node4
+./provisioning/harden-ssh.sh <ip>       # verifies key auth BEFORE disabling passwords
+./provisioning/distribute.sh            # asserts version, libc AND ISA
 ./cluster/install-services.sh
+ssh-keygen -R <ip>                      # setup.sh regenerates host keys (F30 item 3)
 
-# 4. Two-node RPC smoke test (gate for upstream bug #26500, F2/F22)
-./bench/two-node-smoke.sh <node2-ip>
-
-# 5. THE measurement that matters: replication, not sharding.
-#    Run an independent llama-server on each node, measure AGGREGATE throughput
-#    on 2 nodes. Expect ~2x. This validates the R x single-node scaling model
-#    the whole architecture now rests on.
+# 4. RPC smoke test -- the go/no-go gate for upstream bug #26500 (F2/F22)
+./bench/two-node-smoke.sh <ip>
 ```
 
-**`nodes.env` values must be MEASURED, not assumed** — LAN IP, RAM MB and
-**physical** cores. Do not leave placeholders, and do not copy node 1's values.
-
-### 2. Missing Link fan-out across R endpoints — DONE (job-level), two sub-items still owed
-
-**The main outstanding code change from the previous entry landed** (see
-"MERGED THIS SESSION" in `docs/CHANGELOG.md`, `151ed32` and `33ddc79`). `missing_link/worker.py`
-no longer targets a single `base_url`; `app.py`'s lifespan starts one
-`_worker_loop` task per `LLAMA_URLS` entry, each claiming jobs independently
-against `db.claim_next_pending` (already atomic under concurrency —
-`BEGIN IMMEDIATE`, F20). Concretely, against the original list:
-
-- ~~`nodes.env` grows a list of inference endpoints~~ — **done**,
-  `LLAMA_URLS`, kept separate from the RPC endpoint list.
-- ~~`run_forever` becomes R concurrent workers~~ — **done**, one
-  `_worker_loop(base_url)` task per endpoint.
-- ~~Health-check endpoints and route around a dead one~~ — **done**,
-  `_probe_endpoint` runs **before** claiming, not after, so a dead endpoint
-  just stops claiming rather than claim-then-fail; per-endpoint status is on
-  `/health` and the index page.
-- ~~Keep the task profile separable from the queue~~ — **holds**, unchanged.
-- ~~Carry provenance through the map step~~ — **done** (landed earlier,
-  `7ceb799`, and unaffected by tonight's merges). `chunk_summaries` records
-  `start_char`/`end_char` per chunk; confirmed present in the live
-  `/opt/missing-link/jobs.sqlite` schema.
-
-**RESOLVED 2026-08-23 — fan-out is now ENABLED AND PROVEN ON HARDWARE.**
-`/etc/default/missing-link` sets
-`LLAMA_URLS=http://127.0.0.1:8080,http://10.10.0.39:8080` (backup at
-`/etc/default/missing-link.bak-20260823-102936`; the legacy singular
-`LLAMA_URL` line was deliberately KEPT — `app.py:39-42` reads it only when
-`LLAMA_URLS` is unset or empty, so it is a pure fallback and cannot produce a
-duplicate endpoint). **Proof, and note that "the service started" was not
-accepted as proof:** two jobs submitted back to back were claimed by
-DIFFERENT endpoints and ran concurrently — `c74d70b24d1f` on
-`http://127.0.0.1:8080` and `1a634b040762` on `http://10.10.0.39:8080`,
-started 5 ms apart (00:30:19.707 / 00:30:19.712), both `done`. Corroborated
-from OUTSIDE Missing Link's own opinion of itself: node 2's load average went
-from 0.00 to 1.14 with `llama-server` on CPU during the run. **This is the
-first time node 2 has ever run inference through Missing Link** — the
-`endpoint` column was NULL on every historical job and the only two non-NULL
-rows in the store were both `127.0.0.1`. The column had been working; there
-was simply never a second endpoint to record.
-
-**A trap found while doing it, recorded because it makes an obvious-looking
-knob dangerous:** a DUPLICATE entry in `LLAMA_URLS` would half-break the
-status display. `ENDPOINT_STATE` is a dict comprehension (`app.py:49`) so it
-dedupes, but the worker task list (`app.py:94`) does not — listing the same
-URL twice yields two worker loops sharing one state entry, and `current_job`
-is clobbered by whichever wrote last. Jobs would still run correctly; only the
-display would lie. So "run two workers per node" is **not** available by
-repeating a URL. Also verified by direct execution, not inference: a malformed
-entry (no scheme, dead host, or not a URL) never crashes the app — all three
-return `False` via `BackendUnavailable` and the entry sits in backoff forever,
-visible only as `"reachable": false` on `/health`.
-
-**Historical note — what this paragraph said before 2026-08-23:** Confirmed directly from `/etc/default/missing-link`
-this session: it sets `LLAMA_URL=http://127.0.0.1:8080` (the legacy singular
-variable) and does **not** set `LLAMA_URLS` (the plural, comma-separated
-variable `app.py` actually reads for fan-out — see `app.py` around line 38).
-`worker.py`'s own fallback logic means an unset `LLAMA_URLS` silently
-degrades to the single-endpoint behaviour rather than erroring, so this is
-easy to miss from the outside — the feature looks live because the service
-runs fine, it is just only using node 1. **Setting `LLAMA_URLS` to include
-node 2's endpoint in `/etc/default/missing-link` and restarting the service
-is a real owed step, not a completed one**, despite everything else in this
-section being done in code.
-
-**NOT done — two real gaps remain, and neither landed tonight:**
-
-- **Chunk-level fan-out within one document.** `_worker_loop`'s own docstring
-  is explicit about this: *"Job-level, not chunk-level: chunk-level fan-out
-  only reduces the wall-clock of a SINGLE document (same total work, spread
-  wider), while job-level fan-out is what multiplies aggregate throughput...
-  Chunk-level is deliberately out of scope here."* So a single large document
-  submitted alone still only uses one endpoint's worker at a time; the rest of
-  the fleet sits idle until there is a second job to claim. See
-  `DESIGN-NOTES.md` G for why the two granularities optimise different
-  metrics (throughput vs one-document latency) and should be selected by
-  queue depth, not built as one thing.
-- **A retrieval-based task profile.** `CLAUDE.md` lists medium-horizon search
-  and Q&A as a target workload, and for that workload RAG is the correct
-  primitive — it should arrive as a task profile plugged into the
-  prompts/chunking seam, not as a second system. No retrieval or embedding
-  code exists anywhere in `missing_link/` yet. See `DESIGN-NOTES.md` E,
-  concessions 1 and 2.
-
-### 3. Resolve the Model B decision
-
-**Research completed 2026-08-17 and now recorded — read before deciding:**
-`docs/MODEL-SELECTION.md` gained (a) **Meta's whole open-weight line assessed** —
-Llama 4 Scout is the best-evidenced option (7.7% Vectara vs gpt-oss's 14.2%, fits
-S=1) but costs **~3.5× throughput** because it has 17B active against gpt-oss's
-5.1B; Maverick is S=2 at N=2 and rejected; Muse Glimmer is dense 27.8B-active with
-**no Vectara entry**; Muse Spark has no weights. And (b) **the agent-appliance model
-choice** — the Qwen3-4B already on disk is good enough (BFCL-v3 57.6) with thinking
-forced off. `docs/DESIGN-NOTES.md` I rejects the DeepSeek Harness, and H's addendum
-records the **UD-quant capacity trap: a UD quant is a size tier heavier than its
-letter suggests, so S=1 maths must use real file sizes.**
-
-
-**Do not fetch Kimi K2 until this is settled.** K2-Instruct has the worst
-REPORTED hallucination rate of any model checked (17.9%, Vectara
-leaderboard — not verified here), against a project
-requirement of faithfulness over style. GLM-4.6 has identical active params
-(same speed), 9.5% hallucination, MIT licence, and needs 189 GB instead of
-546 GB — **which removes the coordinator-disk blocker entirely.** See F25 and
-`docs/MODEL-SELECTION.md`.
-
-**A constraint nobody crossed against N until 2026-08-17: the Model B choice
-implies a MINIMUM FLEET SIZE, and at N=2 it destroys the replication win.**
-
-F25 compared the candidates on faithfulness, disk and active params. None of that
-touched `S` — how many nodes one copy needs — so the interaction with fleet size
-stayed invisible:
-
-| Model | Size | S | **R at N=2** | What you actually get |
-|---|---:|---:|---:|---|
-| **gpt-oss-120b** | 65 GB | **1** | **2** | **replication, ~2x aggregate** |
-| GLM-4.6 IQ4_XS | 189 GB | 2 | **1** | **no replication at all**, plus RPC over 100 Mb |
-| DeepSeek-V3.2 | 363 GB | 4 | **0** | **does not run at N=2** |
-| Kimi K2 IQ4_XS | 546 GB | 6 | **0** | does not run at N=2 |
-
-(S = `ceil(size / (131.8 GB x 0.75))`, i.e. against the 98.9 GB per-node
-guideline.)
-
-**So GLM-4.6 — the faithfulness-led favourite — would take the fleet from R=2 to
-R=1 and add sharding overhead on a 100 Mb link (F28).** Plausibly slower than a
-single node running gpt-oss. It only starts paying at about **N=6** (R=3).
-
-**Consequences:**
-
-- **Do not download 189 GB over an 11 MB/s link before deciding this.** That is
-  ~4.7 h per node, and every node needs its own copy under replication.
-- **The faithfulness gain must be weighed against a factor-of-R throughput loss**,
-  not treated as free. `docs/EVALUATION.md` argues the leaderboard should pick the
-  model; it cannot price this in, because it knows nothing about our fleet.
-- **This is the "largest model with S = 1" rule from `CLAUDE.md` biting for real.**
-  At N=2 that rule selects gpt-oss-120b, and the 1 -> 2 threshold crossing costs
-  exactly the factor of N the rule warns about.
-- **It also means sharding stays untested until a model needs it.** Nothing on the
-  fleet does; S=1 holds to ~99 GB. See the sharding caveat in
-  `docs/measurements.md`.
-
-Two research gaps that would change the answer:
-
-- **GLM-5 / 5.1 / 5.2 active-parameter count** is not published anywhere found.
-  That single number decides whether the strongest MIT-licensed open reasoner is
-  usable here.
-- **Finix S1 32B** has the best listed hallucination rate (1.8%) but is
-  uncharacterised — architecture, active params, GGUF availability all unknown.
-
-### 4. Faithfulness evaluation — REFRAMED 2026-08-17. Do NOT try to reproduce the leaderboard.
-
-Task 14 in the plan, and F25 argued it should **gate model selection rather than
-validate it afterwards.** That is still right, but the *design* was wrong, and
-the reason is statistical.
-
-**We cannot measure an absolute hallucination rate here, and should not try.**
-To distinguish the two leading candidates on their reported rates — GLM-4.6 at
-9.5% vs Kimi K2 at 17.9% — a two-proportion test at 80% power needs
-**~260 documents per model**:
-
-```
-n = (1.96 + 0.84)^2 x [0.095(0.905) + 0.179(0.821)] / (0.084)^2 ~= 259
-```
-
-Separating GLM-4.6 (9.5%) from GLM-4.5-Air (9.3%) would need **tens of
-thousands**. Vectara used 7,700+. A local run over a few dozen documents cannot
-rank models, and burning cluster-nights to half-reproduce someone else's
-leaderboard is a poor trade. **Use the leaderboard for ranking. It is a better
-instrument than anything we can build.**
-
-**Measure instead the thing the leaderboard structurally CANNOT tell us.** F25
-flagged it as INFERRED and it is the project's real exposure: our pipeline is
-**map-reduce**, so a fabrication in a chunk summary becomes *source material*
-for the reduce step, where it is indistinguishable from genuine content. Errors
-do not merely persist, they get laundered.
-
-That is a **paired, within-pipeline** comparison — same documents, same model,
-single-pass vs map-reduce — which is far more statistically efficient than
-comparing absolute rates across models, because document-level variance cancels.
-**A few dozen documents can detect it**, where hundreds could not rank models.
-
-So the eval becomes two much cheaper questions:
-
-1. **Does map-reduce amplify fabrication relative to single-pass, on our own
-   documents?** Paired design, ~30–50 documents, AlignScore/SummaC (RoBERTa-scale,
-   fine on CPU). If yes, that is an architectural finding about the *pipeline*,
-   independent of model choice, and it may argue for a verification pass in the
-   reduce step.
-2. **Is the chosen model's faithfulness acceptable at all on our material?** A
-   qualitative acceptance check, not a ranking. Small n is fine.
-
-**Neither requires 260 documents, and neither competes with the leaderboard.**
-
-### 4b. Try the popular document-summary pipelines as a BASELINE
-
-Research was done on this (see "Summarisation pipelines" below) and its
-conclusion was **nothing mature exists to adopt** — private-gpt, Kotaemon and
-localGPT are RAG-QA systems that retrieve top-k chunks, the *opposite* of reading
-a whole document. So running those would mostly re-confirm a shape mismatch.
-
-**The one worth actually running is LlamaIndex `tree_summarize`**, the closest
-building block, as a **baseline to measure Missing Link against.** The project
-implicitly claims Missing Link is better than reaching for the obvious library;
-that claim is currently untested.
-
-**Set the timeouts explicitly before running it.** LlamaIndex and LangChain both
-default to a 60 s-class timeout, and against a backend where one chunk takes
-minutes that is a retry storm, not a summary — it will look like the library
-"cannot handle" the cluster when in fact it was never configured for it.
-**Corrected 2026-08-18:** research into the underlying OpenAI/Anthropic SDKs
-both libraries build on found `max_retries` defaults to **2**, not the 3–6
-originally assumed here. The retry-storm risk is still real: each retry
-re-waits the full timeout, so even 2 retries at a naive short timeout is tens
-of seconds of silent waiting against this backend. Compare on wall-clock
-**and** on faithfulness, using the paired design above.
-
-### 5. Smaller, still open
-
-- ~~Adopt `ik_llama.cpp` for the document workload (+22% end-to-end)~~ —
-  **REVERSED, see F40.** ik_llama.cpp fatal-errors on the 5th request of any
-  `--parallel 4` job, a 100% failure rate on real multi-chunk documents, and
-  the resulting hang is invisible to `Restart=always`. Mainline is now the
-  fleet-wide default. **What is genuinely still open, and untested per F40:**
-  ik at `--parallel 1` (removes the interleaving that triggers the bug, at
-  the cost of F24's 1.79× batching gain) and ik with flash attention
-  explicitly disabled (removes the faulty code path entirely, at the cost of
-  most of ik's prefill advantage). Neither may be adopted on reasoning alone
-  — F40's own lesson is that a plausible configuration was standardised from
-  a benchmark (`llama-bench`) that could not exercise the failure. Also
-  still owed: filing the ik_llama.cpp defect upstream — F40 already contains
-  the diagnosis and a one-line reproduction, and issue #2186 on the CUDA
-  path is the closest existing report, but nothing has been filed against
-  the CPU path.
-- `-fa` flash attention and `-ctk q8_0` KV quantisation on **mainline**:
-  untested, cheap.
-- Open WebUI (plan Task 9).
-- Measure the real per-node RAM ceiling now that the 75% rule's citation is
-  disproven (F1). At 85% the pooled budget rises ~13%.
-- A long legal/records-style document, closer to this project's actual
-  target material than the philosophical-text corpus the chunk-size sweep
-  and F40's reproduction both used, to find the real boundary/context-limit
-  behaviour on the kind of document this project is actually for.
+**Check the smoke test's OUTPUT, not just its exit status.** F21 has produced a
+**false negative on this exact gate**: a reasoning model returning empty content
+made a healthy cluster look broken (F31). Read the prose, confirm it is coherent
+and on-topic, and confirm zero `[create_node] invalid data ptr`.
 
 ---
 
 ## Where things stand
 
-**Node 1 (coordinator, user `debian1`, `10.10.0.34`)** and **node 2 (worker /
-second replica, `10.10.0.39`)** — both provisioned, both serving.
+**Node 1 (coordinator), node 2 (second replica) and node 3 (joined, no inference
+endpoint yet).** IPs, roles and per-node logins are in **`network.md`**
+(gitignored) and `provisioning/nodes.env`; this file is published, so it names
+nodes, not addresses.
 
-| Item | node 1 | node 2 |
-|---|---|---|
-| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` — **the ENGINE ACTUALLY SERVING (F40)**. Snapshot, observed 2026-08-18 afternoon from `/etc/default/llama-server`'s `LLAMA_BIN=`. Re-check: `grep LLAMA_BIN /etc/default/llama-server` | **mainline as last observed, but this moved during the same session — see the box below the table, and re-check with `ssh debian1@<node2-ip> 'grep LLAMA_BIN /etc/default/llama-server'` before trusting this cell** |
-| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` — **kept installed, NOT the default any more.** Old config backed up at `/etc/default/llama-server.ik.bak` (snapshot, node 1, 2026-08-18 afternoon) | kept installed; **actually serving 16:29–18:24 on 2026-08-18** (see below) |
-| `rpc-server@50052` | snapshot 2026-08-18 afternoon: active, `-t 4`, user `cluster`. Re-check: `systemctl is-active rpc-server@50052` | snapshot 2026-08-18 afternoon: **active** (`systemctl is-active` → `active`) — the chunk-size sweep that left it stopped is over. Re-check: `ssh debian1@<node2-ip> 'systemctl is-active rpc-server@50052'` |
-| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB), **Qwen3-Next-80B-A3B-Instruct UD-Q8_K_XL — download COMPLETE as of 2026-08-18 afternoon**, both shard files present, ~93 GB total (`ls /opt/models`; the previous entry's "26%" is stale) | **gpt-oss-120b, md5-verified as of 2026-08-17** (not re-checked since) |
-| SSH | password auth still ON as of 2026-08-18 (no key installed until that session) | **key-only, hardened** |
-| Disk free | snapshot 2026-08-18 afternoon: **248 GB**. Re-check: `df -h /` | snapshot 2026-08-18 afternoon: **375 GB**, down from the previous entry's 437 GB, consistent with the corpus/model activity recorded above. Re-check: `ssh debian1@<node2-ip> 'df -h /'` |
-| Missing Link | job store + worker + web API, fan-out across R endpoints (**LIVE as of 2026-08-23: `LLAMA_URLS` set to both endpoints and proven by two jobs running concurrently on different nodes** — see task 2 above; re-check with `grep LLAMA_URLS /etc/default/missing-link`), queue control, resumable per-chunk persistence, automatic retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table, a corpus benchmark page. Test count and service-restart timestamp are snapshots, not facts — re-run `cd missing-link && .venv/bin/python -m pytest tests/ -q \| tail -1` and `systemctl show missing-link --property=ActiveEnterTimestamp` yourself; as last observed (2026-08-18 afternoon) these were **552 tests** and `ActiveEnterTimestamp` **17:44:47**, later than the previous entry's 11:53:31, i.e. the service had been restarted again since then, consistent with the corpus feature going live | n/a (coordinator only) |
-| Phase 0 gate | **PASSED**, 2026-08-12 — a one-time validation, not a live status | — |
-| #26500 gate | **PASSED across both machines** (F31), 2026-08-17 — a one-time validation, not a live status | — |
+**Every cell below is a SNAPSHOT with a re-check command, not a fact.** A
+hand-edited status line goes stale the moment a concurrent session changes
+something, and node 2's engine has flipped mid-session at least once.
 
-**Node 2's engine changed while this session was checking it, and that is worth
-recording plainly rather than smoothing over.** Direct SSH checks, in order:
+| Item | node 1 | node 2 | node 3 |
+|---|---|---|---|
+| llama.cpp | b10369 (`6e62ba53`) at `/opt/llama.cpp/bin` — the engine that should be serving (F40). Re-check: `grep LLAMA_BIN /etc/default/llama-server` | mainline as last observed, **but this moved during a session once** — re-check over SSH before trusting it | **b10369, matching the fleet** (verified at join) |
+| ik_llama.cpp | `8337e4cd` at `/opt/ik_llama.cpp/bin` — **kept installed, NOT the default.** Old config backed up at `/etc/default/llama-server.ik.bak` | kept installed, not the default | **`8337e4cd`, matching the fleet.** Shipping it here is what exposed `setup.sh` creating only `/opt/llama.cpp` (F56) |
+| `llama-server@8080` | serving | serving | **installed, and this unit had never reached ANY node before node 3** (F56). Resolves its user from a drop-in |
+| `rpc-server@50052` | active, `-t 4`, user `cluster`. Re-check: `systemctl is-active rpc-server@50052` | active. Re-check over SSH | active |
+| `INFERENCE_ENDPOINTS` | yes | yes | **deliberately NOT listed.** Adding it before a server answers parks a Missing Link worker in permanent backoff. Its in-band watchdog logs one `DOWN … Restart=always owns this, watchdog stands off` per minute and correctly restarts nothing (`NRestarts=0`) |
+| Models | Qwen3-4B (2.4 GB), gpt-oss-120b F16 (65 GB), Qwen3-Next-80B-A3B-Instruct UD-Q8_K_XL (~93 GB total). Re-check: `ls /opt/models` | gpt-oss-120b, md5-verified 2026-08-17 | **none** |
+| Disk | NVMe. Re-check: `df -h /` | NVMe. Re-check over SSH | NVMe 476.9 GB root, **plus a 931.5 GB 7200 rpm SATA disk that is unmounted and contributes zero usable space today** — see NEXT TASKS §4 |
+| SSH | — | key-only, hardened | **key-only, verified independently of the hardening script**: a real password login via `sshpass` was rejected `(publickey)`, and `sshd -T` reads `passwordauthentication no` |
+| Missing Link | job store, worker, web API, fan-out across R endpoints, queue control, resumable per-chunk persistence, retry-and-resume, live telemetry, per-workflow guidance, section-level citations, a revive route, a failure-history table, the corpus page, the nupunkt splitter, **and a shared-credential auth gate**. Test count and restart timestamp are **snapshots, not facts** — run the commands in the at-a-glance table | n/a | n/a |
+| #26500 gate | **PASSED across all three machines** (F31, F56) — a one-time validation, not a live status | | |
+| Phase 0 gate | **PASSED**, 2026-08-12 — a one-time validation, not a live status | | |
 
-1. First check: `/etc/default/llama-server` read `LLAMA_BIN=/opt/ik_llama.cpp/bin`.
-2. `journalctl` on node 2 shows `llama-server@8080` started at **16:29:27** running
-   ik_llama.cpp at the default configuration — `--parallel 4`, `flash_attn = 1`
-   (**not** the untested `--parallel 1` or flash-attention-off variants F40 named
-   as still open) — and it ran without a logged crash through at least 18:24, longer
-   than the four requests F40 found fatal on a busy job (consistent with a mostly
-   idle service in that window, not with the bug being fixed).
-3. A **second and third check, four minutes apart, both read
-   `LLAMA_BIN=/opt/llama.cpp/bin`** — mainline. `systemctl show` confirms the
-   service restarted at **18:24:53 AEST**, a timestamp inside this session's own
-   working window. **This agent did not restart it** — this pass is read-only on
-   node 2 per its brief. Something else (the operator, or another concurrent
-   session) flipped it back to mainline while this documentation pass was running.
-
-**What this means for anyone reading this file next: treat "node 2's engine" as a
-live value, not a fact to carry forward.** As of the last check this session
-(18:28 AEST), node 2 is on mainline, matching node 1 and the fleet-wide decision.
-Re-check `/etc/default/llama-server` before relying on it.
-
-**`rpc-server` IS now running on both nodes.** The unit is *templated*, so the
-name is `rpc-server@50052.service` — plain `systemctl status rpc-server` reports
-"could not be found" and looks like a broken install. Use:
+**`rpc-server`'s unit is TEMPLATED**, so the name is `rpc-server@50052.service`
+— plain `systemctl status rpc-server` reports "could not be found" and looks
+exactly like a broken install:
 
 ```bash
-systemctl status rpc-server@50052
-ssh debian1@10.10.0.39 'systemctl status rpc-server@50052'
+systemctl status rpc-server@50052                        # node 1
+ssh <user>@<node-ip> 'systemctl status rpc-server@50052' # per nodes.env, 5th field
 ```
 
 It runs as the **`cluster`** system user, whose account and tensor-cache
-directory (`/var/lib/cluster/.cache/llama.cpp/rpc`) nothing created until this
-session — see F30.
+directory (`/var/lib/cluster/.cache/llama.cpp/rpc`) nothing created until F30.
 
-**Not done:** nodes 3+, Model B decision, Open WebUI, evaluation harness,
-chunk-level fan-out within one document, a retrieval task profile, watchdog
-moved fully off-cluster, ik at `--parallel 1` / flash-attention-off, a long
-legal/records-style document for the boundary measurement, filing the
-ik_llama.cpp defect upstream. **Done since the previous entry:** the
-aggregate replication measurement, the chunk-size sweep at `-c 32768`
-(`docs/measurements.md`), the extended sweep at `-c 65536` (numbers on disk,
-not yet written up), the engine reversal to mainline (F40), and the
-citation-format check against a real job.
+**Not done:** nodes 4+, `GLM-4.7-Flash` measured, Open WebUI, the amplification
+run, chunk-level fan-out within one document, a retrieval task profile, watchdog
+moved fully off-cluster, ik at `--parallel 1` / flash-attention-off, filing the
+ik_llama.cpp defect upstream, the coldstore disk, the fleet GNOME trim, the
+playground build-out, the `:80` page, snapshotting, monitoring.
 
 ---
 
-## Real production events this session — not benchmarks, the actual system doing actual work
+## Real production events, 2026-08-18 — not benchmarks, the actual system doing actual work
+
+**Historical, kept because each one is the system failing or recovering for
+real rather than under test.** "This session" below means 2026-08-18.
 
 - **The rewritten watchdog fired twice for real on node 1**, both against
   genuine wedges, both confirmed directly from
@@ -720,43 +658,51 @@ citation-format check against a real job.
 
 ## Joining a node
 
-**Use the same username as the coordinator (`debian1`).** Not strictly required,
-but the systemd unit, `scp`/`rsync` targets and every `ssh` in the scripts all
-assume it. A different username means editing all of them.
+**The username no longer has to match the coordinator.** It used to — the
+systemd unit, `scp`/`rsync` targets and every `ssh` in the scripts assumed one
+login fleet-wide. Node 3's admin account is not `debian1`, and rather than rename
+the machine the operator chose to **parameterise**, because the eventual skill
+must run where usernames do not match. `nodes.env` grew an optional 5th field;
+`distribute.sh` (eight call sites), `install-services.sh` (five) and
+`llama-server@.service` all read it. **F56 has the mechanism, including why
+`EnvironmentFile` cannot solve `User=`.**
 
-**Generate these with `./provisioning/join-node.sh` on the coordinator** rather
-than copying from here — it substitutes the real key and LAN IP, so it cannot go
-stale. The listing below is what it prints today.
-
-On the new machine:
+**Generate the on-machine steps with `./provisioning/join-node.sh` on the
+coordinator** rather than copying from here — it substitutes the real key and LAN
+IP, so it cannot go stale. What it prints is, in outline:
 
 ```bash
-# 1. Same username as the coordinator
-sudo adduser debian1                     # skip if it already exists
+# 1. An admin account (any name -- record it as nodes.env's 5th field)
+sudo adduser <user>                      # skip if it already exists
 
 # 2. Passwordless sudo. Append to /etc/sudoers, NOT a sudoers.d drop-in --
 #    sudo is last-match-wins, and a later "(ALL:ALL) ALL" line silently
 #    overrides a NOPASSWD rule in sudoers.d. This bit us on node 1 (F9).
-echo "debian1 ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
+echo "<user> ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers
 
 # 3. SSH server
 sudo apt-get install -y openssh-server
 sudo systemctl enable --now ssh
 
-# 4. Authorise the coordinator's key
-sudo -u debian1 mkdir -p /home/debian1/.ssh
-sudo -u debian1 tee -a /home/debian1/.ssh/authorized_keys <<'KEY'
+# 4. Authorise the coordinator's key (join-node.sh prints the real key)
+sudo -u <user> mkdir -p /home/<user>/.ssh
+sudo -u <user> tee -a /home/<user>/.ssh/authorized_keys <<'KEY'
 <PASTE THE COORDINATOR'S PUBLIC KEY -- run ./provisioning/join-node.sh to print it>
 KEY
-sudo chmod 700 /home/debian1/.ssh
-sudo chmod 600 /home/debian1/.ssh/authorized_keys
+sudo chmod 700 /home/<user>/.ssh
+sudo chmod 600 /home/<user>/.ssh/authorized_keys
 
 # 5. Report the LAN IP
 ip -br addr | grep -v LOOPBACK
 ```
 
-Coordinator is `10.10.0.34/24`, gateway `10.10.0.254`. Everything after this the
-coordinator can do over SSH.
+**`join-node.sh` assumes console access to the new machine.** Node 3 had no key
+and no console to hand, which is why `sshpass` is now installed on the
+coordinator. Nodes 4-7 hit the same wall: either keep `sshpass` or give
+`join-node.sh` a documented bootstrap.
+
+The coordinator's own address and the gateway are in **`network.md`**
+(gitignored). Everything after step 5 the coordinator does over SSH.
 
 **Then harden it — key-only, once keys are confirmed working:**
 
@@ -772,30 +718,32 @@ this exists to prevent.
 
 ---
 
-## The web UI is RUNNING (2026-08-17)
+## The web UI
 
-**Missing Link's own UI, not Open WebUI.** It already existed — `base.html`,
-`index.html`, `job.html`, plus submit/job-view/result/health/api routes — and is
-now serving. Open WebUI (plan Task 9) is a *chat* frontend and is still not
-deployed; this is the *job queue* UI, which is what the async workload needs.
+**Missing Link's own job-queue UI, not Open WebUI.** Open WebUI (plan Task 9) is
+a *chat* frontend, and this workload is explicitly asynchronous — nobody is
+waiting at a prompt — so it is still not deployed and is no longer a settled
+decision. See `docs/DESIGN-NOTES.md` F and `docs/REQUIREMENTS.md`.
 
-```bash
-./missing-link/start-ui.sh http://127.0.0.1:8081 8000   # backend url, port
-```
+It runs as `missing-link.service`; `./missing-link/start-ui.sh` exists for
+running it by hand. Reach it over Tailscale at port 8000 — **address in
+`network.md`**, gitignored, because this file is published.
 
-Reach it over Tailscale at `http://<coordinator-tailscale-ip>:8000`
-(address in `network.md`). Submit a document, watch the job go
-pending -> running -> done, read the summary.
+**It now requires the credential.** `ML_AUTH_TOKEN` from
+`/etc/default/missing-link`; the browser is prompted once for the whole origin,
+so the server-rendered forms need no template change. `/health` is the only open
+route. **Do not write the token into this file.**
 
-**It needs a llama-server to point at.** `start-ui.sh` takes the backend URL as
-its first argument. Under replication there are R of them and Missing Link still
-targets ONE — that is the fan-out work in task 2 below, and the reason
-`INFERENCE_ENDPOINTS` already exists in `nodes.env`.
+**It fans out across R endpoints and no longer targets one.** `LLAMA_URLS` names
+the serving endpoints; `INFERENCE_ENDPOINTS` in `nodes.env` is the inventory it
+comes from, kept deliberately separate from the RPC endpoint list. Proven live on
+hardware, not merely merged — see "Current state, in detail".
 
 **Verified working end-to-end 2026-08-17:** a records-retention memo submitted
 over HTTP was claimed by the background worker and processed against
 gpt-oss-120b. Form field is `document` (not `text`), `kind` is one of
-`summarise` / `report` / `qa`.
+`summarise` / `report` / `qa`. **Read the API before calling it** — Missing Link
+is FastAPI, so `GET /openapi.json` is free and authoritative.
 
 ---
 
@@ -832,22 +780,30 @@ on a 131.8 GB node trivially and does not threaten the S=1 budget.
 
 ---
 
-## Hardware — nodes 1 AND 2 MEASURED, 3+ unknown
+## Hardware — nodes 1, 2 AND 3 MEASURED; 4+ unknown
 
-| | Node 1 | **Node 2** |
-|---|---|---|
-| CPU | Xeon E5-1620 v4 — **4 cores / 8 threads** | **identical** |
-| ISA | AVX2, FMA, F16C. **No AVX-512** | **identical** |
-| RAM | **131.8 GB** — 4 × 32 GB DDR4-2400, all four channels | **identical, confirmed by `dmidecode`** |
-| **Achievable bandwidth** | **28.4 GB/s** (STREAM, 2026-08-17 re-run; 28.2 on 08-12) | **27.9 GB/s** |
-| Disk | NVMe 477 GB — **367 GB free as of 2026-08-17** (snapshot; superseded by the more recent 248 GB in "Where things stand" above). Re-check: `df -h /` | NVMe 477 GB — **437 GB free as of 2026-08-17** (snapshot; superseded by the more recent 375 GB above). Re-check: `ssh debian1@<node2-ip> 'df -h /'` |
-| Board | LENOVO 30B2S2E800 (ThinkStation P510) | **identical** |
-| Network | **100 Mb/s** (not gigabit — F28), `10.10.0.34/24` on `eno1` | **100 Mb/s**, `10.10.0.39/24` |
-| Hostname | `debian1` (inconsistent with `nodes.env`, left alone) | `node2` |
+| | Node 1 | **Node 2** | **Node 3** |
+|---|---|---|---|
+| CPU | Xeon E5-1620 v4 — **4 cores / 8 threads** | **identical** | **identical, down to family/model/stepping 6/79/1 and microcode `0xb000040`** |
+| ISA | AVX2, FMA, F16C. **No AVX-512** | **identical** | **identical — the sorted flag sets diff to ZERO differences against node 1**, so no SIGILL risk (F8) |
+| RAM | **131.8 GB** — 4 × 32 GB DDR4-2400, all four channels | **identical, confirmed by `dmidecode`** | **128707 MB — genuinely 2 MB under nodes 1/2.** Use the measured value (F29) |
+| **Achievable bandwidth** | **28.4 GB/s** (STREAM, 2026-08-17 re-run; 28.2 on 08-12) | **27.9 GB/s** | **27.6–27.7 GB/s** at 4 threads. The 4-thread peak and the SMT penalty (F10) reproduce for the third time |
+| Disk | NVMe 477 GB. Re-check: `df -h /` | NVMe 477 GB. Re-check over SSH | NVMe 476.9 GB root (**same model as node 1's**) **plus a 931.5 GB 7200 rpm SATA HDD, unmounted, contributing zero usable space today** |
+| Board | LENOVO 30B2S2E800 (ThinkStation P510) | **identical** | Lenovo ThinkStation **P410**, BIOS S00KT52A — same chassis family and same BIOS as node 1 |
+| Network | **100 Mb/s** (not gigabit — F28) on `eno1` | **100 Mb/s** | **100 Mb/s full duplex — F28 holds for a third machine** |
+| Other | — | — | Python 3.11.2 (on nupunkt's floor); **no compiler**, so STREAM was built on node 1 and copied; `machine-id` and all six SSH host-key fingerprints distinct (F30 clear); swap was ENABLED on arrival (975 MB) and timezone US/Eastern — both corrected at provisioning |
 
-**Node 2 is a bandwidth twin of node 1 — 1.8% apart, within run-to-run noise**
-(F29). That is a *measured* result, so `--tensor-split` by RAM is also correct by
-bandwidth here. **Do not assume it for nodes 3+**; re-run STREAM per node.
+**The fleet is a THREE-WAY bandwidth twin, and that is a measured result each
+time, not a property of the fleet** (F29, extended by F53). Nodes 1 and 2 are
+1.8% apart; node 3 lands within the same band, and its 6-thread dip matches node
+2's figure exactly. So `--tensor-split` by RAM is also correct by bandwidth here.
+**Do not assume it for nodes 4+**; re-run STREAM per node, and note there is no
+compiler on a fresh node — build the binary on node 1 (same CPU, same glibc, no
+`-march=native`) and copy it.
+
+**All three nodes are full GNOME desktops, and F56 established that is the
+fleet's NORMAL, not node 3 being odd.** ~2.5% of RAM. Trim fleet-wide with a
+before/after measurement or not at all — see NEXT TASKS §5.
 
 **The bandwidth gap is the CPU, not the memory.** Four cores cannot generate
 enough memory-level parallelism to saturate a quad-channel bus — that needs
@@ -884,11 +840,15 @@ most consequential number in model selection: crossing it costs a factor of N.
 |---|---|
 | Memory bandwidth (STREAM), node 1 | **28.4 GB/s** at 4 threads (28.2 on 08-12) |
 | Memory bandwidth (STREAM), **node 2** | **27.9 GB/s** at 4 threads — **a twin** (F29) |
+| Memory bandwidth (STREAM), **node 3** | **27.6–27.7 GB/s** at 4 threads — **a three-way twin** (F53) |
 | Optimal threads | **4 = physical cores.** `-t 8` is 26% slower. **Reproduced on node 2** |
 | Generation efficiency, dense | **~99% of STREAM** |
 | Generation efficiency, **sparse MoE** | **~61% of STREAM** |
-| RPC overhead, **localhost** | generation **−5.2%**, prefill **−39.4%** |
-| RPC overhead, **two real machines** | generation **≈ −49%** ⚠ indicative only, not `llama-bench` (F28) |
+| RPC overhead, **localhost (protocol only)** | generation **−5.8%**, prefill **−39.1%** (F50; reproduces F14's −5.2%/−39.4%) |
+| RPC overhead, **whole model on node 2 over the LAN** | generation **−39.2%**, prefill −38.8% — the wire adds a further **−35.4%** on generation (F50) |
+| RPC overhead, **two RPC devices, `-ts 1/1`** | generation **−46.1%**, prefill −40.7% — the second device adds **−11.4%** (F50). This is the old "−47%" figure, now reproduced properly |
+| RPC overhead, **local CPU + node 2, `-ngl 18`** | generation −48.0%, prefill **−23.8% — 29% better on prefill than `-ts 1/1`.** Never put a loopback `rpc-server` in the path for the local shard (F50) |
+| **Why the generation penalty never amortises** | the output-layer device returns `n_vocab × f32` **per token** — 593.5 KiB for Qwen3. Predicted +51.9 ms/token and 445 MiB; **measured 52.4 ms and 443 MiB.** It scales with `n_vocab`, **not** model size (F50). Prefill is immune: a batch returns logits for the final position only (+0.6%) |
 | **LAN throughput** | **93.8 Mbit/s = 11.7 MB/s.** NOT gigabit (F28) |
 | **LAN RTT** | **0.827 ms idle, 9.544 ms saturated** — 11.5× bufferbloat |
 | gpt-oss-120b, single node | pp2048 **16.08**, tg128 **6.05** t/s |
@@ -899,6 +859,8 @@ most consequential number in model selection: crossing it costs a factor of N.
 | ik_llama.cpp vs mainline, through `llama-server` at `--parallel 4` (the actual deployment) | prefill **+43% decaying to +15%** as KV fills, generation **indistinguishable (~5.2–5.3 t/s both)** — but **ik fatal-errors on request 5 of any such job (F40); mainline is the fleet default** |
 | **Aggregate throughput, 2 replicas** | **~1.8× (1.86× prefill / 1.77× completion, adjusted; 1.62/1.55 raw)** |
 | Chunk size vs wall-clock, real pipeline, mainline | **U-shaped, optimum at 4096 tokens** — 1.85× worse at 1024, 1.29× worse at 6144 |
+| Sentence splitter, real corpus | **nupunkt beats the regex and pysbd both.** Structural fragments 65.0% → **12.3%**; legislative marker rate 2.85% → **10.53%**; pysbd scored **2.76% — worse than the regex — and took 133.94 s to be worse** (F48, F52) |
+| Tokens per word, within ONE document | **0.53–1.08.** `WORDS_PER_TOKEN = 0.70` is wrong by up to 2× in both directions, and `POST /tokenize` is free (F49) |
 
 **Sizing rule, validated both ways:**
 `tok/s ≈ effective_bandwidth / (active_params × bytes_per_weight)`,
@@ -918,17 +880,36 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
       and use more requests per endpoint before treating 1.8× as a constant.
 - [ ] **`enable_thinking:false` does NOT work on gpt-oss-120b** (harmony format).
       Investigate `reasoning_effort` instead. Verify per model, never assume.
-- [x] ~~Nodes 2+ hardware~~ — **node 2 measured, a twin of node 1** (F29).
-      Nodes 3+ still unknown; core count is a bandwidth spec.
-- [ ] **Rigorous two-node sharding A/B.** The ≈−49% generation figure is one
-      short chat request, not `llama-bench`. Must be re-run on an **idle link**.
+- [x] ~~Nodes 2+ hardware~~ — **nodes 2 and 3 measured; a three-way bandwidth
+      twin** (F29, F53). Nodes 4+ still unknown; core count is a bandwidth spec,
+      and homogeneity is a result to be re-derived, not a fleet property.
+- [x] ~~**Rigorous two-node sharding A/B**~~ — **DONE (F50).** −5% and −47% are
+      the same system at different topologies: protocol −5.8%, the 100 Mb wire a
+      further −35.4%, the second device −11.4%. **And the penalty scales with
+      `n_vocab`, not model size, so it never amortises** — correcting a standing
+      guess in `docs/measurements.md`.
 - [ ] **Does the 61% MoE efficiency generalise?** Measured on gpt-oss (128
       experts, top_k=4). Kimi K2 has 384 at top_k=8 — a more scattered gather
       could be worse.
 - [ ] **Real per-node RAM ceiling** now that the 75% citation is disproven (F1).
-- [ ] **Model B**: GLM-4.6 vs DeepSeek-V3.2 vs Kimi K2 — faithfulness-led.
-- [ ] **GLM-5 active params** — unpublished; decides a leading candidate.
-- [ ] **Finix S1 32B** — best listed faithfulness (1.8%), uncharacterised.
+- [x] ~~**Model B**~~ — **CLOSED IN THE NEGATIVE (F47).** Every frontier
+      candidate is priced and dominated; "one model too large for any single
+      machine" cannot be justified on this fleet. A decision, not a deferral.
+- [x] ~~**GLM-5 active params**~~ — **40.8 B, computed from `config.json`**, the
+      arithmetic validating itself to **0.00%** against the published 753.86 B
+      total. More than DeepSeek-V3.2's 37 B, and *less* faithful than GLM-4.6.
+- [x] ~~**Finix S1 32B**~~ — **no public weights (HTTP 401)**, and its 1.8% is a
+      summary-length artifact: 172.4 words average against a 106.9-word median.
+      **A hallucination score cannot be read without the summary length beside
+      it.**
+- [ ] **`GLM-4.7-Flash` vs the gpt-oss-120b incumbent** — the only live model
+      question, and cheap to settle by measurement. NEXT TASKS §1.
+- [ ] **Does 1-bit GLM-4.6 (UD-IQ1_S, 96.9 GB, S=1) keep enough faithfulness to
+      beat gpt-oss?** The one experiment that reopens Model B. 2.3 h to fetch.
+- [ ] **Does the patched `PreToolUse` hook actually block?** Unverified since
+      F55; needs a fresh session and one negative test. NEXT TASKS §8.
+- [ ] **Is `--entity-rules strict` right on clean source?** 100% near-miss catch
+      at 17.3% FP, measured only on OCR-damaged text. The corpus is now clean.
 - [ ] `-fa` and `-ctk q8_0` — untested.
 - [ ] **Does `models.sh pull` still prefer a peer?** F28 inverts that choice at
       11.7 MB/s LAN vs 21 MB/s from HuggingFace.
@@ -948,6 +929,15 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
 - **`dd` cloning** — disks vary in size and type.
 - **Kimi K3** — real (2.78T total) but **104B active** ≈ 0.3 tok/s here, and
   1.5 TB at Q4. Newer and larger is actively worse (F26).
+- **GLM-5 / 5.1 / 5.2** — **40.8 B active**, computed from `config.json` and
+  validated to 0.00% against the published total (F47). More active than
+  DeepSeek-V3.2, *less* faithful than GLM-4.6, 402.9 GB against 368 GB free, and
+  a thinking model with no reliable off switch (F35).
+- **Finix S1 32B** — **no public weights** (HTTP 401), and its 1.8% hallucination
+  rate is a **summary-length artifact** (F47). Do not cite the number.
+- **"One frontier model too large for any single machine" (Model B) as a
+  concept** — closed in the negative (F47), not deferred. Reopen it only with the
+  GLM-4.6 UD-IQ1_S measurement, which is S=1 and therefore a different question.
 - **Expert parallelism** — genuinely the largest theoretical win (~4×), and
   communication would not kill it, but llama.cpp has no such mode; building it
   is a new inference engine. Recorded in `docs/DESIGN-NOTES.md` A.
@@ -975,8 +965,11 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
   sequential so far slower in wall-clock.
 - **A bigger context window does not fix "lost in the middle"** — extended-
   context variants show near-identical position bias (arXiv:2307.03172).
-- **Chunk size barely matters for map-reduce** (unlike refine) — ~4K with 10%
-  overlap is fine and is not worth tuning.
+- ~~**Chunk size barely matters for map-reduce**~~ — **true for QUALITY, which is
+  what its source (BooookScore) measured, and WRONG for wall-clock.** A real
+  sweep on the real pipeline found wall-clock **U-shaped with a 1.85× spread**
+  and a minimum at 4096 tokens. ~4K with 10% overlap is right, but it is a
+  measured optimum, not a "does not matter". See `docs/measurements.md`.
 - **No public leaderboard compares local llama.cpp models to frontier models on
   summarisation.** Producing one is a genuine contribution. Use BillSum (CC0)
   and score factual consistency separately from the SummEval rubric.
@@ -1023,6 +1016,27 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
 
 ## Log
 
+**Newest first. The session-by-session detail lives in `docs/CHANGELOG.md`; this
+is the one-line-per-turning-point version.**
+
+- **2026-08-23** — **NODE 3 JOINED. The cluster is N=3, and it is a three-way
+  bandwidth twin** (27.6–27.7 GB/s, F53). **2 → 3 found three more latent bugs
+  and the anticipated one was not among them** (F56), which retires this
+  project's "nothing new appears at the tenth node" claim. **Model B closed in
+  the negative** — every frontier candidate priced and dominated, GLM-5 computed
+  at 40.8 B active and *less* faithful than GLM-4.6, Finix S1 a summary-length
+  artifact with no weights (F47). **The sentence splitter is now `nupunkt`**, a
+  legal-domain library nobody had searched for, which beats both our regex and
+  the most-recommended alternative; the whole corpus was re-profiled on it
+  (F48, F52). **The two-node sharding A/B settled the −5% vs −47% dispute** — both
+  right, different topologies, and the penalty scales with `n_vocab` so it never
+  amortises (F50). **The watchdog was found to make large-model sharding
+  impossible** and was fixed to probe bytes moved rather than port acceptance
+  (F51). **The agent-hardening hooks were found never to have fired, in the
+  repo's entire history** (F55). **Missing Link got a shared credential** (F54),
+  fan-out went live and was proven on hardware, and the citation-accuracy audit
+  ran deterministically on real output — finding a correct citation anchoring a
+  false sentence (F46).
 - **2026-08-17 (evening)** — **NODE 2 JOINED. The cluster is N=2.** Characterised
   before assuming: node 2 is a **bandwidth twin** of node 1 (STREAM 27.9 vs 28.4
   GB/s, identical 4 x 32 GB DDR4-2400 layout) — F29. Both engines distributed,
@@ -1142,5 +1156,5 @@ Predicts Qwen3-4B at 11.31 (measured 11.49) and gpt-oss at 6.4 (measured 6.05).
   running process postdates all the relevant merges; `LLAMA_URLS` is unset
   in production despite fan-out being fully built, so only node 1 is
   actually used **[superseded 2026-08-23 — `LLAMA_URLS` is now set and fan-out
-  is proven live; see task 2]**; and 50, not "41+", commits are unpushed to
-  `origin/main`.
+  is proven live; see "Current state, in detail"]**; and 50, not "41+", commits
+  were unpushed to `origin/main`.

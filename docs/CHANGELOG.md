@@ -13,6 +13,231 @@ an unannotated command is still safe without checking `STATUS.md` and
 
 ---
 
+## MERGED 2026-08-23 — N goes to 3, Model B closes, the splitter changes, and the safety layer turns out to be decorative
+
+**The single largest batch since the project started, and three of its results
+are corrections to things this repo asserted as fact.** Findings F46–F56 all
+landed in `docs/FINDINGS.md`; read those rather than this summary where they
+disagree. `git log --format='%h %ci %s' dfbc262..HEAD` gives the exact chain.
+
+### The corrections, first, because they invalidate prose people were acting on
+
+- **F55 — the `PreToolUse` agent-hardening hooks have NEVER been enforced.**
+  `.claude/settings.json` invoked the guard as `"$CLAUDE_PROJECT_DIR"/…`; the
+  variable is empty, so the path resolved to `/.claude/hooks/cluster-guard.py`
+  and never existed. Tested directly: `git add -A` — a hard BLOCK rule — ran
+  unimpeded, as did a DENY-rule `git merge` in the live checkout. All 166 lines
+  of `.claude/hook-audit.log` are same-second direct test invocations; **there is
+  no record of a framework interception, ever.** `CLUSTER_OPS_CONFIRMED=1` has
+  therefore never meant anything either. A fallback path is patched into
+  `settings.json` (`4ef0744` and the ml-auth window) and is **UNVERIFIED** until
+  a fresh session sees a real block.
+  **It also corrects F52**, which had explained the same silence with a genuine
+  but non-operative pattern gap. **A satisfying explanation for a failure is the
+  most effective way to stop looking for the real one** — the same shape as
+  F36/F40 and F45/F48.
+- **F47 — Model B is CLOSED, in the negative.** Not deferred: every frontier
+  candidate is now priced and each is dominated. GLM-5's active-parameter count,
+  published nowhere, was **computed from `config.json` at 40.8 B** and labelled
+  CONFIRMED because the same per-tensor inventory reconstructs the published
+  753.86 B total to **0.00% error**. It is more active than DeepSeek-V3.2, *less*
+  faithful than GLM-4.6 (10.1% vs 9.5%), and 402.9 GB against 368 GB free.
+  Finix S1 has no public weights (HTTP 401) and its 1.8% is a **summary-length
+  artifact** — 172.4 average words against a 106.9 median, on a leaderboard whose
+  own FAQ says a copy-paste extractive summariser scores 0%.
+  **Flagged, not chased: `GLM-4.7-Flash`** appears to dominate the incumbent on
+  every axis this project ranks and is ~30 minutes of link time to settle.
+- **F56 — "everything appears at N=2 and nothing new at the tenth" is
+  measurably too optimistic.** 1 → 2 found five latent bugs; **2 → 3 found three
+  more**, and the anticipated one (the per-node username) was not among them:
+  `setup.sh` created only `/opt/llama.cpp`; the #26500 gate's only diagnostic ran
+  unprivileged and printed `-- No entries --` on healthy and broken nodes alike;
+  and F30's machine-id journal orphaning recurred because `setup.sh` still does
+  not restart `systemd-journald`. **And `llama-server@.service` had never reached
+  ANY node** despite being tracked in git — F32 a second time, in a different
+  file. **It also corrects F53:** the GNOME desktop is the fleet's normal, not
+  node 3 being odd.
+
+### Node 3, and the fleet becoming N=3
+
+**F53 + F56.** Characterised before provisioning, per F29's rule. Xeon E5-1620
+v4 down to the stepping, zero differences in the sorted CPU flag set, **STREAM
+27.6–27.7 GB/s** — a three-way bandwidth twin. RAM measured at 128707 MB,
+genuinely 2 MB under nodes 1/2. Joined, hardened key-only (verified independently
+of the hardening script by a real rejected `sshpass` login), `two-node-smoke.sh`
+**PASS** with coherent prose checked against F21's false-negative hazard, at
+b10369 and ik `8337e4cd` matching the fleet, 100 Mb/s full duplex.
+
+**The per-node username was parameterised rather than renamed**, per the
+operator's decision that the eventual skill must run where usernames do not
+match — an optional 5th field in `nodes.env`, read by `distribute.sh` (eight call
+sites), `install-services.sh` (five) and a `llama-server@.service` drop-in.
+**`EnvironmentFile` cannot solve it:** systemd expands `${VAR}` only in the
+`ExecStart` family, so `User=${LLAMA_USER}` dies 217/USER. The tracked `User=` is
+a placeholder resolving to nobody, so a missing drop-in fails loudly rather than
+silently running the inference server as root.
+
+**Its "1 TB" is a 7200 rpm SATA disk**, not more NVMe — bare NTFS, 128 MB used of
+932 GB, SMART PASSED, 2,789 power-on hours. A layout is designed and **not
+executed** pending the operator, because it destroys a filesystem. Models stay on
+NVMe. **Node 3 is deliberately NOT in `INFERENCE_ENDPOINTS`** until a server
+answers there.
+
+### The sentence splitter, and the search term that found it
+
+**F48 + addendum + F52.** Prompted by the operator's *"why aren't we using an
+existing pipeline?"*, every hand-rolled text component was audited against what
+already exists (`docs/existing-pipeline-audit.md`): **one ADOPT, three
+KEEP-OURS, one unmeasured.**
+
+**pysbd — the most-recommended library, carrying a peer-reviewed 97.92% Golden
+Rules claim — scored WORSE than the regex it would replace** (2.76% vs 2.85%) and
+**took 133.94 s to be worse**, because it was benchmarked on well-formed prose
+and our failure case is a document that is structurally a list.
+
+**`nupunkt`, a legal-domain splitter nobody had searched for, fixes F45
+outright**: structural fragments 65.0% → 12.3%, legislative marker rate 2.85% →
+10.53%, PDF hard-wrap fragments 52.4% → 3.5%. Pure Python, zero runtime
+dependencies, MIT, 9.1 MB wheel, verified to work inside `unshare -rn` with no
+network. **The transferable lesson: `chunking-research.md` asked "what is the
+best general-purpose splitter?" and correctly rejected nltk and spaCy as too
+heavy — but domain-specific tooling can be simultaneously more accurate AND
+cheaper, so "too heavy" is not a conclusion that survives a change of search
+term.**
+
+Implementation notes worth keeping: `nupunkt.sent_spans` returns **true character
+offsets**, removing the whole `str.find` bug class F48 had budgeted for; the
+offset contract was verified over **12,129 real spans** from the live corpus;
+**nupunkt INVERTS the raw-HTML effect rather than fixing it**, so HTML extraction
+stays load-bearing; and **four existing tests encoded the old splitter's defects
+as expectations** — pinned to the regex rung rather than deleted, because a test
+suite can hold a bug in place as a specification.
+
+**F52 re-profiled all 17 corpus documents on the new instrument.** Legislative
+3.03% → 9.68%, regulatory 1.06% → 2.06%, ISM 0.57% → 1.71%, NIST 0.30% → 1.21%.
+The dry run confirmed **no splitter-INDEPENDENT control figure moved**, which is
+what distinguishes "the instrument changed" from "something else changed". Test
+suite **662 passed**, and the number was **reconciled** (552 + 77 + 27 + 6)
+rather than accepted — a count that does not reconcile is an unexamined claim.
+
+### The sharding A/B, and what RPC actually costs
+
+**F50.** Two contradictory figures had sat unreconciled for weeks — F14's −5% and
+a −47% from one short chat request. **Both reproduce; they measure different
+topologies, and the configuration separating them had never been run.**
+Decomposition: **protocol −5.8%, the 100 Mb wire a further −35.4%, the second
+device −11.4%.**
+
+**The mechanism was established by byte accounting, not inference:** the device
+holding the output layer returns `n_vocab × f32` = 593.5 KiB **per token**;
+predicted +51.9 ms/token and 445 MiB, **measured 52.4 ms and 443 MiB**. So the
+penalty scales with `n_vocab`, **not** model size — **correcting a standing guess
+in `docs/measurements.md` that a larger model would amortise RPC away.** Prefill
+is immune structurally (+0.6%).
+
+Two configuration results: **`--rpc <remote> -ngl <half>` beats `-ts 1/1` by 29%
+on prefill** — never put a loopback `rpc-server` in the path for the local shard;
+and pinning the output tensor local with `-ot` collapses both metrics and doubles
+traffic. **F44 was validated incidentally, and cleanly: a contended sample showed
+pp512 22.63 ± 1.23 against 24.53 ± 0.11 clean — an error bar 11× wider.
+A widening error bar is the signature of a contended benchmark; a single run
+would have shown only a slightly wrong mean.**
+
+### The watchdog, corrected for the third time
+
+**F51 + addendum.** `rpc-server` serves one client at a time and **refuses
+connections while busy**, so during a shard upload its port is silent for the
+whole ~54 min — and the watchdog restarted it **9m41s in, at 5.4 GiB
+transferred**, with a log message whose premise was exactly inverted (*"a worker
+that is not listening cannot be carrying shard work"*). **That made any shard
+larger than ~4 GB on this link impossible to load**, and F50's own measurement
+was possible only because its model was small enough to sneak under the timer.
+
+Fixed with a **BYTES** signal: `ss -ti` data counters on the RPC port's
+established connections, with cgroup CPU as a co-signal, running only after the
+port has already refused. **The decisive measurement retires the obvious
+alternative: the receiving `rpc-server` burns ~0% CPU while 1 MB/s of real
+payload arrives**, so CPU alone would not have saved the upload. Both directions
+tested on both nodes against a real `rpc-server`; a `SIGSTOP`ped server with
+`conns=0` still triggered a real restart. **The fleet was never unguarded — zero
+seconds.**
+
+### Missing Link: fan-out live, citations audited, and a door lock
+
+- **Fan-out enabled and PROVEN, not merely merged.** Two jobs claimed by
+  different endpoints 5 ms apart, running concurrently, corroborated from outside
+  Missing Link's own opinion of itself by node 2's load average going 0.00 →
+  1.14. **The first time node 2 had ever run inference through Missing Link.**
+  A trap found in passing: a duplicate entry in `LLAMA_URLS` yields two worker
+  loops sharing one state entry, so "run two workers per node" is not available
+  by repeating a URL.
+- **F46 — the citation-accuracy audit, deterministic, no model consulted.**
+  7 markers, 7 CORRECT, 0 wrong-chunk, 0 unsupported. Sample size is honestly 1,
+  established rather than assumed. **The near-miss is the sharp part: the model
+  emitted its markers with U+202F NARROW NO-BREAK SPACE, and a tolerant `\\s` is
+  the only reason all seven resolved** — a stricter regex would have dropped 7 of
+  7 valid citations and reported that the model ignored the instruction. **And a
+  new defect shape: the citation is correct, the span is correct, and the claim
+  is still false** — two true facts from the cited span merged into one wrong one.
+- **F54 → a shared credential in front of the API** (`1532865`, merged
+  `f50e774`). The live instance was bound to `0.0.0.0:8000` with **no security
+  scheme at all**, exposing `POST /corpus/{doc_id}/delete` — on a LAN about to
+  carry ~20 students. `ML_AUTH_TOKEN`, HTTP Basic or Bearer, `/health` the only
+  open route (F39: a probe whose token drifts reports an outage that is not
+  happening). **A door lock, not a security system**, which is exactly the scope
+  the operator set.
+
+### The amplification experiment: built, not run
+
+**F49.** The paired single-pass-vs-map-reduce design **cannot run on whole
+documents at all**, for arithmetic rather than effort reasons: at
+`n_ctx_slot = 8192` the single-pass source budget is **5,094 tokens**, and **1 of
+17 documents fits**. Exact McNemar cannot reach p<0.05 below 6 discordant pairs,
+so that is not an underpowered experiment, it is **no experiment** — and it would
+have produced a null reading as "no amplification". The unit became a
+paragraph-aligned **section**, with the cost stated: any amplification measured
+is a **lower bound**.
+
+Also from it: **`POST /tokenize` runs on the HTTP thread and constructs no
+task**, verified by reading `server-context.cpp`, so exact token counting is free
+anywhere the code estimates — which matters because **`WORDS_PER_TOKEN = 0.70` is
+wrong by up to 2× in both directions** (0.53–1.08 within a single document). Two
+defects only real text exposed: paragraph-aligned sectioning returned **zero**
+usable sections from one Act whose HTML yields 23 paragraphs under 40 characters
+and one of 29,053; and the first fan-out implementation **silently dropped a
+section and reported success.**
+
+**The harness has never been run. The operator's instruction is to drop it for
+now.**
+
+### The teaching playground
+
+**F54**, with `docs/comfyui-feasibility.md` and `docs/n8n-feasibility.md`.
+**ComfyUI is compute-bound the wrong way for this fleet** — 7–13 min per 512×512
+SD1.5 image per node, and the one CPU diffusion benchmark with a published memory
+figure peaks at **6.94 GB, 5% of a node's RAM**. Diffusion leaves idle exactly the
+resource this fleet has. Video is not reachable. **n8n fits**, is
+licence-permitted with one grey edge worth an email, gives unlimited Community
+users (CONFIRMED from `license.ts`, against a widely-repeated forum claim), and
+integrates with local LLMs with no custom code. **Both belong on node 3, not on
+an inference node — F44 decides it, and `nice` is not a mitigation.**
+
+**Found in passing and fixed:** `reportlab` was an **undeclared test dependency**
+since `test_extract.py` was written (`37db6ad`), verified by building a fresh
+venv purely from `requirements.txt`. **`pip install minicheck` installs an
+unrelated z3-based package** — `requirements-audit.txt` correctly pins the git
+URL, and anyone "simplifying" that line gets the wrong package silently.
+
+### A process note worth keeping
+
+An agent ran a read-only profiling pass on node 1 while the sharding benchmark
+held both nodes, then **disclosed it unprompted with the exact window** so the
+affected repetitions could be discarded. Under F44 that is a real perturbation.
+**A disclosed contention event is cheap; an undisclosed one silently corrupts a
+number that then gets quoted for months.**
+
+---
+
 ## MERGED 2026-08-18 morning → afternoon, AFTER the entry below
 
 **~30 more commits landed after the batch documented below**, roughly
@@ -243,11 +468,11 @@ Log: `/tmp/rsync-gptoss.log`.
 ```bash
 # is it still going / did it finish?
 pgrep -af 'rsync -a --partial' ; tail -c 200 /tmp/rsync-gptoss.log
-ssh debian1@10.10.0.39 'ls -lh /opt/models/gpt-oss-120b/'   # want 65369017728 bytes
+ssh <user>@<node2-ip> 'ls -lh /opt/models/gpt-oss-120b/'   # want 65369017728 bytes
 # if interrupted, it resumes -- --partial --inplace, so just re-run:
 rsync -a --partial --inplace --info=progress2 \
   /opt/models/gpt-oss-120b/gpt-oss-120b-F16.gguf \
-  debian1@10.10.0.39:/opt/models/gpt-oss-120b/
+  <user>@<node2-ip>:/opt/models/gpt-oss-120b/
 ```
 
 **Do not benchmark either node while this runs.** It reads 65 GB off node 1's
