@@ -21,9 +21,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 >   fan out"*, while the on-disk "Conventions" section below says the opposite:
 >   **fan out, up to about five at once, in separate git worktrees.**
 >
-> **Use that last one as your staleness self-test.** Scroll to "Conventions" in
-> the copy you are reading. If it says one agent at a time, your copy is stale
-> and nothing else in it can be trusted either — re-read the file from disk.
+> **Two self-tests. Run both against the copy you are reading.**
+>
+> 1. Scroll to "Conventions". If it says one agent at a time, your copy is stale
+>    and nothing else in it can be trusted either — re-read the file from disk.
+> 2. Scroll to "Conventions" again. If it says **"Agent hygiene is enforced, not
+>    merely advised"**, your copy predates 2026-08-23 and **F55**, and it is
+>    asserting something that was never true: the `PreToolUse` hooks have never
+>    blocked anything, in this repo's entire history.
+>
+> **And a third failure mode, worse than staleness, recorded 2026-08-23:** this
+> file was **wrong on disk**, not merely wrong in a snapshot. It claimed the
+> agent-hardening hooks were enforced for roughly six days without anyone
+> issuing one command the guard claims to block and watching it fail. A
+> snapshot can only be as good as the file; **`docs/FINDINGS.md` outranks both,
+> and a claim in here that no finding backs is a claim nobody has tested.**
 
 
 ## File index
@@ -60,7 +72,7 @@ orientation and you are not expected to have read it.**
 | `docs/UPSTREAM-PATCHES.md` | folding corrections back into the plan and spec |
 | `docs/MODEL-SELECTION.md` | choosing, or defending, which model to run |
 | `docs/DESIGN-NOTES.md` | tempted by expert parallelism, speculative decoding, replication or RAG — analysed with numbers, not built |
-| `docs/AGENT-HARDENING.md` | a `PreToolUse` hook blocked you, or you are changing what is blocked/gated |
+| `docs/AGENT-HARDENING.md` | a `PreToolUse` hook blocked you, or you are changing what is blocked/gated — **read F55 first: the layer this file describes has never actually fired** |
 | `docs/superpowers/specs/` | checking whether an alternative was already rejected, and why — **partly stale** |
 | `docs/superpowers/plans/` | historical task-by-task plan — **stale, superseded by FINDINGS** |
 
@@ -70,8 +82,8 @@ orientation and you are not expected to have read it.**
 |---|---|
 | `docs/EVALUATION.md` | which datasets and faithfulness metrics to use, and why NOT to reproduce the hallucination leaderboard |
 | `docs/corpus-selection.md` | ranked shortlist of public documents structurally matching real work product, licences checked per source |
-| `docs/chunking-research.md` | whether and how document splitting matters for map-reduce summarisation |
-| `docs/chunk-boundary-measurement.md` | how often a chunk cut severs a qualifying clause pair on the real corpus |
+| `docs/chunking-research.md` | whether and how document splitting matters for map-reduce summarisation — **its §4 splitter conclusion is superseded by F48**, and the way it went wrong is the more useful part |
+| `docs/chunk-boundary-measurement.md` | how often a chunk cut severs a qualifying clause pair on the real corpus — **every figure in it came from the OLD splitter and is not comparable; it carries a banner saying so** (F45, F48) |
 | `docs/citation-research.md` | what an attributed summary should look like; the design behind the reduce step's section-level citations |
 | `docs/faithfulness-cascade.md` | deterministic checks (numbers/entities in span) that decide before any classifier is asked |
 | `docs/audit-ledger.md` | mapping a summary against its source into a machine-readable ledger of matches/misses |
@@ -80,6 +92,9 @@ orientation and you are not expected to have read it.**
 | `docs/minicheck-spike.md` | does MiniCheck run fast enough on this hardware, and does it survive negation |
 | `docs/watchdog-research.md` | the multi-node, out-of-band watchdog design — liveness, per-service signals |
 | `docs/market-research.md` | what office workers actually use for document summarisation, and whether Missing Link's shape matches |
+| `docs/existing-pipeline-audit.md` | whether an off-the-shelf NLP library should replace any hand-rolled component — one ADOPT, three KEEP-OURS, one unmeasured (F48) |
+| `docs/comfyui-feasibility.md` | the teaching playground's image-generation half — why CPU diffusion is compute-bound the wrong way for this fleet (F54) |
+| `docs/n8n-feasibility.md` | the teaching playground's automation half — licence, isolation, and the local-LLM integration (F54) |
 | `docs/upstream-ik-2186-draft.md` | the drafted, **not yet filed**, upstream report of the ik_llama.cpp multi-slot fatal error (F40) |
 
 ## Homogenous Cluster
@@ -89,7 +104,9 @@ legally cannot leave the building.
 
 **Immediate deliverable: the cluster.** An **N-node** CPU-only llama.cpp cluster
 doing real work on real sensitive documents. N is whatever the organisation has;
-the reference fleet is 7, but **nothing in the design may assume 7.**
+the reference fleet is 7, but **nothing in the design may assume 7.** **N is 3
+today** — nodes 1, 2 and 3 provisioned and characterised. Check what is actually
+running from `STATUS.md`'s at-a-glance table, not from this sentence.
 
 **Long-term deliverable: a Claude Skill** that lets an organisation without a
 specialist do the same with whatever hardware it has. The cluster comes first
@@ -148,6 +165,20 @@ That is not a metaphor, it is a build rule, and it decides arguments:
 - **Never ask the model where something came from.** Hand it a label and ask it to
   repeat the label; resolve the label to a span in code. Asking a model for a
   location scores ~38% on the *easier* task of merely validating one.
+- **An attribution is not a verification.** Observed on real output (F46): all 7
+  citation markers in a real job resolved CORRECT, to the right chunk, with every
+  number matching inside its own cited span — **and the summary's first sentence
+  was still false**, having merged two true facts from that span (an author and
+  his guru) into one wrong one. Correct citation, correct span, false claim.
+  Nothing was fabricated and nothing was misattributed, so no provenance check
+  can catch it.
+- **When output parsing reports 0% compliance, suspect the parser before the
+  model.** The same job emitted its markers with U+202F NARROW NO-BREAK SPACE,
+  not ASCII space. A tolerant `\s` in `_SECTION_MARKER_RE` is the only reason all
+  seven resolved; **a stricter literal-space regex would have dropped 7 of 7
+  valid citations and reported "the model ignored the instruction"** — a total,
+  confident, wrong conclusion about the model caused by one invisible character
+  in our own code.
 - **Model output is a protocol, not an answer.** It gets parsed, validated and
   refused — which is why `extract_content` raises on empty and on truncated text,
   why an invented `[Section 47]` is dropped rather than rendered, and why an
@@ -226,6 +257,44 @@ about exactly one thing — **a fast, low-latency connection between machines.**
 Do not write security guidance into this project. Do not imply the tooling
 makes a network safe. Point at the requirement and move on.
 
+### That rule is about the CLUSTER'S OWN posture. It does not forbid the teaching material.
+
+**Added 2026-08-23, because the two are easy to conflate and an agent could
+refuse the wrong thing.** The fleet is now also becoming a **cybersecurity
+teaching playground** — ComfyUI and n8n for roughly 20 students on the DMZ LAN
+(F54, `docs/comfyui-feasibility.md`, `docs/n8n-feasibility.md`). Hold the
+distinction explicitly:
+
+- **Still forbidden:** writing hardening advice, network-security guidance, or
+  any claim that this tooling makes a network safe. That is the organisation's
+  responsibility and no tool can assess it.
+- **Not forbidden, and actively wanted:** building the lab — deploying the
+  playground services, writing teaching material about how these systems fail
+  and how AI can be misused, and reporting plainly what is exposed. **Refusing
+  the lab work on the strength of the paragraph above would be a misreading.**
+
+**What is open on the LAN right now, stated as fact rather than advice, because
+students are about to be on it:**
+
+- **`llama-server` on `:8080` is unauthenticated.** Any host on the LAN can
+  spend the cluster's inference directly, and `--parallel 4` means four
+  concurrent students can starve the queue that Missing Link is trying to drain.
+- **ComfyUI has no authentication at all** — unauthenticated `POST /queue`,
+  `/interrupt`, `/free`, `/history`; any student can wipe everyone's work from a
+  browser address bar, no exploit required. Custom nodes are arbitrary Python
+  executed at startup, with real unauth-RCE CVEs in the ecosystem.
+- **n8n's task runners default to `N8N_RUNNERS_MODE=internal`**, which n8n's own
+  docs call "insecure by design" — anyone who can edit a workflow can read the
+  database, encryption key, stored credentials and environment variables.
+- **Missing Link WAS unauthenticated and is no longer** — see below. It was
+  bound to `0.0.0.0:8000` exposing corpus deletion; that predated the playground
+  request and is the reason the credential exists.
+
+**Placement is decided by F44, not by preference: the playground services belong
+on node 3, not on an inference node.** ComfyUI holds all cores for its entire
+runtime, `nice` is not a mitigation (F44 tested exactly that), and n8n's Code
+node makes it CPU-bound on demand.
+
 **Faithfulness is a security property here.** These are legally sensitive
 documents; a fabricated fact in a summary is a failure of the same order as a
 leak. Model selection must weight reported hallucination rate above general
@@ -268,8 +337,32 @@ scaling story, and it makes the design N-agnostic.
 **Consequences, measured:**
 
 - **Sharding buys capacity, never speed.** Within a shard group nodes run
-  sequentially, so utilisation is 1/S and RPC adds **−39% prefill / −5%
-  generation**. `S` nodes ≈ 1 node with `S`× the RAM.
+  sequentially, so utilisation is 1/S. `S` nodes ≈ 1 node with `S`× the RAM.
+- **What RPC actually costs, decomposed (F50), because two contradictory
+  numbers sat in this repo for weeks and BOTH were right:** the **RPC protocol
+  alone is −5.8% generation / −39.1% prefill** (loopback, which is what F14
+  measured); putting the 100 Mb wire in the path costs **a further −35.4%
+  generation**; adding a second RPC device costs **−11.4%** on top. So −5% and
+  −47% are the same system measured at different topologies.
+- **The generation penalty scales with `n_vocab`, NOT with model size, so it
+  never amortises.** The device holding the output layer ships the full logit
+  vector every token — 151936 × f32 = 593.5 KiB for Qwen3 — and a bigger model
+  does more compute per token while returning *the same* vector. **The standing
+  guess that a larger model would amortise RPC away is wrong and is corrected in
+  `docs/measurements.md`.** Prefill is immune for a structural reason: a batch
+  returns logits for the final position only (+0.6%).
+- **Never put a loopback `rpc-server` in the path for the local shard.**
+  `--rpc <remote> -ngl <half>` beats `--rpc 127.0.0.1,<remote> -ts 1/1` by
+  **29% on prefill** — the local CPU can serve its own half directly. And do not
+  retry pinning the output tensor local with `-ot`: it collapses both metrics
+  and doubles traffic.
+- **A shard upload can outlive the watchdog's patience, and that once made
+  sharding impossible (F51).** `rpc-server` serves one client at a time and
+  refuses connections while busy, so a port probe read "wedged" and restarted it
+  9m41s into a ~54 min upload. Fixed by probing **bytes moved** on the RPC
+  port's established connections, not the port's willingness to accept — but the
+  fix's `RPC_STALL_GRACE = 900 s` is a labelled safety margin, not a
+  measurement.
 - **Replication buys speed, linearly.** Independent nodes, no RPC overhead, and
   the document workload is embarrassingly parallel (map-reduce chunks are
   independent).
@@ -281,10 +374,9 @@ scaling story, and it makes the design N-agnostic.
   batch 4**, and **collapses at batch 8** (prefill −56%, total throughput below
   batch 1). Use `--parallel 4`; never 8.
 
-### The 1 → 2 transition is where the risk lives
+### The 1 → 2 transition is where MOST of the risk lives — but not all of it
 
-Almost everything that can go wrong appears when the second node arrives, and
-nothing new appears at the tenth:
+Most of what can go wrong appears when the second node arrives:
 
 - RPC protocol enters the picture at all
 - **Version, libc and ISA lockstep** start to matter (a mismatch is silent until
@@ -294,6 +386,23 @@ nothing new appears at the tenth:
 
 **Test every one of these at N=2 before growing.** They are cheap to find with
 two machines and expensive to find with ten.
+
+**This section used to end "and nothing new appears at the tenth." That was too
+optimistic, and F56 measured it.** 1 → 2 found five latent bugs (F30); **2 → 3
+found three more** — `setup.sh` creating only `/opt/llama.cpp` so shipping
+ik_llama.cpp to a fresh node died on `Permission denied`; the #26500 gate's only
+diagnostic (`journalctl`) running unprivileged and printing `-- No entries --`
+on healthy and broken nodes alike; and F30's machine-id journal orphaning
+recurring because `setup.sh` still does not restart `systemd-journald`. **The
+one problem that WAS anticipated — a per-node username — was not among them.**
+Plus `llama-server@.service` had never reached any node at all despite being
+tracked in git, which is F32 a second time in a different file.
+
+**So the transferable rule is the opposite of the old sentence: every new node
+is a fresh test of whether a step lives in a script or in somebody's shell
+history.** A step that only ever ran by hand is invisible until a genuinely
+clean machine arrives, and each one costs a node join to find. Expect node 4 to
+find something too.
 
 ## Missing Link
 
@@ -306,8 +415,27 @@ into "fast enough for this class of work." It is also the prototype for the
 skill's task-profile mechanism — each workload type is a plug-in with its own
 prompts, chunking and evaluation.
 
-**It must fan out across R endpoints, not one.** Under replication the queue's
-job is to keep R independent servers busy. This is the main outstanding change.
+**It fans out across R endpoints, not one.** Under replication the queue's job
+is to keep R independent servers busy. That is built *and proven live on
+hardware* as of 2026-08-23 — two jobs claimed by different endpoints, running
+concurrently, corroborated from outside Missing Link's own opinion of itself by
+node 2's load average. **Still open: chunk-level fan-out within one document**
+(a single large job still uses one endpoint) and a retrieval task profile.
+
+**Missing Link now requires a credential.** `ML_AUTH_TOKEN`, read from
+`/etc/default/missing-link`, accepted as HTTP Basic (`curl -u ml:$ML_AUTH_TOKEN`)
+or `Authorization: Bearer`. **`/health` is the only open route** — deliberately,
+because a monitor whose token drifts out of sync would report an outage that is
+not happening (F39's lesson), and `/health` carries queue counts and endpoint
+reachability, no document or job text. Everything else, read-only routes
+included, needs the token.
+
+**Never put the token in any published file.** Not in `CLAUDE.md`, `STATUS.md`,
+`docs/`, a commit message, or a comment. It is a value in
+`/etc/default/missing-link`; site-specific detail belongs in `network.md`, which
+is gitignored. It is a **door lock, not a security system** — one shared secret,
+no users, no roles, no sessions — which is exactly the scope the operator asked
+for and all this project claims for it.
 
 **Cloud is not part of the story.** Do not frame local inference as a
 preprocessing step that makes cloud safe, and do not propose hybrid
@@ -435,6 +563,46 @@ Standing constraints when writing anything that touches the cluster:
   more wall-clock on the identical chunking**, not a wash — larger context is not
   free even when unused. See `docs/measurements.md`, "Chunk-size sweep" and
   "Chunk-size sweep, extended". Do not raise `-c` for headroom alone.
+- **The sentence splitter is `nupunkt`, not a regex** (F48 and its addendum,
+  merged and live). It is a **legal-domain** splitter: pure Python, zero runtime
+  dependencies, MIT, model bundled in a 9.1 MB wheel, verified to work inside
+  `unshare -rn` with no network. It exposes `sent_spans`, returning true
+  character offsets, so the offset contract (`text[start:end] == sentence`) that
+  citations and the audit ledger depend on is preserved directly rather than
+  recovered by string search. On the real corpus it took structural fragments
+  from 65.0% to 12.3% and legislative marker rate from 2.85% to 10.53%.
+  **The regex rung still exists as a loud fallback and four tests pin the old
+  splitter's defects to it deliberately** — a test suite can hold a bug in place
+  as a specification, and deleting such a test hides the change rather than
+  recording it.
+  **Python floor: nupunkt needs >= 3.11.** Nodes 1, 2 and 3 are all on 3.11.2 —
+  *exactly* on the line. Nodes 4-7 are unchecked, and **a floor satisfied only
+  on characterised nodes is a fleet trap.**
+  **HTML extraction stays load-bearing and must not be dropped as redundant.**
+  nupunkt does not fix F45's raw-markup manifestation, it **inverts the sign**:
+  markup now inflates density (0.50 raw vs 0.33 cleaned) where it used to
+  deflate it.
+  **Every number produced by the old splitter is invalid, not merely old.** The
+  corpus has been re-profiled (F52); `docs/chunk-boundary-measurement.md`
+  carries a banner saying its figures came from the old instrument.
+- **Count tokens; do not estimate them. `POST /tokenize` is free.** It runs on
+  the HTTP thread and constructs no task — verified by reading
+  `server-context.cpp`, not assumed — so it takes no inference slot and cannot
+  perturb a running benchmark. **`WORDS_PER_TOKEN = 0.70` is wrong by up to 2×
+  in BOTH directions** (0.53–1.08 words/token *within a single document*, from
+  the chunk-size sweep's own raw output). A constant cannot express that, and
+  every place the estimate gates a fit decision is a place a real document
+  silently overflows a slot or wastes one (F49).
+- **`nodes.env` fields are `<hostname> <lan-ip> <ram_mb> <physical-cores>
+  [ssh-user]`.** The fifth field is optional and defaults to the coordinator's
+  login. It exists because node 3's admin account is `debian3`, and the operator
+  chose to **parameterise rather than rename** — the skill must eventually run
+  where usernames do not match. Note that **`EnvironmentFile` cannot solve
+  this**: systemd expands `${VAR}` only in the `ExecStart` family, so `User=` is
+  resolved before any environment exists. It is done with a drop-in written by
+  `install-services.sh`, and the tracked `User=` is a placeholder resolving to
+  nobody **so a missing drop-in fails loudly rather than silently running the
+  inference server as root.**
 
 ## Verification
 
@@ -451,9 +619,18 @@ Missing Link does have tests. Run them from the repo root:
 cd missing-link && .venv/bin/python -m pytest tests/ -q
 ```
 
-552 tests as of 2026-08-18 (0 failures, 25s). The `.venv` is gitignored and
-exists only in the main checkout — an agent worktree does not have one, so
-create one there if you need to run the suite from a worktree.
+**662 passed / 0 failed as recorded in F52 (2026-08-23), plus the auth suite
+merged after it — run the command rather than quoting a number from here.** The
+`.venv` is gitignored and exists only in the main checkout — an agent worktree
+does not have one, so create one there if you need to run the suite from a
+worktree. **`reportlab` was an undeclared test dependency** until 2026-08-23; it
+is now in `requirements.txt`, verified by building a fresh venv purely from that
+file.
+
+**Reconcile a test count; do not merely accept one.** 662 was reached from an
+estimate of ~585 because the splitter branch extended four *existing* test files
+as well as adding its own (552 + 77 + 27 + 6). **A test count that does not
+reconcile is an unexamined claim.**
 
 **But a test count is not evidence of working software:** 41 tests passed
 against a pipeline that had never processed a single document (F34). Every defect since lived in the seam between our code and something
@@ -469,9 +646,35 @@ at rated speed), 477 GB NVMe. **Achievable memory bandwidth 28.2 GB/s** — only
 their own memory bus.** Not a misconfiguration; uncore and energy-perf-bias are
 already at maximum, so there is no BIOS lever.
 
-Other nodes are **not yet characterised.** Do not assume they match. If a node
-has more cores it will be faster at generation despite identical RAM, and
+**The fleet is N=3 and is a three-way bandwidth twin, MEASURED not assumed.**
+STREAM triad: node 1 **28.4 GB/s**, node 2 **27.9**, node 3 **27.6–27.7**. Node
+3 is the same Xeon E5-1620 v4 down to the stepping, the same ThinkStation
+chassis, the same BIOS, and its sorted CPU-flag set diffs to **zero
+differences** against node 1 — so no ISA/SIGILL risk (F8). Its RAM is
+**128707 MB**, genuinely 2 MB under nodes 1/2: **use the measured value** (F29).
+The 4-thread peak and the SMT penalty (F10) have now reproduced independently
+three times.
+
+**Nodes 4-7 are not characterised. Do not assume they match** — homogeneity is a
+result here, re-derived per node, not a property of the fleet. If a node has more
+cores it will be faster at generation despite identical RAM, and
 `--tensor-split` should then weight by **measured bandwidth**, not RAM.
+
+**Two things about node 3 that generalise to node 4:**
+
+- **Its "1 TB disk" is a 7200 rpm spinning SATA drive**, not more NVMe — and the
+  same drives are going into nodes 1 and 2. It is effectively new (128 MB used of
+  932 GB, SMART PASSED, 2,789 power-on hours). **Models stay on NVMe**; the HDDs
+  are snapshot and cold storage (F16 makes disk the binding constraint, F3 makes
+  load single-core serialised, and loading 65 GB off rust would be materially
+  worse). The payoff is still large: a fleet-local GGUF mirror re-provisions at
+  ~120 MB/s off local rust instead of ~11.7 MB/s over the LAN — **~9 minutes per
+  65 GB instead of ~97.**
+- **It shipped as a full GNOME desktop, and so did nodes 1 and 2.** F53 framed
+  that as a divergence; **F56 corrects it — it is the fleet's normal**, and
+  trimming node 3 alone would make it the odd machine out and confound any A/B
+  against the bandwidth twins it just joined. Trim fleet-wide as its own task
+  with a before/after RAM measurement, fully reversible. It is ~2.5% of 128.7 GB.
 
 Settled:
 
@@ -508,12 +711,52 @@ Settled:
 - **Map-reduce for long documents**, ~4K chunks with 10% overlap — decided on
   evidence. A larger context window does not fix "lost in the middle".
 
-**Model selection is open and is now driven by faithfulness.** The previously
-settled "Model B = Kimi K2" is **under review**: K2-Instruct has the worst
-REPORTED hallucination rate (17.9%) of any model checked — Vectara
-leaderboard, not verified here — against GLM-4.6 at
-9.5% with identical active params and one third the disk. See
-`docs/MODEL-SELECTION.md` and F25.
+**Model B is CLOSED, in the NEGATIVE (F47, 2026-08-23). It is a decision, not a
+deferral.** *"One frontier model too large for any single machine"* cannot be
+justified on this fleet — every candidate is now priced and each is dominated:
+
+- **GLM-5 / 5.1 / 5.2 — REJECT.** Its active-parameter count is published
+  nowhere and was **computed from `config.json` at 40.8 B**, labelled CONFIRMED
+  because the same per-tensor inventory reconstructs the published 753.86 B
+  total to **0.00% error**. That is *more* than DeepSeek-V3.2's 37 B and ~8× the
+  incumbent's 5.1 B, and on this fleet active params *are* generation speed. It
+  is also **less faithful than GLM-4.6** (10.1% vs 9.5%, Vectara, REPORTED) —
+  **the strongest open reasoner is not the most faithful one**, which is the
+  assumption that put GLM on the shortlist. And IQ4_XS is 402.9 GB real against
+  368 GB free: F16's disk blocker again, worse than Kimi K2. Software support was
+  *not* the blocker, contrary to expectation — both llama.cpp PRs merged before
+  our pin.
+- **Finix S1 32B — REJECT, no public weights.** HF returns 401; the public
+  `antgroup` org holds two models, neither Finix. **And its headline 1.8% is a
+  summary-length artifact:** its average summary is 172.4 words against a
+  106.9-word median across 105 models, and the leaderboard's own FAQ says a
+  copy-paste extractive summariser scores 0% and that it is "not evaluating the
+  quality of the summaries." **A hallucination score cannot be read without
+  reading the summary length beside it.**
+- **Kimi K2 — REJECT** (unchanged, F25: 17.9% REPORTED, the worst checked).
+  **DeepSeek-V3.2** stands on merit and does not run at N=2. **GLM-4.6** becomes
+  viable only at N≥4.
+
+At N=7 the S=1 tier delivers **12–47× the aggregate tokens** of the GLM-5 tier,
+and GLM-5 offers no faithfulness gain to weigh against that.
+
+**The live question is `GLM-4.7-Flash`, and it is a measurement, not a
+paragraph.** It was never on the shortlist and appears to beat the gpt-oss-120b
+incumbent on every axis this project ranks: **31.2 B total** (CONFIRMED from HF
+safetensors), **~3.6 B active** (computed, reconstruction within 2%), **9.3%
+Vectara** against gpt-oss's 14.2%, **MIT**, **18.3 GB at Q4_K_M**, **S=1**,
+predicted ~8.2 tok/s, llama.cpp support merged before our pin — and **half an
+hour of link time to fetch**. **Do not adopt it on this paragraph.** It is a
+hybrid reasoning model (F35: there is no universal thinking-off switch), 31 B
+total is far less stored knowledge than 120 B, and everything but the file sizes
+and config is REPORTED or INFERRED. It is cheap enough to settle the only way
+this project is allowed to settle anything.
+
+**The one experiment that reopens Model B:** GLM-4.6 **UD-IQ1_S at 96.9 GB is
+S=1**, hence replicable at R=7. Whether 1-bit retains enough of the 9.5% to beat
+gpt-oss's 14.2% is genuinely open, and it costs 2.3 h to fetch.
+
+See `docs/MODEL-SELECTION.md`, F25 and F47.
 
 ## Roles: orchestrator vs subagent
 
@@ -555,6 +798,20 @@ cannot get back.** So:
   issues, forum threads, writeups from people who built the same thing. The
   goal is to find the *specific* fixes and known failure modes, not general
   background.
+- **Then check the search TERM, not just the answer.** `chunking-research.md`
+  asked *"what is the best general-purpose sentence splitter?"*, assessed nltk
+  and spaCy, correctly rejected both as too heavy for this fleet, and concluded a
+  regex was the only fit. **The reasoning was sound and the conclusion was
+  wrong**, because it never asked *"what do people who process legislation use?"*
+  One does exist, it is MIT with zero runtime dependencies, and it is **lighter
+  than either candidate rejected for weight** (F48). So: **domain-specific
+  tooling can be simultaneously more accurate AND cheaper than the
+  general-purpose tool, which means "too heavy" is not a conclusion that survives
+  a change of search term.** Corollary, measured on the same day: **a library's
+  benchmark score is earned on a text genre.** pysbd's peer-reviewed 97.92%
+  Golden Rules claim came from well-formed prose; on our real corpus — a document
+  that is structurally a list — it scored **worse than the regex it would
+  replace, and took 133.94 s to be worse.**
 - **Delegate research to Sonnet subagents** rather than running searches inline.
   Ask for conclusions plus source URLs, with CONFIRMED / REPORTED / INFERRED
   distinguished. Point them at specific repos, issues and files.
@@ -569,15 +826,35 @@ cannot get back.** So:
 - **Model tier by risk, not by size of task.** Opus for high-complexity or
   high-risk implementation — anything touching faithfulness, the completion
   guards, or the job store. Sonnet for everything else, which is most things.
-- **Agent hygiene is enforced, not merely advised.** `.claude/settings.json`
-  runs `PreToolUse` hooks (`.claude/hooks/cluster-guard.py`) that **block**
+- **Agent hygiene is your obligation, and the hook is an UNPROVEN backstop.**
+  The rules in this section are right on their own merits — every one of them
+  is here because it broke something — and **you follow them because they are
+  right, not because anything stops you.** `.claude/settings.json` runs
+  `PreToolUse` hooks (`.claude/hooks/cluster-guard.py`) that *intend* to block
   `git add -A`, `git commit -a`, `pkill -f` and inline Python that does not
-  compile, and **gate** cluster service control, `git push`, mutating SQL
+  compile, and to gate cluster service control, `git push`, mutating SQL
   against the live job store, writes to `/opt/models`, and git working-tree
-  operations in the live checkout. **If a hook blocks you, the hook is right and
-  the command was wrong** — read its message and take the alternative it names.
-  Never set `CLUSTER_OPS_CONFIRMED=1` on your own initiative; that prefix means
-  the operator said yes. See `docs/AGENT-HARDENING.md`.
+  operations in the live checkout.
+  **F55, 2026-08-23: that layer has NEVER fired.** `settings.json` invoked the
+  hook via `"$CLAUDE_PROJECT_DIR"/...`, the variable is empty, and the path
+  never resolved — so a hard BLOCK rule (`git add -A`) executed unimpeded when
+  it was finally tested, and all 166 lines of `.claude/hook-audit.log` are
+  direct test invocations with **no framework interception ever recorded.**
+  **`CLUSTER_OPS_CONFIRMED=1` has therefore never meant anything either**,
+  because nothing ever checked it. Still: never set it on your own initiative;
+  that prefix means the operator said yes.
+  **`settings.json` now carries a fallback path, and that fix is UNVERIFIED.**
+  The framework reads `settings.json` at session start, so confirming
+  interception requires a *fresh* session issuing a command the guard claims to
+  block and seeing the block. **Until someone has seen a real block, treat the
+  guard as inert and yourself as the only enforcement.** If a hook does block
+  you, the hook is right and the command was wrong — read its message and take
+  the alternative it names, and **record that it fired**, because that is the
+  observation this repo is currently missing. See `docs/AGENT-HARDENING.md`.
+  **The general lesson, and it is why no new rules were written in response:
+  an enforcement layer must prove it enforces before anything is written that
+  depends on it.** A guard's fail-closed logic lives inside the guard, which is
+  no protection at all against the guard never being run.
 - **Enumerate paths; never stage by wildcard.** `git add <path> [<path>…]`,
   after reading `git status --porcelain`. `git add -A` once swept three agent
   worktrees in as embedded git repos, and pushed them.
