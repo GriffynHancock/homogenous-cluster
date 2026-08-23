@@ -81,8 +81,23 @@ def test_sentence_spans_empty():
 
 def test_splitter_name_is_recorded():
     """Which splitter ran must be visible; a silent swap changes what
-    'sentence 3' means between runs."""
-    assert audit.splitter_name() in {"nltk-punkt", "regex-fallback"}
+    'sentence 3' means between runs -- and F48 measured the two rungs 4x
+    apart on legislative marker rate, so it changes the NUMBER too."""
+    assert audit.splitter_name() in {"nupunkt", "regex-fallback"}
+
+
+def test_audit_does_not_define_its_own_splitter():
+    """F48: `_SENT_FALLBACK` existed as two identical copies in two modules,
+    with two contradicting docstrings. One primitive, one definition -- and
+    `audit.sentence_spans` must be that same object, not a same-shaped
+    reimplementation that can drift."""
+    from missing_link import chunk_boundary_audit as cba
+    from missing_link import sentences
+
+    assert audit._SENT_FALLBACK is sentences._SENT_FALLBACK
+    assert cba._SENT_FALLBACK is sentences._SENT_FALLBACK
+    assert audit.sentence_spans is sentences.sentence_spans
+    assert cba.sentence_spans is sentences.sentence_spans
 
 
 # ---------------------------------------------------------------------------

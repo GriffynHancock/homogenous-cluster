@@ -26,12 +26,11 @@ METHOD
 ------
 For each real document, at each of several chunk sizes:
   1. Run the REAL `worker.chunk_spans` (imported, not reimplemented).
-  2. Split the document into sentences with a dependency-free regex (the same
-     shape as `audit.py`'s `_SENT_FALLBACK`, used unconditionally here rather
-     than `audit.py`'s nltk-preferring `sentence_spans` -- F41 confirmed nltk
-     degenerates on real material (9.1% garbage fragments) and the production
-     venv has no nltk anyway, so this is the splitter that actually runs in
-     production).
+  2. Split the document into sentences with `missing_link.sentences.
+     sentence_spans` -- the single shared splitter, nupunkt if installed and
+     the regex fallback if not. Which one ran is recorded in this module's
+     JSON output under `sentence_splitter`, and it MATTERS: F48 measured the
+     two disagreeing 4x on legislative marker rate.
   3. For each chunk's END offset (the only real internal cut point produced
      by a stride-and-overlap chunker -- see chunk_spans' own docstring), ask:
        - does it fall STRICTLY INSIDE a detected sentence? (n_midsentence)
@@ -47,12 +46,18 @@ found (retention-plus-disjunction, exemption-plus-carve-out,
 obligation-plus-condition): "unless", "except", "provided that", "or until",
 "whichever is later/earlier", "subject to", "other than", "apart from".
 
-KNOWN INSTRUMENT LIMITATION, sanity-checked rather than assumed away: on
+KNOWN INSTRUMENT LIMITATION -- ON THE REGEX RUNG ONLY, AND THIS IS WHY THE
+RUNG THAT RAN IS REPORTED. Sanity-checked rather than assumed away: on
 hard-line-wrapped, PDF-extracted prose, the regex fallback's non-punctuated
 branch (`\\S[^.!?\\n]*$`) treats each un-punctuated LINE as its own pseudo-
 "sentence" (chunking-research.md section 4 already warned a bare `\\n` is not
 a real boundary; this is that warning manifesting inside the sentence
-splitter itself, not just in `snap_boundaries`). That means:
+splitter itself, not just in `snap_boundaries`). F45 is the measurement of it
+and F48 is the fix: on the ISM PDF, short fragments fall from 52.4% to 3.5%
+under nupunkt, and no nupunkt unit lacks terminal punctuation at all (0.0%).
+The checks below are kept anyway, because they are also how a reader
+distinguishes a run that had nupunkt from a run that silently did not.
+On the regex rung that means:
   - "midsentence" can be measured on a LINE FRAGMENT rather than a true
     clause, inflating word-position matches that aren't real multi-clause
     sentences (see `false_positive_check_boundary_detections` below).
@@ -74,25 +79,20 @@ import sys
 
 from missing_link import worker
 
-# --- sentence splitter: dependency-free, same shape as audit.py's
-# _SENT_FALLBACK, used unconditionally (see module docstring for why). ------
-_SENT_FALLBACK = re.compile(r"[^.!?\n]*[.!?]+[\"')\]]*|\S[^.!?\n]*$", re.MULTILINE)
-
-
-def sentence_spans(text):
-    """[(start, end, sentence_text)] with true character offsets into `text`."""
-    if not text or not text.strip():
-        return []
-    out = []
-    for m in _SENT_FALLBACK.finditer(text):
-        s, e = m.start(), m.end()
-        frag = text[s:e]
-        stripped = frag.strip()
-        if not stripped:
-            continue
-        lead = len(frag) - len(frag.lstrip())
-        out.append((s + lead, s + lead + len(stripped), stripped))
-    return out
+# --- sentence splitter -----------------------------------------------------
+# This module used to carry its OWN copy of `_SENT_FALLBACK`, byte-identical to
+# `audit.py`'s and used unconditionally, on the reasoning that the regex was
+# "the splitter that actually runs in production". That reasoning was right
+# about production and wrong about the instrument: F45 measured the regex
+# inflating the sentence denominator with structural fragments on exactly the
+# legislative material this module is pointed at, and F48 replaced it.
+# Both copies are gone; `missing_link.sentences` is the only one left, and it
+# reports which rung ran.
+from missing_link.sentences import (  # noqa: E402,F401 (re-exported on purpose)
+    _SENT_FALLBACK,
+    sentence_spans,
+    splitter_name,
+)
 
 
 def sentence_covering(spans, pos):
@@ -285,12 +285,20 @@ def marker_density(text):
     """Of every well-formed sentence anywhere in `text`, what fraction carry
     a qualifying marker? Context stat -- tells us whether a near-zero
     boundary count reflects sparse boundaries landing on markers, or markers
-    simply being rare in the document to begin with."""
+    simply being rare in the document to begin with.
+
+    Returns the SPLITTER alongside the rate, because the rate is a property of
+    the pair. F48 measured 2.85% and 10.53% for the same Privacy Act text
+    under the two rungs; a stored 2.85% with no instrument attached is not a
+    weaker number, it is an unreadable one. `corpus.profile` carries this
+    straight into the `corpus_documents` row.
+    """
     spans = sentence_spans(text)
     n = len(spans)
     n_marked = sum(1 for s, e, t in spans if find_markers(t))
     return {"n_sentences": n, "n_with_marker": n_marked,
-            "rate": round(n_marked / max(1, n), 4)}
+            "rate": round(n_marked / max(1, n), 4),
+            "splitter": sentence_spans.last_splitter}
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +344,14 @@ def main(argv=None):
     for d in docs:
         print(f"  job={d['job_id']} chars={d['chars']}", file=sys.stderr)
 
+    # Stamp the instrument on the output BEFORE running it. Every figure in
+    # docs/chunk-boundary-measurement.md was produced by the regex rung and is
+    # not comparable with a nupunkt run (F48); a JSON blob that does not say
+    # which one it came from is the ambiguity F45 is about.
+    splitter = splitter_name()
+    print(f"sentence splitter: {splitter}", file=sys.stderr)
     out = {"marker_patterns": MARKER_PATTERNS, "chunk_sizes_tokens": list(chunk_sizes),
+           "sentence_splitter": splitter,
            "documents": [{"job_id": d["job_id"], "chars": d["chars"]} for d in docs],
            "per_document": {}}
 

@@ -42,12 +42,21 @@ def test_find_markers_deduplicates_and_lowercases():
 
 
 # ---------------------------------------------------------------------------
-# Sentence splitter -- must match audit.py's own regex-fallback shape, since
-# the whole point is to use "the dependency-free splitter already in the
-# codebase" rather than a new, divergent one.
+# Sentence splitter -- this module and audit.py must use the SAME ONE. They
+# used to carry two byte-identical copies of the fallback regex with two
+# contradicting docstrings (F48); the assertion below is that they are now one
+# object, not two that happen to agree on the test string.
 # ---------------------------------------------------------------------------
 
-def test_sentence_splitter_matches_audit_regex_fallback_shape():
+def test_sentence_splitter_is_the_same_object_as_audits():
+    from missing_link import sentences
+    assert cba.sentence_spans is audit.sentence_spans is sentences.sentence_spans
+    assert cba._SENT_FALLBACK is audit._SENT_FALLBACK
+
+
+def test_regex_rung_still_matches_the_fallback_regex_shape(regex_splitter):
+    """The fallback rung must remain exactly what it always was, so a
+    deliberately-pinned re-run of an old measurement reproduces it."""
     text = "First sentence. Second sentence! Third one? Trailing fragment"
     ours = [t for _, _, t in cba.sentence_spans(text)]
     theirs = [text[s:e].strip() for s, e in
@@ -233,13 +242,24 @@ def test_false_positive_check_empty_pool():
 # clean_boundary_linewrap_check -- the false-negative-risk self-check
 # ---------------------------------------------------------------------------
 
-def test_clean_boundary_linewrap_check_flags_marker_adjacent_bare_linewrap():
-    """Construct a hard-wrapped document where a clause and its "unless"
-    exception sit on two different LINES with no period between them (so the
-    dependency-free splitter treats them as two separate fragments, and a
-    boundary landing exactly between the lines would be reported "clean"
-    despite actually severing the pair). This is the false-negative shape
-    the check exists to catch."""
+def _linewrap_document():
+    """A clause and its "unless" exception on two different LINES with no
+    period between them -- the PDF hard-wrap shape, built by hand."""
+    lead = _filler(30)
+    line1 = "records must be retained for the full statutory period\n"
+    line2 = "unless the subject requests earlier deletion in writing.\n"
+    tail = _filler(30, tag="tail")
+    return f"{lead}.\n{line1}{line2}{tail}."
+
+
+def test_clean_boundary_linewrap_check_flags_marker_adjacent_bare_linewrap(
+        regex_splitter):
+    """On the REGEX rung, the two lines are two separate fragments, so a
+    boundary landing exactly between them is reported "clean" despite
+    actually severing the pair. This is the false-negative shape the check
+    exists to catch, and it is pinned to the rung that has it: F48 replaced
+    the default rung precisely because nupunkt does not make this mistake
+    (see the companion test below)."""
     lead = _filler(30)
     line1 = "records must be retained for the full statutory period\n"
     line2 = "unless the subject requests earlier deletion in writing.\n"
@@ -262,6 +282,39 @@ def test_clean_boundary_linewrap_check_flags_marker_adjacent_bare_linewrap():
     assert found_marker_adjacent, (
         "expected at least one chunk size to land a boundary at the bare "
         "line-wrap immediately before the 'unless' clause")
+
+
+def test_nupunkt_does_not_split_on_the_bare_linewrap(nupunkt_splitter):
+    """The F48 claim, asserted on the same hand-built document as the test
+    above rather than taken from the audit's prose.
+
+    The regex rung sees two fragments across the hard wrap; nupunkt sees one
+    sentence, so the clause and its "unless" exception stay together and a
+    cut between them is correctly MID-SENTENCE rather than "clean". That is
+    the PDF hard-wrap manifestation of F45 disappearing.
+    """
+    text = _linewrap_document()
+    marker_line = "unless the subject requests earlier deletion in writing."
+    pos = text.index(marker_line)
+
+    spans = cba.sentence_spans(text)
+    covering = cba.sentence_covering(spans, pos)
+    assert covering is not None, "the 'unless' clause must sit inside a sentence"
+    # The retained-period clause and its exception are ONE unit, so the
+    # sentence containing the marker starts before the line break.
+    assert covering[0] < pos
+    assert "must be retained for the full statutory period" in covering[2]
+    assert "unless" in covering[2]
+
+    # ...and the regex rung is what produces the opposite, on the same text.
+    import os
+    os.environ["MISSING_LINK_SPLITTER"] = "regex"
+    try:
+        regex_cov = cba.sentence_covering(cba.sentence_spans(text), pos)
+    finally:
+        os.environ["MISSING_LINK_SPLITTER"] = "nupunkt"
+    assert regex_cov is not None
+    assert regex_cov[0] == pos, "regex rung starts a new fragment at the wrap"
 
 
 def test_clean_boundary_linewrap_check_zero_on_short_document():

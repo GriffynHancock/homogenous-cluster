@@ -63,7 +63,11 @@
   <code>unless / except / provided that / or until / whichever later / subject to /
   other than / apart from</code> — the single number that says whether a document
   can speak to the severed-clause question (measured: 15.4% on legal-styled text
-  vs 0.03% on narrative prose).
+  vs 0.03% on narrative prose). It is a property of the document
+  <em>and the sentence splitter</em>: F48 measured the same Privacy Act text at
+  2.85% under the old regex and 10.53% under <code>nupunkt</code>, so any row
+  not marked <code>nupunkt</code> carries a badge and must not be compared with
+  one that is.
   <em>Numbers/1k</em> is checkable figures per 1000 words; a document with none
   cannot exercise the faithfulness cascade's hard number tier.
   A document whose text was not taken verbatim from the upload — currently
@@ -96,7 +100,12 @@
       <td>{{ "{:,}".format(d.n_words) }}</td>
       <td>{{ d.n_chunks }}</td>
       <td>{{ "%.2f"|format(d.marker_rate * 100) }}%<br>
-        <span style="font-size:.7rem;color:var(--mut)">{{ d.n_marker_sentences }} / {{ d.n_sentences }} sentences</span></td>
+        <span style="font-size:.7rem;color:var(--mut)">{{ d.n_marker_sentences }} / {{ d.n_sentences }} sentences</span>
+        {%- if d.sentence_splitter != "nupunkt" %}
+        <br><span class="badge" style="font-size:.65rem;background:var(--bg);
+          border:1px solid var(--line);color:var(--mut)"
+          title="{% if d.sentence_splitter %}measured with the {{ d.sentence_splitter }} sentence splitter{% else %}profiled before the splitter was recorded{% endif %} - not comparable with a nupunkt row (F48 measured the two 4x apart on legislative text). Re-profile with missing_link/reprofile_corpus.py"
+          >{{ d.sentence_splitter or "splitter unknown" }}</span>{% endif %}</td>
       <td>{{ "%.1f"|format(d.numbers_per_1k_words) }}<br>
         <span style="font-size:.7rem;color:var(--mut)">{{ d.n_numbers }} total</span></td>
       <td><code style="font-size:.7rem">{{ d.sha256[:16] }}…</code><br>

@@ -349,3 +349,45 @@ def test_upload_with_no_files_is_refused(webclient):
                        files=[("files", ("", b"", "text/plain"))])
     assert r.status_code == 422
     assert webclient.get("/api/corpus").json() == []
+
+
+# --- provenance: which splitter produced marker_rate -------------------------
+
+def test_profile_records_the_splitter_that_produced_the_rate():
+    """F45/F48: the rate is a property of the document AND the instrument.
+    A row that does not name its instrument cannot be compared with one that
+    names a different one."""
+    p = corpus.profile(LONG_LEGISLATIVE)
+    assert p["sentence_splitter"] in {"nupunkt", "regex-fallback"}
+    assert p["sentence_splitter"] == \
+        chunk_boundary_audit.marker_density(LONG_LEGISLATIVE)["splitter"]
+
+
+def test_corpus_page_badges_a_row_whose_splitter_is_not_nupunkt(webclient):
+    """The live store's existing rows predate the column and read NULL. The
+    page must SAY SO rather than render their marker_rate beside a nupunkt
+    row as though the two were on one scale -- that is exactly the mistake
+    F45 is a record of."""
+    live = os.environ["MISSING_LINK_DB"]     # the page's own db, not `dbpath`
+    db.add_corpus_document(live, {
+        "filename": "legacy_row.html", "genre": "legislative", "status": "ready",
+        "text": LONG_LEGISLATIVE, "sha256": "cafe", "text_sha256": "beef",
+        "n_bytes": 10, "n_chars": 10, "n_words": 10, "n_chunks": 2,
+        "chunk_tokens": 4096, "n_sentences": 8455, "n_marker_sentences": 241,
+        "marker_rate": 0.0285, "n_numbers": 1, "numbers_per_1k_words": 1.0,
+        "sentence_splitter": None,          # the legacy case
+    })
+    body = webclient.get("/corpus").text
+    assert "legacy_row.html" in body
+    assert "splitter unknown" in body
+
+    db.add_corpus_document(live, {
+        "filename": "regex_row.html", "genre": "legislative", "status": "ready",
+        "text": LONG_LEGISLATIVE, "sha256": "f00d", "text_sha256": "d00d",
+        "n_bytes": 10, "n_chars": 10, "n_words": 10, "n_chunks": 2,
+        "chunk_tokens": 4096, "n_sentences": 8455, "n_marker_sentences": 241,
+        "marker_rate": 0.0285, "n_numbers": 1, "numbers_per_1k_words": 1.0,
+        "sentence_splitter": "regex-fallback",
+    })
+    body = webclient.get("/corpus").text
+    assert "regex-fallback" in body

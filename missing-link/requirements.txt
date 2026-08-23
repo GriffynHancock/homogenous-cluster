@@ -17,3 +17,20 @@ python-multipart==0.0.32
 # which turned every PDF into mojibake that was then summarised and stored as a
 # successful job. See missing_link/extract.py.
 pypdf==6.16.1
+
+# Sentence segmentation -- a LEGAL-DOMAIN Punkt variant (ALEA Institute, MIT).
+# Adopted on measurement, not on reputation: F48 ran five candidate splitters
+# against the real corpus in the job store and pysbd -- the obvious choice,
+# peer-reviewed, 97.92% Golden Rules -- scored WORSE than the regex it would
+# have replaced (2.76% vs 2.85% marker density) and took 133.94 s to do it.
+# nupunkt cut structural fragments 65.0% -> 12.3% and restored the genre
+# separation F45 lost. See missing_link/sentences.py.
+#
+# It is the only entry in this file that is OPTIONAL: missing_link.sentences
+# falls back to a dependency-free regex and says so loudly. Leaving it out
+# does not break the pipeline, it invalidates the numbers.
+#
+# ZERO transitive dependencies, model bundled in the wheel, nothing fetched at
+# first use (verified in a network namespace with no interfaces). REQUIRES
+# PYTHON >= 3.11; nodes 1 and 2 are on 3.11.2, exactly on the line.
+nupunkt==0.6.0

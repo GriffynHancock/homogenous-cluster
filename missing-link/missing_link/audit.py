@@ -89,6 +89,15 @@ import sys
 import time
 from datetime import datetime, timezone
 
+# The sentence splitter lives in ONE module now (F48). `sentence_spans` and
+# `splitter_name` are re-exported here unchanged, because `audit.sentence_spans`
+# is the name the ledger, the cascade and three test modules already call.
+from missing_link.sentences import (  # noqa: F401  (re-exported on purpose)
+    _SENT_FALLBACK,
+    sentence_spans,
+    splitter_name,
+)
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -165,49 +174,16 @@ def line_of(text, offset):
     return text.count("\n", 0, offset) + 1
 
 
-_SENT_FALLBACK = re.compile(r"[^.!?\n]*[.!?]+[\"')\]]*|\S[^.!?\n]*$", re.MULTILINE)
-
-
-def sentence_spans(text):
-    """[(start, end, sentence)] with TRUE offsets into `text`.
-
-    Prefers nltk's Punkt tokenizer -- the same splitter MiniCheck itself uses,
-    so the claim units this module scores line up with the units MiniCheck
-    reasons about. Falls back to a regex when nltk is absent (the production
-    venv has no nltk), and the ledger records WHICH was used under
-    `config.sentence_splitter`, because a silently different splitter would
-    change what "sentence 3" means between two runs.
-    """
-    if not text or not text.strip():
-        return []
-    try:
-        import nltk.data  # noqa: F401
-        from nltk.tokenize import PunktTokenizer
-
-        spans = list(PunktTokenizer("english").span_tokenize(text))
-        splitter = "nltk-punkt"
-    except Exception:
-        spans = [(m.start(), m.end()) for m in _SENT_FALLBACK.finditer(text)]
-        splitter = "regex-fallback"
-    out = []
-    for s, e in spans:
-        frag = text[s:e]
-        stripped = frag.strip()
-        if not stripped:
-            continue
-        lead = len(frag) - len(frag.lstrip())
-        out.append((s + lead, s + lead + len(stripped), stripped))
-    sentence_spans.last_splitter = splitter
-    return out
-
-
-sentence_spans.last_splitter = "unknown"
-
-
-def splitter_name():
-    """Which sentence splitter is actually available in this interpreter."""
-    sentence_spans("Probe sentence.")
-    return sentence_spans.last_splitter
+# `sentence_spans`, `splitter_name` and `_SENT_FALLBACK` used to be defined
+# HERE, and a byte-identical `_SENT_FALLBACK` was defined a second time in
+# `chunk_boundary_audit.py` with a contradicting docstring. F48 found the pair;
+# both now come from `missing_link.sentences`, imported at the top of this
+# module. The ladder there is nupunkt -> regex; the nltk rung this module used
+# to prefer is gone, because its only rationale was lining up with MiniCheck's
+# own tokenizer and F41 took the classifier tier off the table. What ran is
+# still reported under `config.sentence_splitter` in every ledger, and it is
+# now MORE load-bearing, not less: nupunkt and the regex disagree by 4x on
+# legislative marker rate, so a number without its splitter name is unreadable.
 
 
 # ---------------------------------------------------------------------------

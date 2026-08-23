@@ -1206,6 +1206,18 @@ _CORPUS_NEW_COLUMNS = [
     # because "unknown" and "plain" are different claims and conflating them
     # would misrepresent old rows as verified passthrough.
     ("extraction_method", "TEXT"),
+    # "nupunkt" | "regex-fallback" -- which sentence splitter produced
+    # n_sentences / n_marker_sentences / marker_rate on this row. F48 measured
+    # the two disagreeing by 4x on legislative marker_rate (2.85% -> 10.53%),
+    # so those three figures are a property of the document AND the
+    # instrument, and a corpus sorted on marker_rate across a mixed-instrument
+    # table sorts on nothing. NULL for every row written before this column
+    # existed; those predate nupunkt and so came from the regex rung, but they
+    # are left NULL rather than backfilled, on the same reasoning as
+    # extraction_method above -- "unknown" and "regex-fallback" are different
+    # claims. `missing_link/reprofile_corpus.py` is what fills them in, and it
+    # refuses to run on the wrong splitter rather than quietly relabelling.
+    ("sentence_splitter", "TEXT"),
 ]
 
 
@@ -1247,7 +1259,7 @@ _CORPUS_FIELDS = (
     "filename", "genre", "status", "error", "text", "note", "sha256",
     "text_sha256", "n_bytes", "n_chars", "n_words", "n_chunks", "chunk_tokens",
     "n_sentences", "n_marker_sentences", "marker_rate", "n_numbers",
-    "numbers_per_1k_words", "extraction_method",
+    "numbers_per_1k_words", "extraction_method", "sentence_splitter",
 )
 
 

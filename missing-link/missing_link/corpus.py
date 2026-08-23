@@ -34,9 +34,11 @@ can never quietly disagree with the thing it is predicting:
     counts in, so n_words and n_chunks are commensurable;
   - **clause-marker density** from `chunk_boundary_audit.marker_density`,
     which carries the marker list and the sentence splitter that the boundary
-    measurement itself used (F41: the dependency-free regex fallback, not
-    nltk, because nltk degenerates on real material and the production venv
-    does not have it anyway);
+    measurement itself used -- now `missing_link.sentences`, nupunkt if
+    installed and the regex fallback if not, with the name of whichever ran
+    stored on the row as `sentence_splitter` (F45/F48: this rate is a
+    property of the document AND the instrument, and rows profiled under
+    different instruments are not comparable);
   - **numeric density** from `cascade.extract_numbers`, the same scanner the
     faithfulness cascade's HARD tier keys on.
 
@@ -138,6 +140,14 @@ def profile(text, chunk_tokens=None, overlap_tokens=None):
         "n_sentences": density["n_sentences"],
         "n_marker_sentences": density["n_with_marker"],
         "marker_rate": density["rate"],
+        # Which splitter produced the three figures above. NOT decoration:
+        # F48 measured nupunkt and the regex fallback disagreeing 4x on
+        # legislative marker_rate, so two rows profiled under different
+        # instruments are not two points on one scale (F45's actual finding).
+        # NULL on rows written before this column existed -- those came from
+        # the regex rung, but "unknown" and "regex-fallback" are different
+        # claims and backfilling would assert a provenance nobody verified.
+        "sentence_splitter": density["splitter"],
         "n_numbers": n_numbers,
         "numbers_per_1k_words": round(1000.0 * n_numbers / n_words, 2) if n_words else 0.0,
     }

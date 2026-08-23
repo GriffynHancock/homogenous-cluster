@@ -139,12 +139,20 @@ def test_html_extraction_does_not_flatten_all_whitespace_to_single_spaces():
 
 # --- 2. Measured improvement: marker density and numeric density -----------
 
-def test_html_extraction_measurably_improves_marker_and_numeric_density():
+def test_html_extraction_measurably_improves_marker_and_numeric_density(
+        regex_splitter):
     """The headline comparison: what the OLD code path (decode raw bytes,
     treat as plain text, markup intact) measured vs. what HTML extraction
     measures on the identical document. This is not just "looks better" --
     the old numbers include garbage manufactured by markup, and the new ones
     do not.
+
+    PINNED TO THE REGEX RUNG, because the sentence-count half of this claim
+    is a statement about that rung specifically: it is markup lines entering
+    the denominator (F45's second manifestation, 0.1176 -> 0.0455). nupunkt
+    does not make that mistake, and distorts raw markup in the OTHER
+    direction instead -- see the companion test below. The numeric half is
+    splitter-independent and is asserted on both.
     """
     raw = LEGIS_HTML.encode("utf-8")
 
@@ -177,6 +185,42 @@ def test_html_extraction_measurably_improves_marker_and_numeric_density():
     # Numeric density: stripping markup must not manufacture new numbers, and
     # must remove at least the CSS-derived ones counted above.
     assert len(new_numbers) < len(old_numbers)
+
+
+def test_raw_markup_still_measures_wrong_under_nupunkt(nupunkt_splitter):
+    """Adopting nupunkt does NOT make HTML extraction optional -- observed,
+    not assumed.
+
+    F45 recorded raw markup DEFLATING marker rate (0.1176 -> 0.0455) because
+    the regex fallback counted every tag line as a pseudo-sentence. On this
+    fixture nupunkt inverts that rather than removing it: with almost no
+    terminal punctuation in the markup it merges the tag soup into a couple
+    of very long units, so the raw-markup rate comes out HIGHER than the
+    cleaned text's. Either way the number measured on raw markup is not the
+    document's number, which is the only thing this test asserts. It is a
+    small synthetic fixture, so treat the direction as observed here, not as
+    a corpus-wide measurement.
+    """
+    raw = LEGIS_HTML.encode("utf-8")
+    old_text = raw.decode("utf-8", errors="replace")
+    new_text, method = extract.extract_with_method(raw, "act.html")
+    assert method == "html"
+
+    old_density = chunk_boundary_audit.marker_density(old_text)
+    new_density = chunk_boundary_audit.marker_density(new_text)
+    assert old_density["splitter"] == new_density["splitter"] == "nupunkt"
+
+    # Same markers, same document, materially different answer.
+    assert old_density["rate"] != new_density["rate"]
+    # The cleaned text yields more real sentence units than the tag soup does,
+    # which is the opposite of the regex rung's failure and equally wrong to
+    # measure on.
+    assert new_density["n_sentences"] > old_density["n_sentences"]
+
+    # The numeric half of the argument is splitter-independent and unchanged.
+    old_number_texts = {n.text for n in cascade.extract_numbers(old_text)}
+    new_number_texts = {n.text for n in cascade.extract_numbers(new_text)}
+    assert "222" in old_number_texts and "222" not in new_number_texts
 
 
 # --- 3. Detection rule: content-based, and its false-positive behaviour ----
