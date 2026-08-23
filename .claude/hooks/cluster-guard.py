@@ -90,6 +90,11 @@ MUTATING_SQL = re.compile(
     re.IGNORECASE,
 )
 
+# Names a Python program uses to say WHICH database it means on the command
+# line. If one of these is present and does not resolve to the live store, the
+# program is pointed somewhere else and the live-store rules do not apply.
+DB_CLI_FLAGS = ("--db", "--database", "--db-path", "--jobs-db")
+
 CONFIRM_TOKEN = re.compile(r"\bCLUSTER_OPS_CONFIRMED=1\b")
 
 NON_PROMPTABLE_MODES = {"bypassPermissions", "dontAsk"}
@@ -329,8 +334,297 @@ def touches(paths, prefix):
     return any(p == prefix or p.startswith(prefix.rstrip("/") + "/") for p in paths)
 
 
-def mentions_db(strings):
-    return any(DB_PATH in s or "MISSING_LINK_DB" in s for s in strings)
+def same_file(a, b):
+    """True if two path strings name the same file, before or after creation."""
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:
+        return False
+
+
+def resolve(token, cwd):
+    """A path token as an absolute path, relative to the tracked cwd."""
+    if os.path.isabs(token):
+        return os.path.normpath(token)
+    return os.path.normpath(os.path.join(cwd or "", token))
+
+
+def looks_like_path(tok):
+    # Cheap filter so a SQL statement or a flag is not fed to realpath().
+    return bool(tok) and len(tok) < 400 and not tok.startswith("-") \
+        and not re.search(r"\s", tok)
+
+
+def mentions_db(strings, cwd=None):
+    """True if any token names the live job store.
+
+    The literal-substring test came first and is kept, because it also catches
+    `$MISSING_LINK_DB` and `file:<path>?mode=ro` forms. The realpath test was
+    added after F52: `cd /opt/missing-link && sqlite3 jobs.sqlite "DELETE ..."`
+    is the same operation spelled relatively, and the substring test allowed it.
+    """
+    for s in strings:
+        if DB_PATH in s or "MISSING_LINK_DB" in s:
+            return True
+        if cwd is not None and looks_like_path(s) and same_file(resolve(s, cwd), DB_PATH):
+            return True
+    return False
+
+
+# --- mutations reached through an interpreter (F52) -------------------------
+# A command-pattern rule cannot see `python -m missing_link.reprofile_corpus
+# --apply`, which issued 17 UPDATEs against the live job store while the guard
+# said nothing. Adding a regex for that one module would leave the general hole
+# open, so the rule below asks a PROPERTY of the program instead of matching a
+# spelling: resolve the module or script to a file on disk, and decide from its
+# source whether it can write the live store.
+#
+# Deliberate limits, so this stays a low-noise rule rather than a nuisance:
+#   * Only project-local code. A module that does not resolve inside the
+#     checkout (pytest, pip, uvicorn, anything in site-packages) is left alone.
+#   * ENTRY FILE ONLY -- no transitive import walk. Intent lives in the program
+#     you invoked; a wrapper that hides its writes in a helper is the residual
+#     gap and is documented as such in docs/AGENT-HARDENING.md.
+#   * Silence when undecidable. Unreadable, unparseable or unresolvable means NO
+#     DECISION, not a block -- the same trade the python-syntax rule makes when
+#     it sees a `$`. A rule that fires on uncertainty gets the guard disabled.
+
+def _project_roots(cwd):
+    """Directories a `python -m <mod>` could resolve against, best first."""
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    roots, seen = [], set()
+    for base in (cwd, os.environ.get("CLAUDE_PROJECT_DIR"), here, LIVE_CHECKOUT):
+        if not base:
+            continue
+        for cand in (base, os.path.join(base, "missing-link"),
+                     os.path.join(base, "bench"), os.path.dirname(base)):
+            cand = os.path.normpath(cand)
+            if cand not in seen and os.path.isdir(cand):
+                seen.add(cand)
+                roots.append(cand)
+    return roots
+
+
+def resolve_python_target(args, cwd):
+    """(source_path, label) for the program `python ...` is about to run.
+
+    Handles `-m package.module` and a positional `script.py`. Returns
+    (None, None) for `-c`, stdin, and anything not found in the checkout.
+    """
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "-m" and i + 1 < len(args):
+            mod = args[i + 1]
+            rel = mod.replace(".", os.sep)
+            for root in _project_roots(cwd):
+                for cand in (os.path.join(root, rel + ".py"),
+                             os.path.join(root, rel, "__init__.py")):
+                    if os.path.isfile(cand):
+                        return cand, "-m " + mod
+            return None, None
+        if a in ("-c", "-"):
+            return None, None
+        if a.startswith("-"):
+            i += 1
+            continue
+        if a.endswith(".py"):
+            p = resolve(a, cwd)
+            return (p, a) if os.path.isfile(p) else (None, None)
+        return None, None
+    return None, None
+
+
+def db_writer_names(cwd):
+    """Function names in missing_link/db.py whose bodies mutate the database.
+
+    Derived by parsing db.py rather than hard-coded, so the rule tracks the db
+    layer instead of drifting away from it the first time someone adds a
+    writer. Returns an empty set if db.py cannot be found or parsed, which
+    simply means this signal contributes nothing.
+    """
+    src = path = None
+    for root in _project_roots(cwd):
+        cand = os.path.join(root, "missing_link", "db.py")
+        if os.path.isfile(cand):
+            path = cand
+            break
+    if not path:
+        return set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+        import ast
+        tree = ast.parse(src)
+    except Exception:
+        return set()
+    # Module-level constants holding DDL/DML (TABLE_SCHEMA, CHUNK_SCHEMA, ...).
+    ddl_consts = set()
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str) and MUTATING_SQL.search(node.value.value):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    ddl_consts.add(t.id)
+    names = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        try:
+            import textwrap
+            # Dedent so first_mutating_sql() can parse the segment on its own
+            # and scan literals rather than falling back to raw text.
+            seg = textwrap.dedent(ast.get_source_segment(src, node) or "")
+        except Exception:
+            seg = ""
+        if first_mutating_sql(seg) or "executescript(" in seg \
+                or any(c in seg for c in ddl_consts):
+            names.add(node.name)
+    return names
+
+
+SQL_COMPANION = re.compile(r"\b(set|from|into|values|table|column|where)\b", re.IGNORECASE)
+
+
+def _sql_literals(src):
+    """Non-docstring string constants in `src`, best SQL candidate first.
+
+    SQL lives in string literals, so scan those rather than the raw source.
+    Two false leads this avoids, both found while testing this rule against
+    reprofile_corpus.py:
+      * the raw source matched the COMMENT "one UPDATE per row";
+      * the literals in source order matched the help text "and update
+        docs/chunk-boundary-measurement.md".
+    Both are true statements about the file and neither is the reason it is
+    being gated, and a guard whose stated evidence is wrong is a guard nobody
+    believes the third time. Literals that also carry a SQL companion keyword
+    are therefore ranked first. Returns [] if the source will not parse.
+    """
+    try:
+        import ast
+        tree = ast.parse(src)
+    except Exception:
+        return []
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef)) and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) \
+                    and isinstance(first.value.value, str):
+                docstrings.add(id(first.value))
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and id(node) not in docstrings:
+            out.append(node.value)
+    return out
+
+
+def first_mutating_sql(src):
+    """The first mutating statement in `src`, as a quotable string, or None.
+
+    A literal only counts when it reads as a statement rather than as prose
+    that happens to contain a verb: the match must start the literal, or be
+    written in the upper case SQL is written in here AND sit next to a
+    companion keyword. Without that test the guard reported
+    reprofile_corpus.py's help text -- "and update
+    docs/chunk-boundary-measurement.md from its output" -- as the reason it was
+    blocking a database write, which is exactly the kind of wrong-but-confident
+    message that gets a guard switched off.
+    """
+    lits = _sql_literals(src)
+    for lit in lits:
+        m = MUTATING_SQL.search(lit)
+        if not m:
+            continue
+        at_start = lit.lstrip().lower().startswith(m.group(0).split()[0].lower())
+        looks_sql = m.group(0)[:6].isupper() and bool(SQL_COMPANION.search(lit))
+        if at_start or looks_sql:
+            return " ".join(lit[m.start():].split())[:60]
+    if lits:
+        return None  # parsed cleanly and nothing read as a statement
+    m = MUTATING_SQL.search(src)  # unparseable source: fall back to raw text
+    return " ".join(m.group(0).split()) if m else None
+
+
+def source_writes_db(src, cwd, scoped):
+    """Why this Python source can write the live job store, or None.
+
+    `scoped` says the caller has already established that the live store is the
+    target (an explicit --db on the command line). Otherwise the source itself
+    must name it, so a script pointed at a scratch database is not gated.
+    """
+    # Scope: the LITERAL live path must appear, not merely the name of the env
+    # var that usually holds it. Half the test suite sets MISSING_LINK_DB to a
+    # tmp file, and gating those was the first false positive this rule
+    # produced.
+    if not scoped and DB_PATH not in src:
+        return None
+    stmt = first_mutating_sql(src)
+    if stmt:
+        return "it contains the statement `%s`" % stmt
+    writers = db_writer_names(cwd)
+    for name in sorted(writers):
+        if re.search(r"\b(?:db\s*\.\s*)?%s\s*\(" % re.escape(name), src):
+            return "it calls `db.%s()`, which db.py defines with a mutating " \
+                   "statement" % name
+    return None
+
+
+DB_WRITE_ADVICE = (
+    "If this program really is the migration, say so and run it with the "
+    "operator's agreement. Whatever runs, the safeguards have to be IN THE "
+    "SCRIPT, because the hook cannot see a predicate: (1) refuse to start "
+    "unless the instrument/preconditions are what you think they are, (2) print "
+    "the row count the write will touch BEFORE writing it and stop on 0 or on "
+    "an unexpected number, (3) re-check a control value that must NOT move and "
+    "abort if it did. Those three are what actually protected the F52 run. "
+    "A dry-run mode that writes nothing should be the default."
+)
+
+
+def check_python_program(args, cwd, mode, text):
+    """GATE `python <project script>` / `python -m <project module>` that can
+    write the live job store. Silent on anything it cannot resolve."""
+    try:
+        path, label = resolve_python_target(args, cwd)
+        if not path:
+            return
+        # Tests are excluded by construction: conftest points every one of them
+        # at a tmp database, and several quote the live path in a comment about
+        # exactly that. Gating `pytest` is how this rule would get switched off.
+        parts = os.path.normpath(path).split(os.sep)
+        if "tests" in parts or os.path.basename(path).startswith("test_") \
+                or os.path.basename(path).endswith("_test.py"):
+            return
+        # An explicit --db elsewhere means the live store is not the target.
+        scoped = False
+        for i, a in enumerate(args):
+            flag, val = None, None
+            if a in DB_CLI_FLAGS and i + 1 < len(args):
+                flag, val = a, args[i + 1]
+            elif "=" in a and a.split("=", 1)[0] in DB_CLI_FLAGS:
+                flag, val = a.split("=", 1)[0], a.split("=", 1)[1]
+            if flag:
+                if mentions_db([val], cwd):
+                    scoped = True
+                else:
+                    return
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+        why = source_writes_db(src, cwd, scoped)
+    except Exception:
+        return  # undecidable -> no decision; see the note above this section
+    if not why:
+        return
+    gate(mode, "jobs-db-write",
+         "`python %s` runs %s, and %s. That is a write to the live job store "
+         "%s, reached through the interpreter -- the shape the guard MISSED on "
+         "2026-08-18 (F52), when `python -m missing_link.reprofile_corpus "
+         "--apply` issued 17 UPDATEs and no rule fired. %s"
+         % (label, os.path.relpath(path, cwd) if cwd else path, why, DB_PATH,
+            DB_WRITE_ADVICE), text)
 
 
 # --- rules -----------------------------------------------------------------
@@ -376,10 +670,27 @@ def check_segment(argv, redirs, text, body, mode, cwd):
 
     # -- inline Python that does not compile ---------------------------------
     if prog.startswith("python"):
+        inline = None
         if "-c" in args and args.index("-c") + 1 < len(args):
-            check_python_syntax(args[args.index("-c") + 1], "python -c snippet", text)
+            inline = args[args.index("-c") + 1]
+            check_python_syntax(inline, "python -c snippet", text)
         elif body:
+            inline = body
             check_python_syntax(body, "inline python heredoc", text)
+        if inline is not None:
+            # Source the guard can actually read: apply the same property test
+            # as for a resolved script. This catches `python -c "from
+            # missing_link import db; db.delete_corpus_document(...)"`, which
+            # the sqlite3.connect regex in check_bash does not see.
+            why = source_writes_db(inline, cwd, False)
+            if why:
+                gate(mode, "jobs-db-write",
+                     "This inline Python writes the live job store %s: %s. "
+                     "Reaching the store through the db layer instead of the "
+                     "sqlite3 CLI does not make it a different operation -- that "
+                     "is the F52 gap. %s" % (DB_PATH, why, DB_WRITE_ADVICE), text)
+        else:
+            check_python_program(args, cwd, mode, text)
 
     # -- git -----------------------------------------------------------------
     if prog == "git":
@@ -478,7 +789,7 @@ def check_segment(argv, redirs, text, body, mode, cwd):
                      % (prog, verb, " ".join(hit)), text)
 
     # -- the live jobs database ---------------------------------------------
-    if mentions_db(paths):
+    if mentions_db(paths, cwd):
         if prog in DESTRUCTIVE_FILE_CMDS or (prog == "mv" and len(args) >= 2):
             deny("jobs-db-clobber",
                  "`%s` against %s destroys the live job store -- queued, running and completed "
@@ -494,8 +805,8 @@ def check_segment(argv, redirs, text, body, mode, cwd):
                  "caught only because someone checked rowcount. Assert the row count before AND "
                  "after, in the same transaction." % DB_PATH, text)
         if prog == "sqlite3":
-            sql_args = [a for a in args if not a.startswith("-") and DB_PATH not in a
-                        and "MISSING_LINK_DB" not in a]
+            sql_args = [a for a in args if not a.startswith("-")
+                        and not mentions_db([a], cwd)]
             # A heredoc body IS visible to the guard (MUTATING_SQL scanned `text`
             # above), so only gate when the statements are genuinely invisible:
             # bare stdin, or `< file.sql`.
