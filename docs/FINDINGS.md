@@ -77,6 +77,7 @@ numbers are cited from other documents and must not move.
 | **F54** | ComfyUI is compute-bound the wrong way; n8n fits; and ComfyUI, n8n AND Missing Link all have no auth | CONFIRMED / REPORTED |
 | **F55** | The agent-hardening hooks have NEVER been enforced — and it corrects F52's diagnosis | CONFIRMED |
 | **F56** | The 2 → 3 transition found three MORE latent bugs, none about the username — and it corrects F53 | CONFIRMED |
+| **F57** | Distributing ComfyUI cannot help; nginx's 60 s default would kill every real request; corrects F54 on n8n | CONFIRMED / REPORTED |
 
 ---
 
@@ -3591,3 +3592,85 @@ a third machine.
   off` per minute and correctly does not restart anything (`NRestarts=0`).
 - **`setup.sh` asserts `THP: expected [madvise]` but all three nodes report
   `[always]`** — a stale assertion in the script, not a node-3 problem.
+
+---
+
+## F57. Distributing ComfyUI cannot help — and nginx's 60 s default would kill every real request on this fleet
+
+**CONFIRMED / REPORTED.** Whether ComfyUI and n8n can spread work across the
+now-three nodes, and what should sit in front of the `llama-server` endpoints.
+
+### ComfyUI: third-party only, and distribution does not change the verdict
+
+First-party multi-GPU **does** now exist (MultiGPU CFG Split, PR #7063) and the
+old forum consensus is out of date — but its own docs say "multiple GPUs
+**installed in the same system**", need matched Ampere+ pairs, and cap near
+1.95×. **No cross-machine path.** The maintainer's position is unchanged:
+*"ComfyUI does not provide a method to execute workflows in parallel"*. Of the
+third-party options only **SwarmUI** is both maintained and job-level;
+ComfyUI_NetDist has not been pushed since 2024-05-22, and **ComfyUI-Distributed
+fans out *seeds within one job*** — right for one user wanting four variations,
+**wrong for twenty students wanting twenty different things.**
+
+**The argument that settles it, and it is worth keeping as a general rule:
+distribution improves THROUGHPUT and cannot improve LATENCY**, because nothing
+maintained splits one CPU denoise across machines (xDiT/PipeFusion do, but are
+GPU-only and DiT-only). Three nodes take a class of 20 from ~3.3 h of SD1.5
+queue to ~1.1 h **while every student still waits the same ~10 minutes for their
+own image.**
+
+**And the configuration that actually rescues ComfyUI removes the problem
+entirely: 1-step turbo at ~30 s serves a class of 20 in ~10 minutes ON ONE
+NODE.** So distributing would spend replication factor R on an already-short
+queue and put F44's contention on three nodes instead of one. **One instance, on
+the non-inference node, turbo models, no distribution layer.**
+
+### n8n: yes, first-party, free on Community — and it CORRECTS F54
+
+Queue mode runs workers on separate machines; only **multi-main** is Enterprise.
+It needs **Redis + Postgres — SQLite is explicitly unsupported** for distributed
+— plus `N8N_ENCRYPTION_KEY` on every worker.
+
+**F54 (and `docs/n8n-feasibility.md`) said no concurrency control covers manual
+executions, which are the only kind a classroom generates. That is true only in
+regular mode.** `OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true` turns a
+Test-workflow click into a queue job, and `N8N_CONCURRENCY_PRODUCTION_LIMIT`
+then drives worker concurrency. **So the backpressure does exist.** Labelled
+INFERRED — it follows from two separate doc sentences rather than one statement
+— and flagged with two REPORTED bugs in that exact path (Python Code nodes
+hanging when offloaded; partial executions regressing after v1.100.1).
+**Sequence: single-process first, adopt queue mode for the specific failure it
+fixes.**
+
+### The load balancer: HAProxy, and two traps
+
+**nginx OSS is actively dangerous here at defaults.** `proxy_read_timeout`
+**defaults to 60 s, below this fleet's measured 77–99 s** for a ~1,300-token
+request — **so at stock settings it would kill every real request and then mark
+every healthy backend as failed.** Active `health_check` is commercial-only, and
+`proxy_buffering` defaults on, which would swallow SSE. **Keep nginx for the
+:80 directory page and basic auth; do not put it in the inference path
+unconfigured.**
+
+**Paddler is rejected, and the reason generalises.** It is the best-informed
+project in this space, but **from v2.0.0 it embeds its own llama.cpp engine**
+rather than proxying to `llama-server`. **Adopting it would swap the engine and
+invalidate every measurement taken on b10369** — the entire `docs/measurements.md`
+corpus. Only v1.x was a true proxy, and that is an abandoned 14–20-month-old
+architecture. **A tool that replaces the component you have measured is not a
+drop-in, however well it fits the description.**
+
+**Two operational points:**
+- **`--alias` becomes a CORRECTNESS requirement behind a balancer**, not
+  cosmetics: without it each backend advertises a different model id (the full
+  GGUF path) and clients see three different models. This is the same missing
+  flag the n8n survey found making the model dropdown render a filesystem path.
+- **`GET /slots` is enabled by default and reports progress** — precisely the
+  F36/F51 signal a port probe cannot give. A ~100-line `/slots`-aware dispatcher
+  is the architecturally correct answer; noted, not recommended for this term.
+
+**Cache locality does not matter for the class** (twenty students share no
+prefix) **but it does for Missing Link** — one more reason Missing Link stays on
+direct `LLAMA_URLS` and out of any balanced pool. **F54's "give the class its own
+endpoint" still wins: balancing students over the document endpoints spreads
+contention rather than creating capacity.**
