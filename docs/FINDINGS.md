@@ -69,6 +69,8 @@ numbers are cited from other documents and must not move.
 | **F48** | pysbd is worse than our regex; the legal-domain splitter nobody searched for fixes F45 | CONFIRMED |
 | **F49** | Whole-document single-pass is impossible at `n_ctx_slot=8192`; `WORDS_PER_TOKEN` is wrong by 2x and `/tokenize` is free | CONFIRMED |
 | **Addendum to F48** | Swap implemented; nupunkt INVERTS the raw-HTML manifestation, so HTML extraction stays load-bearing | CONFIRMED |
+| **F50** | The −47% and F14's −5% are both right; RPC's generation penalty scales with `n_vocab`, not model size | CONFIRMED |
+| **F51** | The watchdog makes large-model sharding impossible — a busy `rpc-server` refuses connections and gets restarted | CONFIRMED |
 
 ---
 
@@ -2981,3 +2983,111 @@ while the sharding benchmark held both nodes, then **disclosed it unprompted**
 with the exact window so the affected repetitions could be discarded. Under
 F44 that is a real perturbation. **A disclosed contention event is cheap; an
 undisclosed one silently corrupts a number that then gets quoted for months.**
+
+---
+
+## F50. The −47% and F14's −5% are BOTH right — RPC's generation penalty scales with `n_vocab`, not model size
+
+**CONFIRMED.** Two contradictory numbers for what RPC costs generation have sat
+in this repo unreconciled: F14's **−5%** and a **−47%** from a single short chat
+request. Both reproduce. **They measure different topologies, and the
+configuration that separates them had never been run.**
+
+Qwen3-4B Q4_K_M, `llama-bench -t 4 -p 512 -n 128 -r 5`, mainline b10369,
+binaries md5-identical on both nodes:
+
+| # | Topology | pp512 | tg128 | pp Δ | tg Δ |
+|---|---|---:|---:|---:|---:|
+| A | local CPU, no RPC | 32.18 ± 0.58 | 11.11 ± 0.12 | — | — |
+| B | whole model, **loopback** RPC | 19.60 ± 0.15 | 10.47 ± 0.09 | −39.1% | **−5.8%** |
+| C | whole model, **node 2 over LAN** | 19.71 ± 0.08 | 6.76 ± 0.01 | −38.8% | −39.2% |
+| D | two RPC devices, `-ts 1/1` | 19.07 ± 0.62 | 5.99 ± 0.06 | −40.7% | **−46.1%** |
+| E | local CPU + node 2, `-ngl 18` | 24.53 ± 0.11 | 5.78 ± 0.16 | **−23.8%** | −48.0% |
+
+**D is the smoke test's topology** (tg 5.99 against its 5.89) and **B is
+F14's** (−5.8%/−39.1% against F14's −5.2%/−39.4%). So the decomposition is the
+finding: **RPC protocol −5.8%, then the 100 Mb wire a further −35.4%, then the
+second device −11.4%.**
+
+### The mechanism, established by byte accounting rather than inference
+
+The device holding the **output layer** returns the full logit vector for every
+generated token: `n_vocab` 151936 × f32 = **593.5 KiB per token.** Predicted
++51.9 ms/token and 445 MiB received; **measured 52.4 ms and 443 MiB** — two
+independent quantities agreeing within 1%.
+
+**Prefill is immune for a structural reason:** a 512-token batch returns logits
+for the final position only, so the same wire costs prefill **+0.6%**.
+
+### This corrects a standing inference, and the correction is the actionable part
+
+`docs/measurements.md` guessed that a larger model would amortise the RPC
+penalty better. **It will not. The penalty scales with `n_vocab`, not with model
+size** — a bigger model does more compute per token while returning the *same*
+logit vector, so the wire cost is fixed overhead that never gets amortised away.
+Corrected in place.
+
+### Two configuration results worth keeping
+
+- **`--rpc <remote> -ngl <half>` beats `--rpc 127.0.0.1,<remote> -ts 1/1` by
+  29% on prefill** (config E vs D). **Never put a loopback `rpc-server` in the
+  path for the local shard** — the local CPU can serve its own half directly.
+- **Pinning the output tensor local with `-ot` to kill the logit traffic
+  collapses both metrics and DOUBLES traffic.** Recorded so it is not retried.
+
+### F44 validated incidentally, and it is a clean demonstration
+
+Config E's first sample overlapped a 64.5 s CPU-bound profiling pass on node 1
+(disclosed by the agent that ran it, see the addendum to F48). It was discarded
+and re-run rather than averaged in. **The contamination was visible in the
+variance, not the mean: pp512 22.63 ± 1.23 dirty against 24.53 ± 0.11 clean —
+an error bar 11× wider.** Configs A–D all completed before the window. **A
+widening error bar is the signature of a contended benchmark; a single run
+would have shown only a slightly wrong mean with no hint anything was wrong.**
+
+---
+
+## F51. The fleet watchdog makes large-model sharding IMPOSSIBLE — the safety system forbids the capability
+
+**CONFIRMED.** This is the third time the watchdog's own design has been
+corrected by running it (after F39 and F43), and it is the most serious.
+
+**`rpc-server` serves one client at a time and refuses connections while
+busy.** So during a shard upload its port refuses connections **for the entire
+duration of that upload** — ~54 min for half of gpt-oss-120b at the measured
+11.7 MB/s. The watchdog restarted it **9m41s in, at 5.4 GiB transferred**:
+
+```
+11:31:02 [node2 ... rpc] WEDGED: ... port has refused connections for 350s.
+         A worker that is not listening cannot be carrying shard work
+11:31:03 RESTARTING ... ANY IN-FLIGHT WORK ON 10.10.0.39:50052 DIED AT THIS TIMESTAMP.
+```
+
+**The premise in the watchdog's own log message is exactly inverted.** It was
+not listening *because* it was carrying shard work. The probe cannot distinguish
+"dead" from "busy with precisely the operation this cluster exists to perform",
+and it resolves the ambiguity in the direction that destroys the work.
+
+**Consequence, and it is a hard capability limit: any shard larger than ~4 GB on
+this link can never be loaded.** Qwen3-4B survived the A/B only because 1.3 GiB
+uploads in ~110 s, inside the 300 s grace — i.e. **F50's whole measurement was
+possible only because its model was small enough to sneak under the timer.**
+
+**This is the F36/F39 tension in its sharpest form yet.** F36 established that a
+liveness probe must test *progress*, not the process or the port; F39 showed a
+probe sharing the queue it measures kills healthy work. Here a **port** probe
+does the same thing to a different subsystem. **A port that refuses connections
+is not evidence of death when the service is single-client by design** — and no
+amount of tuning the 300 s grace fixes it, because the correct grace is a
+function of shard size and link speed, both unknown to the probe.
+
+**Not fixed, and deliberately not worked around.** Pausing the fleet's safety
+system is an operator decision, not an agent's. The options are a
+shard-upload-aware grace, an out-of-band signal from the loading coordinator,
+or probing progress (bytes transferred) rather than port acceptance — which is
+what F36 said in the first place.
+
+**Also found: a stale process from 2026-08-17 (PID 20659) loops forever**
+because its `pgrep -f auto-bench-gptoss` **self-matches its own command line** —
+the same pattern-matching hazard behind this project's standing "never `pkill
+-f`" rule, in its other form. Zero CPU, harmless, and it will never exit.
