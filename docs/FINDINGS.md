@@ -78,6 +78,7 @@ numbers are cited from other documents and must not move.
 | **F55** | The agent-hardening hooks have NEVER been enforced — and it corrects F52's diagnosis | CONFIRMED |
 | **F56** | The 2 → 3 transition found three MORE latent bugs, none about the username — and it corrects F53 | CONFIRMED |
 | **F57** | Distributing ComfyUI cannot help; nginx's 60 s default would kill every real request; corrects F54 on n8n | CONFIRMED / REPORTED |
+| **F58** | A token-budget formula decides the syllabus; a small model buys only ~2x; `--api-key` takes a LIST | CONFIRMED |
 
 ---
 
@@ -3674,3 +3675,102 @@ prefix) **but it does for Missing Link** — one more reason Missing Link stays 
 direct `LLAMA_URLS` and out of any balanced pool. **F54's "give the class its own
 endpoint" still wins: balancing students over the document endpoints spreads
 contention rather than creating capacity.**
+
+---
+
+## F58. A token-budget formula decides the whole teaching syllabus — and "just use a small model" buys far less than it sounds
+
+**CONFIRMED.** The cybersecurity lab design is done, and **the binding
+constraint turned out to be arithmetic, not security.**
+
+### The planning formula, which is the reusable part
+
+From `docs/measurements.md`:
+
+```
+node-seconds ≈ prompt_tokens / 16.6  +  generated_tokens / 9.7
+```
+
+**It reproduces `llama-batched-bench`'s own published totals exactly** (2048 /
+16.58 = 123.5 s, the prefill wall-time that table records; total 14.54 tok/s
+matches) and is ~10% pessimistic against the replication run.
+
+**So one node moves ~1,000 prompt tokens or ~580 generated tokens per minute.**
+A class of 20 in a 50-minute lab on one node gets **~2,500 prompt / ~1,450
+generated tokens per student — about four short calls each.**
+
+**That number, not the security content, decided the shape of every exercise.**
+The resolution is to **move generation into the overnight batch — the cluster's
+actual strength — and spend class time auditing what the model produced.** This
+formula should be reused for any future capacity question; it is the first
+general planning tool this project has derived from its own measurements.
+
+### It CORRECTS F54's own suggestion
+
+F54 suggested "a small model that fails visibly may be pedagogically better".
+**Measured on this fleet, that buys much less than it reads.** Qwen3-4B against
+gpt-oss-120b: **pp512 33.04 vs 16.03, pp2048 28.33 vs 15.88, tg128 11.49 vs
+6.05** — only **~1.8–2.1× prefill and ~1.9× generation for 1/29th the
+parameters.**
+
+**The mechanism: prefill is compute-bound on four cores regardless of model
+size.** Shrinking the model shrinks the bytes read per token, which helps
+generation; it does not give you more cores. A sub-1B model may do better but
+**nothing here has measured one** — that is one hour of `llama-bench` and it
+changes a lab's shape.
+
+### The `--api-key` finding closes the hole flagged in F54
+
+**`llama-server --api-key` takes a COMMA-SEPARATED LIST, and `--api-key-file`
+reads one per line** (confirmed from the on-disk b10369 README). **So per-group
+credentials on the inference endpoint exist today with no new software** — which
+directly addresses F54's item that `llama-server` on :8080 is unauthenticated on
+the LAN and that four students could starve `--parallel 4`. It is also the only
+attribution lever available, since Missing Link's gate is one shared secret.
+
+### Snapshot traps, one per tool, each of which silently produces a wrong restore
+
+- **The job store is in WAL mode.** **Copying the `.db` without `-wal`/`-shm`
+  restores a database that is not the one you think it is.** This is the
+  highest-consequence item here, because a reset script is exactly where it
+  would be written.
+- **n8n's `N8N_ENCRYPTION_KEY` must be set explicitly BEFORE first launch and
+  stored outside the snapshot**, or a restore returns every workflow and **zero
+  working credentials.**
+- **ComfyUI's `custom_nodes` must be a pinned `repo@commit` manifest, never a
+  tarball** — restoring a tarball can restore an attacker's node. The
+  deliberately-vulnerable lab VM is rebuilt from image unconditionally between
+  classes.
+
+### Two pedagogical results that are also real findings
+
+- **"Detect the AI" is an unreliable control with a discriminatory failure
+  mode.** The Stanford result that detectors misclassified **more than half of
+  TOEFL essays by non-native speakers as AI-generated**, one detector at ~98%.
+  Zero compute, and it is the sharpest "AI harms" moment in the set.
+- **The log-triage lab's lesson is that the LLM CANNOT read the data.** 2.6 M
+  synthetic alerts (AIT Alert Data Set, CC BY 4.0, line-level ground truth) must
+  be **deterministically reduced to <1,500 tokens first**, then the narrative
+  audited against the digest. Students then read `missing_link/cascade.py` — the
+  production version of the check they just wrote by hand. **That is this
+  project's core build rule taught as an exercise.**
+
+**Recommended first lab of the semester: "measuring an AI service from
+outside"** — built on F36/F39/F40/F51, costs no tokens, and teaches the
+shared-resource etiquette every other lab depends on. Its permissioned DoS
+demonstration (one oversized prompt degrades 19 students) is mitigated with
+per-group `--api-key` plus a `/tokenize` pre-flight — both of which now exist.
+
+**Rejected as not viable, with reasons:** deepfake video (F54 — out by one to
+two orders of magnitude, not merely slow); SDXL in class; standard 20-step SD1.5
+(overnight only); live OSINT against real people (guardrail, and no ground truth
+to grade); fine-tuning; in-class RAG; real-time SOC; and **`--parallel 8`, which
+is actively harmful** (prefill collapses 56%, total throughput 7.86 against
+batch 1's 11.50).
+
+**Licence items left open deliberately, following the Hansard precedent:**
+SpamAssassin's readme says *"copyright for the text in the messages remains with
+the original senders"* — **a fact, not a grant** — and the n8n licence grey edge
+still wants one email. **CPU-only voice cloning is entirely unestablished and is
+the highest-guardrail-risk modality if it turns out to work**; one timed
+10-second clip is the whole test.
