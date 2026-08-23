@@ -84,6 +84,7 @@ numbers are cited from other documents and must not move.
 | **Addendum to F59** | Suspend cause CONFIRMED (1200 s = the GNOME idle timeout); the fix had been hand-applied twice and never propagated | CONFIRMED |
 | **F61** | n8n's `Execute Command` is disabled by default; the LLM is measurably useless at cryptanalysis | CONFIRMED / REPORTED |
 | **F62** | The GTX 960 is strictly worse than the P600 already fitted — and it corrects F54 three ways | CONFIRMED / INFERRED |
+| **F63** | No space problem (1.1 TB free); network-backed inference is 1,479× too slow; the 21 MB/s HF figure is impossible | CONFIRMED |
 
 ---
 
@@ -4223,3 +4224,105 @@ asserted: NVIDIA's ~Oct 2028 Maxwell security window (press coverage only —
 and **any GTX-960-specific Stable Diffusion benchmark, which does not appear to
 exist anywhere.** That absence is itself the argument for measuring rather than
 estimating.
+
+---
+
+## F63. There is no space problem — and the "21 MB/s from HuggingFace" figure three documents rest on is impossible
+
+**CONFIRMED.** The operator asked whether a model too large for the other
+machines could live on node 3 and be streamed to them. **The premise is false,
+and the question contains two different questions that must not be conflated.**
+
+### The premise: measured today, there is 1.1 TB free
+
+| Node | Free NVMe | Holds |
+|---|---:|---|
+| node 1 | **264.3 GB** | gpt-oss-120b (65.4) + Qwen3-Next-80B (93.1) + Qwen3-4B |
+| node 2 | **395.5 GB** | gpt-oss only |
+| node 3 | **468.8 GB** | **no models**, plus 983.3 GB coldstore at 28 KB used |
+
+**Fleet free NVMe: 1,128.6 GB.** Largest model one node can *run*: **98.9 GB**
+(the S=1 boundary). Largest the 3-node cluster can run: **296.6 GB of pooled
+RAM — which now binds before coordinator disk.** **F16's ordering has flipped**
+now that node 3's NVMe is 98% empty; disk was the binding constraint, and RAM
+is again.
+
+**F23 partly dissolves the question outright: workers never open the GGUF.** A
+sharded model needs **one copy on the coordinator and zero transfers.** Node 3
+has 468.8 GB free — enough for anything the RAM pool could run, with 172 GB
+spare. **So the answer is not to stream the model; it is to make node 3 the
+coordinator.** That is F23's own rule — the coordinator role should follow the
+disk.
+
+The only place "not quite enough space" holds is node 1 at 264.3 GB, below the
+296.6 GB ceiling. Deleting `/opt/models/qwen3-next-80b` (93.07 GB, manifest role
+`interim-large`, **not** the served model — the live unit points at
+`gpt-oss-120b-F16.gguf`) takes node 1 to 357.4 GB. **Not done; the operator's
+call.**
+
+### (a) Distribution is viable — but the coldstore does NOT accelerate it
+
+| Model | Real GB | LAN copy @ 11.18 MB/s | Within node 3 @ 213 MB/s |
+|---|---:|---:|---:|
+| gpt-oss-120b | 65.4 | **97.5 min** | 5.1 min |
+| S=1 boundary | 98.9 | 147.4 min | 7.7 min |
+| GLM-4.6 IQ4_XS | 190.7 | 4.74 h | 14.9 min |
+
+**The crux, and it is easy to get backwards:** the addendum to F59's "~5 min per
+65 GB" is a **within-node-3** figure. A copy from node 3 **to** node 1 leaves the
+fast disk, crosses the 100 Mb switch, and arrives at **11.18 MB/s — identical to
+a copy from anywhere else.** The source disk being 19× faster than the switch
+makes it irrelevant. **Coldstore is a local provisioning accelerator and an
+archive, not a distribution accelerator**, until the switch changes.
+
+### (b) Network-backed inference is 1,479× too slow
+
+17.3 GB/s effective MoE bandwidth (F24) ÷ 11.7 MB/s = **1,479×**. That is
+**0.0041 tok/s — 243.6 seconds per token.** The real 7-chunk job that takes
+**37 minutes** today would take **38.1 days.** Gigabit is still 157× short;
+10 GbE still 15.7×.
+
+**The honest nuance, included rather than hand-waved:** llama.cpp `mmap`s the
+GGUF (the journal shows a 30.26 s "load" for 65.4 GB — not a real read), so pages
+fault on demand. **If the model fits in RAM, the network is touched once and
+this degenerates into (a) with worse failure modes. If it does not fit — which is
+exactly the case being asked about — you converge on 0.0041 tok/s.** So it is
+survivable only in precisely the case where you did not need it. llama.cpp also
+has **no weight-streaming mode at all.**
+
+### The correction: a number three documents rest on cannot be true
+
+`docs/measurements.md`, **F23** and `cluster/models.json` all rest on **21 MB/s
+from HuggingFace**, and conclude the LAN is 1.8× slower — which is why
+`models.sh pull` prefers a peer over the internet.
+
+**CONFIRMED today: all three nodes read `100` from
+`/sys/class/net/eno1/speed`, and `ip route get` returns a default route out
+`eno1` on all three. There is no second path.** 100 Mbit/s is ~11.9 MB/s of
+payload, so **21 MB/s is unreachable over that interface.**
+
+**Therefore HuggingFace and peer-pull are the SAME speed**, and `models.sh`'s
+peer preference is justified by a number that cannot be true. F28 already
+inverted F23 once on the same evidence; this closes it — **the two sources are
+equivalent, and the choice should be made on availability, not speed.**
+
+### The gigabit switch is worth breaking a zero budget for — for the RIGHT reason
+
+Not the transfer saving (65 GB: 97.5 → ~9.9 min, INFERRED). **For F50's −35.4%
+generation penalty contributed by the wire in the RPC path — a tax on every
+token of every sharded job, forever.** It is the only item here that improves
+**inference** rather than transfers, and it converts the coldstore from
+useless-to-others into useful. ~$30, plus ~$15 of Cat6, because it is only
+REPORTED that the switch rather than the cabling is the cap — **budget the pair
+and treat it as buying a diagnostic as well as a fix.** It does **not** rescue
+(b) and must not be sold as doing so.
+
+### Two conflicts this surfaces
+
+- **Node 3 is double-booked.** F44/F54 place the teaching playground on it
+  *because* it runs no `llama-server`; this analysis wants it as the
+  large-model coordinator *because* it has the disk. **Only one can be true.**
+- **F1's 75% ceiling is still unmeasured**, and it sets the S=1 boundary at
+  98.9 GB. **At 85% it moves to 112.0 GB** — the difference between GLM-4.6
+  UD-IQ1_S (96.9 GB) fitting with 2 GB to spare and fitting comfortably.
+  **That experiment is worth more than any storage change here.**
