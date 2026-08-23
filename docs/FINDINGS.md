@@ -75,6 +75,7 @@ numbers are cited from other documents and must not move.
 | **F53** | Node 3 is a three-way bandwidth twin — but its "1 TB" is a spinning HDD and it shipped as a GNOME desktop | CONFIRMED |
 | **Addendum to F51** | Fixed with a BYTES progress signal — CPU alone reads 0% during a real shard upload | CONFIRMED |
 | **F54** | ComfyUI is compute-bound the wrong way; n8n fits; and ComfyUI, n8n AND Missing Link all have no auth | CONFIRMED / REPORTED |
+| **F55** | The agent-hardening hooks have NEVER been enforced — and it corrects F52's diagnosis | CONFIRMED |
 
 ---
 
@@ -3385,3 +3386,95 @@ Missing Link is deliberately an overnight workload and a class is not.
 students across four slots is a queue tens of minutes deep. **A small model that
 fails visibly may be pedagogically better for a "how AI harms" syllabus than a
 large one that is merely slow.**
+
+---
+
+## F55. The agent-hardening hooks have NEVER been enforced — and F52's diagnosis was wrong
+
+**CONFIRMED, by direct test.** `CLAUDE.md` states that *"Agent hygiene is
+enforced, not merely advised"* and that *"If a hook blocks you, the hook is
+right and the command was wrong."* **No hook has ever blocked anything.** The
+entire `PreToolUse` layer described in `docs/AGENT-HARDENING.md` has been
+decorative for its whole existence.
+
+**The test, run by the orchestrator rather than taken on report.** In a
+throwaway git repo:
+
+```
+$ git add -A
+!!! git add -A EXECUTED -- hook did NOT intercept
+```
+
+`git add -A` is one of the guard's **hard BLOCK** rules — the rule that exists
+because it once swept three agent worktrees in as embedded git repos and pushed
+them. It ran. Two further framework-level probes behaved the same way: `git -C
+<live checkout> merge --ff-only` (a DENY rule) ran, and an Edit under
+`/opt/models` returned the Edit tool's own error rather than the `models-write`
+gate.
+
+**The audit log is the corroborating evidence.** `.claude/hook-audit.log` holds
+166 lines and **every one is a same-second direct invocation from a test
+sweep. There is no record of a framework interception, ever.**
+
+### The mechanism
+
+`.claude/settings.json` invoked the hook as:
+
+```
+"$CLAUDE_PROJECT_DIR"/.claude/hooks/cluster-guard.py
+```
+
+**`CLAUDE_PROJECT_DIR` is empty**, so that expands to
+`/.claude/hooks/cluster-guard.py` — a path that does not exist. **A hook that
+cannot start cannot deny.** And this guard's fail-closed design lives *inside
+the script*, which offers exactly no protection against the script never being
+run. **Fail-closed logic in a component that is never invoked is
+indistinguishable from no logic at all.**
+
+Patched to `"${CLAUDE_PROJECT_DIR:-/home/debian1/homogenous-cluster}"/...`,
+keeping the variable when it is set and falling back when it is not. **The fix
+is NOT yet verified end-to-end** — the framework reads `settings.json` at
+session start, so confirming interception requires a fresh session. Until
+someone sees a real block, treat the guard as still inert.
+
+### This CORRECTS F52, and the correction matters more than the original finding
+
+F52 concluded that the guard failed to fire on the re-profile's 17 UPDATEs
+because *"`python -m missing_link.reprofile_corpus --apply` does not look like
+SQL to a pattern matcher."* **That pattern gap is real** — the `guard-gap` agent
+independently confirmed the old script returns ALLOW when driven directly with
+that command — **but it is not why nothing fired. Nothing would have fired for
+any command whatsoever.**
+
+**Two independent defects, and diagnosing the first concealed the second.** The
+pattern-gap explanation was plausible, evidence-backed, and led to a genuinely
+better guard — while leaving the actual cause untouched. **A satisfying
+explanation for a failure is the most effective way to stop looking for the
+real one.** The same shape as F36/F40, where a client disconnect explained the
+hang so convincingly that the fork/waitpid abort went unfound for a day, and
+F45/F48, where "a regex is the only splitter light enough" explained the choice
+so well that nobody asked whether a legal-domain splitter existed.
+
+### What this means for everything else in this repo
+
+**Every "the hook gates this" statement in `CLAUDE.md`, `STATUS.md` and
+`docs/AGENT-HARDENING.md` has been false in practice.** Agents have been
+following the documented rules *voluntarily*, from the prose in `CLAUDE.md` —
+which is why nothing catastrophic happened, and is also why the gap stayed
+invisible for so long. **The prose was doing all the work the hooks were
+credited with.**
+
+Practical consequences, none hypothetical:
+- The `git add -A` incident that motivated the rule happened **before** the hook,
+  and the hook has never prevented a recurrence.
+- The re-profile's 17 UPDATEs against the live job store ran ungated (F52).
+- Service restarts this session were reported as "not blocked by the hook" —
+  correctly, and for the wrong reason.
+- **`CLUSTER_OPS_CONFIRMED=1` has never meant anything**, because nothing ever
+  checked it.
+
+**Do not now write more rules.** The lesson is the opposite: **an enforcement
+layer must prove it enforces before anything is written that depends on it.**
+The guard needed one negative test — issue a command it claims to block and
+confirm the block — and that test had never been run in ~six days of it being
+cited as a safety property.
